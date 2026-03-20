@@ -1,0 +1,43 @@
+# Secrets
+.credentials.json
+
+# Caches and temp data
+cache/
+paste-cache/
+stats-cache.json
+mcp-needs-auth-cache.json
+
+# Session data and history
+sessions/
+history.jsonl
+channels/
+shell-snapshots/
+session-env/
+
+# IDE integration
+ide/
+
+# Backups and file history
+backups/
+file-history/
+
+# Telemetry
+telemetry/
+
+# Tasks and todos (ephemeral)
+tasks/
+todos/
+plans/
+
+# Debug
+debug/
+
+# Chrome/browser
+chrome/
+
+# Plugins (installed from marketplace, not custom config)
+plugins/
+
+# Project session logs (keep memory and CLAUDE.md, ignore session files)
+projects/**//*.jsonl
+projects/**/*-*-*-*-*

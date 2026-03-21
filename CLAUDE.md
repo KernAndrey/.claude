@@ -41,3 +41,6 @@ Do NOT use teams for single-file changes or quick fixes.
 
 ## MCP
 When working with library/framework APIs, use the context7 MCP tool to fetch up-to-date documentation before writing code.
+
+## Ports availability
+Always check which ports are free before starting the server

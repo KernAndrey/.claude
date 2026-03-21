@@ -12,5 +12,9 @@
   "effortLevel": "high",
   "voiceEnabled": true,
   "skipDangerousModePermissionPrompt": true,
-  "teammateMode": "tmux"
+  "teammateMode": "tmux",
+  "statusLine": {
+    "type": "command",
+    "command": "bash /home/kern/.claude/statusline-command.sh"
+  }
 }

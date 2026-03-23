@@ -38,6 +38,9 @@ chrome/
 # Plugins (installed from marketplace, not custom config)
 plugins/
 
+# Agent teams
+teams/
+
 # Project session logs (keep memory and CLAUDE.md, ignore session files)
 projects/**//*.jsonl
 projects/**/*-*-*-*-*

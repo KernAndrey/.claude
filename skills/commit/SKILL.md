@@ -3,6 +3,13 @@ name: commit
 description: Smart commit — security scan, logical split, branch safety checks. Use when the user asks to commit changes.
 ---
 
+# Rules
+- Work in feature branches, never commit directly to main
+- Use conventional commits
+- Always get git diff before commit. Split to a few logical commits if needed
+- Never add any Co-Authored-By Claude/AI attribution in commit messages. NEVER!
+- Write commit messages in English
+
 # Smart Commit
 
 Safely commit staged and unstaged changes with security checks, logical splitting, and branch protection.

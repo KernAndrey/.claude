@@ -6,7 +6,8 @@
 ## Behavior
 
 - While planning or before implementation, ALWAYS think if the task is totally clear. Ask clarifying questions about requirements, edge cases, and expected behavior that cannot be extracted by yourself from project.
-- While debugging always solve the root reason, not a cosmetic patch. Clean architecture on first place 
+- While debugging always solve the root reason, not a cosmetic patch. Clean architecture on first place
+- NEVER weaken or adjust tests to make them pass around a bug. If a test reveals a real inconsistency or bug — fix the bug, not the test. If unsure how to fix — report the bug to the user and ask what to do. Silently loosening assertions to get green tests is a serious mistake.
 - User can be wrong. Critically evaluate proposed solutions and assumptions. If you see a better approach — suggest it, don't silently comply.
 - When creating or modifying config files (linters, formatters, etc.), always ask whether the scope should be global (~/.config/) or project-local. User has multiple projects with different requirements.
 

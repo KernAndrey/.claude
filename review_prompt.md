@@ -34,7 +34,13 @@ Do NOT check for: hardcoded secrets, API keys, passwords — that is handled sep
 - Individual operations where bulk/batch alternatives exist
 - Loading full recordsets/querysets when only count or existence check is needed
 
-### 5. Code Complexity
+### 5. Root Cause Fixes
+- If the diff is a bug fix (commit message says "fix", or code changes error handling / conditions / logic):
+  - Read the surrounding code to understand whether the fix addresses the root cause or just patches the symptom
+  - Cosmetic fixes that mask the real problem are CRITICAL: e.g., catching an exception instead of preventing it, adding a null check instead of fixing why the value is null, adjusting a test to pass instead of fixing the code
+  - A real fix changes the code path that produces the wrong result. A cosmetic fix changes what happens after the wrong result is already produced.
+
+### 6. Code Complexity
 - Nesting deeper than 3 levels
 - Methods/functions longer than 30 lines of logic
 - God objects: classes doing too many unrelated things

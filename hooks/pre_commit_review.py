@@ -22,7 +22,7 @@ GLOBAL_PROMPT = Path.home() / ".claude" / "review_prompt.md"
 PROJECT_PROMPT = Path(".claude") / "review_prompt.md"
 LOG_DIR = Path.home() / ".claude" / "review-logs"
 MAX_DIFF_LINES = 2000
-MIN_LINES_TO_REVIEW = 3
+MIN_LINES_TO_REVIEW = 1
 TIMEOUT_SECONDS = 600
 
 

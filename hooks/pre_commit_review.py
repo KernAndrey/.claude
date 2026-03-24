@@ -12,6 +12,7 @@ Exit codes:
 
 import json
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime
@@ -33,15 +34,47 @@ def read_file(path):
         return ""
 
 
+def _split_chain(cmd):
+    """Split a shell command chain on && and ; into sub-commands."""
+    return [p.strip() for p in re.split(r"&&|;", cmd)]
+
+
 def is_git_commit(cmd):
     """Check if command contains a git commit (handles && and ; chains)."""
-    # Split on && and ; to check each sub-command
-    for part in re.split(r"&&|;", cmd):
-        part = part.strip()
-        # Handle optional env var prefixes: VAR=val git commit ...
-        if re.match(r"^(\w+=\S+\s+)*git\s+commit\b", part):
-            return True
-    return False
+    return any(
+        re.match(r"^git\s+commit\b", _strip_env_prefixes(part))
+        for part in _split_chain(cmd)
+    )
+
+
+def _strip_env_prefixes(part):
+    """Remove VAR=val prefixes from a shell command string."""
+    return re.sub(r"^(\w+=\S+\s+)+", "", part)
+
+
+def run_pre_commit_steps(cmd):
+    """Run git add/staging commands that precede git commit in a chain.
+
+    PreToolUse fires BEFORE the Bash command executes. When the command is
+    "git add file && git commit -m msg", files aren't staged yet.
+    We run everything before git commit so git diff --cached works.
+    """
+    for part in _split_chain(cmd):
+        clean = _strip_env_prefixes(part)
+        if re.match(r"^git\s+commit\b", clean):
+            break  # Stop before git commit itself
+        if re.match(r"^git\s+(add|rm|reset|restore)\b", clean):
+            try:
+                result = subprocess.run(
+                    shlex.split(clean), capture_output=True, text=True,
+                )
+                if result.returncode != 0:
+                    print(
+                        f"⚠️ Pre-staging failed: {clean}: {result.stderr.strip()}",
+                        file=sys.stderr,
+                    )
+            except (ValueError, OSError):
+                pass  # shlex parse error or command not found — skip
 
 
 def get_staged_diff():
@@ -305,8 +338,12 @@ def report_and_exit(review, verdict):
 
 
 def main():
-    if not parse_hook_input():
+    cmd = parse_hook_input()
+    if not cmd:
         sys.exit(0)
+
+    # Run git add/staging steps so git diff --cached has data
+    run_pre_commit_steps(cmd)
 
     context = collect_diff_context()
     if not context:

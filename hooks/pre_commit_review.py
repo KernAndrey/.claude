@@ -317,4 +317,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # DEBUG: marker to verify script is being called
+    Path(Path.home() / ".claude" / "review-logs" / "_hook_fired").touch()
     main()
+# test

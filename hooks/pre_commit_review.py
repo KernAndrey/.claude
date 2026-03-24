@@ -34,9 +34,14 @@ def read_file(path):
 
 
 def is_git_commit(cmd):
-    """Check if command is a git commit (not merge, rebase, etc.)."""
-    # Handle optional env var prefixes: VAR=val VAR2=val2 git commit ...
-    return bool(re.match(r"^(\s*\w+=\S+\s+)*git\s+commit\b", cmd))
+    """Check if command contains a git commit (handles && and ; chains)."""
+    # Split on && and ; to check each sub-command
+    for part in re.split(r"&&|;", cmd):
+        part = part.strip()
+        # Handle optional env var prefixes: VAR=val git commit ...
+        if re.match(r"^(\w+=\S+\s+)*git\s+commit\b", part):
+            return True
+    return False
 
 
 def get_staged_diff():
@@ -317,7 +322,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # DEBUG: marker to verify script is being called
-    Path(Path.home() / ".claude" / "review-logs" / "_hook_fired").touch()
     main()
-# test

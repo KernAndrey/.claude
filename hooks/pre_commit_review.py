@@ -11,7 +11,6 @@ Exit codes:
 """
 
 import json
-import os
 import re
 import subprocess
 import sys
@@ -223,6 +222,20 @@ def save_log(files, diff, review, verdict, error=None):
         pass  # Don't fail the hook if logging fails
 
 
+def log_skip(reason):
+    """Log early exits for debugging."""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        project = Path.cwd().name
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_path = LOG_DIR / f"{timestamp}_{project}_SKIP.md"
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"# Skip: {project} @ {timestamp}\n\n")
+            f.write(f"**Reason:** {reason}\n")
+    except OSError:
+        pass
+
+
 def parse_hook_input():
     """Parse stdin and return the command string, or None to skip."""
     try:
@@ -230,13 +243,20 @@ def parse_hook_input():
     except (json.JSONDecodeError, EOFError):
         return None
     cmd = data.get("tool_input", {}).get("command", "")
-    return cmd if is_git_commit(cmd) else None
+    if not is_git_commit(cmd):
+        return None
+    return cmd
 
 
 def collect_diff_context():
     """Collect staged diff and file list. Returns (diff, files, is_merge) or None to skip."""
     diff = get_staged_diff()
-    if not diff or count_added_lines(diff) < MIN_LINES_TO_REVIEW:
+    if not diff:
+        log_skip("empty diff")
+        return None
+    added = count_added_lines(diff)
+    if added < MIN_LINES_TO_REVIEW:
+        log_skip(f"only {added} added lines (min {MIN_LINES_TO_REVIEW})")
         return None
     files = get_staged_files()
     is_merge = Path(".git/MERGE_HEAD").is_file()
@@ -248,6 +268,7 @@ def execute_review(diff, files, is_merge):
     system_prompt = build_system_prompt()
     if not system_prompt:
         print("⚠️ No review_prompt.md found, skipping review", file=sys.stderr)
+        log_skip("no review_prompt.md found")
         return None, "SKIP"
 
     user_prompt = build_user_prompt(diff, files, is_merge)

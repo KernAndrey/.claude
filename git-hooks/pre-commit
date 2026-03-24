@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Global pre-commit hook: runs code review, then chains to repo-local hooks.
+# Skip with: git commit --no-verify
+
+set -euo pipefail
+
+REVIEW_SCRIPT="$HOME/.claude/hooks/pre_commit_review.py"
+
+# --- Run code review ---
+if [ -f "$REVIEW_SCRIPT" ]; then
+    python3 "$REVIEW_SCRIPT"
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        exit $rc
+    fi
+fi
+
+# --- Chain to repo-local pre-commit hook ---
+# core.hooksPath overrides .git/hooks/, so we call the local one explicitly.
+LOCAL_HOOK="$(git rev-parse --git-dir 2>/dev/null)/hooks/pre-commit"
+if [ -f "$LOCAL_HOOK" ] && [ -x "$LOCAL_HOOK" ]; then
+    exec "$LOCAL_HOOK"
+fi

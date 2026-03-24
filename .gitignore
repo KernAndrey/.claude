@@ -47,3 +47,5 @@ review-logs/
 # Project session logs (keep memory and CLAUDE.md, ignore session files)
 projects/**//*.jsonl
 projects/**/*-*-*-*-*
+
+*.pyc

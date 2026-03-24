@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-Claude Code pre-commit quality gate.
+Git pre-commit code review gate.
 
-Intercepts `git commit` via PreToolUse hook, sends staged diff to a separate
-Claude Code session for review.
+Called by ~/.claude/git-hooks/pre-commit. Sends staged diff to a Claude Code
+session for review.
 
 Exit codes:
     0 — commit allowed (review passed or skipped)
-    2 — commit BLOCKED (critical issues found, stderr has details)
+    1 — commit BLOCKED (critical issues found)
+
+Skip with: git commit --no-verify
 """
 
-import json
-import re
-import shlex
 import subprocess
 import sys
 from datetime import datetime
@@ -26,6 +25,22 @@ MAX_DIFF_LINES = 2000
 MIN_LINES_TO_REVIEW = 3
 TIMEOUT_SECONDS = 300
 
+
+def warn(msg):
+    """Print warning to stderr."""
+    print(f"\033[33m⚠️  [code-review] {msg}\033[0m", file=sys.stderr)
+
+
+def error(msg):
+    """Print error to stderr."""
+    print(f"\033[31m❌ [code-review] {msg}\033[0m", file=sys.stderr)
+
+
+def info(msg):
+    """Print info to stderr."""
+    print(f"\033[36mℹ️  [code-review] {msg}\033[0m", file=sys.stderr)
+
+
 def read_file(path):
     """Read file contents, return empty string if not found."""
     try:
@@ -34,67 +49,37 @@ def read_file(path):
         return ""
 
 
-def _split_chain(cmd):
-    """Split a shell command chain on && and ; into sub-commands."""
-    return [p.strip() for p in re.split(r"&&|;", cmd)]
-
-
-def is_git_commit(cmd):
-    """Check if command contains a git commit (handles && and ; chains)."""
-    return any(
-        re.match(r"^git\s+commit\b", _strip_env_prefixes(part))
-        for part in _split_chain(cmd)
-    )
-
-
-def _strip_env_prefixes(part):
-    """Remove VAR=val prefixes from a shell command string."""
-    return re.sub(r"^(\w+=\S+\s+)+", "", part)
-
-
-def run_pre_commit_steps(cmd):
-    """Run git add/staging commands that precede git commit in a chain.
-
-    PreToolUse fires BEFORE the Bash command executes. When the command is
-    "git add file && git commit -m msg", files aren't staged yet.
-    We run everything before git commit so git diff --cached works.
-    """
-    for part in _split_chain(cmd):
-        clean = _strip_env_prefixes(part)
-        if re.match(r"^git\s+commit\b", clean):
-            break  # Stop before git commit itself
-        if re.match(r"^git\s+(add|rm|reset|restore)\b", clean):
-            try:
-                result = subprocess.run(
-                    shlex.split(clean), capture_output=True, text=True,
-                )
-                if result.returncode != 0:
-                    print(
-                        f"⚠️ Pre-staging failed: {clean}: {result.stderr.strip()}",
-                        file=sys.stderr,
-                    )
-            except (ValueError, OSError):
-                pass  # shlex parse error or command not found — skip
-
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
 
 def get_staged_diff():
-    """Get the staged diff."""
+    """Get the staged diff. Returns (diff_text, error_msg)."""
     result = subprocess.run(
         ["git", "diff", "--cached"],
-        capture_output=True,
-        text=True,
+        capture_output=True, text=True,
     )
-    return result.stdout.strip()
+    if result.returncode != 0:
+        return "", f"git diff --cached failed (rc={result.returncode}): {result.stderr.strip()}"
+    return result.stdout.strip(), ""
 
 
 def get_staged_files():
     """Get list of staged file names."""
     result = subprocess.run(
         ["git", "diff", "--cached", "--name-only"],
-        capture_output=True,
-        text=True,
+        capture_output=True, text=True,
     )
     return result.stdout.strip()
+
+
+def get_git_status():
+    """Get git status for diagnostics."""
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "(git status failed)"
 
 
 def count_added_lines(diff):
@@ -105,6 +90,10 @@ def count_added_lines(diff):
         if line.startswith("+") and not line.startswith("+++")
     )
 
+
+# ---------------------------------------------------------------------------
+# Diff processing
+# ---------------------------------------------------------------------------
 
 def truncate_diff(diff):
     """Truncate diff to MAX_DIFF_LINES, keeping complete file sections."""
@@ -149,20 +138,19 @@ def truncate_diff(diff):
     return "\n".join(result_lines)
 
 
-def build_system_prompt():
-    """Assemble system prompt: review rules + project-specific review rules.
+# ---------------------------------------------------------------------------
+# Prompt building
+# ---------------------------------------------------------------------------
 
-    CLAUDE.md is auto-discovered by claude (no --bare), so we don't include it here.
-    """
+def build_system_prompt():
+    """Assemble system prompt from review_prompt.md files."""
     parts = []
 
-    # 1. Global review instructions (required)
     global_prompt = read_file(GLOBAL_PROMPT)
     if not global_prompt:
         return ""
     parts.append(global_prompt)
 
-    # 2. Project-specific review rules (optional)
     project_rules = read_file(PROJECT_PROMPT)
     if project_rules:
         parts.append(f"## Project-specific review rules:\n{project_rules}")
@@ -196,8 +184,12 @@ def build_user_prompt(diff, files, is_merge):
     return "\n\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Claude review
+# ---------------------------------------------------------------------------
+
 def run_claude(system_prompt, user_prompt):
-    """Run a separate Claude Code session for review."""
+    """Run Claude Code for review. Returns (stdout, stderr, returncode)."""
     cmd = [
         "claude",
         "-p",
@@ -218,7 +210,7 @@ def run_claude(system_prompt, user_prompt):
         timeout=TIMEOUT_SECONDS,
     )
 
-    return result.stdout.strip()
+    return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
 def parse_verdict(review):
@@ -237,8 +229,12 @@ def parse_verdict(review):
     return "OK"
 
 
-def save_log(files, diff, review, verdict, error=None):
-    """Save every review to a log file for debugging and analysis."""
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+def save_log(verdict, files="", diff="", review="", error_msg=None, diag=None):
+    """Save review to a log file for debugging."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         project = Path.cwd().name
@@ -248,114 +244,117 @@ def save_log(files, diff, review, verdict, error=None):
         with open(log_path, "w", encoding="utf-8") as f:
             f.write(f"# Review: {project} @ {timestamp}\n\n")
             f.write(f"**Verdict:** {verdict}\n")
-            f.write(f"**Files:**\n{files}\n\n")
-            f.write(f"## Diff stats\n{len(diff.splitlines())} lines in diff\n\n")
-            if error:
-                f.write(f"## Error\n```\n{error}\n```\n\n")
+            if files:
+                f.write(f"**Files:**\n{files}\n\n")
+            if diff:
+                f.write(f"## Diff stats\n{len(diff.splitlines())} lines in diff\n\n")
+            if error_msg:
+                f.write(f"## Error\n```\n{error_msg}\n```\n\n")
+            if diag:
+                f.write(f"## Diagnostics\n```\n{diag}\n```\n\n")
             if review:
                 f.write(f"## Review output\n```\n{review}\n```\n\n")
-            f.write(f"## Full diff\n```diff\n{diff}\n```\n")
-    except OSError:
-        pass  # Don't fail the hook if logging fails
-
-
-def log_skip(reason):
-    """Log early exits for debugging."""
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        project = Path.cwd().name
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        log_path = LOG_DIR / f"{timestamp}_{project}_SKIP.md"
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write(f"# Skip: {project} @ {timestamp}\n\n")
-            f.write(f"**Reason:** {reason}\n")
+            if diff:
+                f.write(f"## Full diff\n```diff\n{diff}\n```\n")
     except OSError:
         pass
 
 
-def parse_hook_input():
-    """Parse stdin and return the command string, or None to skip."""
-    try:
-        data = json.load(sys.stdin)
-    except (json.JSONDecodeError, EOFError):
-        return None
-    cmd = data.get("tool_input", {}).get("command", "")
-    if not is_git_commit(cmd):
-        return None
-    return cmd
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
+def collect_diff():
+    """Collect staged diff and metadata. Returns (diff, files, is_merge) or None."""
+    diff, git_error = get_staged_diff()
 
-def collect_diff_context():
-    """Collect staged diff and file list. Returns (diff, files, is_merge) or None to skip."""
-    diff = get_staged_diff()
+    if git_error:
+        warn(f"git diff failed: {git_error}")
+        save_log("SKIP", error_msg=git_error)
+        return None
+
     if not diff:
-        log_skip("empty diff")
+        status = get_git_status()
+        diag = f"git diff --cached returned empty.\ngit status:\n{status}"
+        warn(f"No staged changes to review.")
+        save_log("SKIP", diag=diag)
         return None
+
     added = count_added_lines(diff)
     if added < MIN_LINES_TO_REVIEW:
-        log_skip(f"only {added} added lines (min {MIN_LINES_TO_REVIEW})")
+        save_log("SKIP", diag=f"only {added} added lines (min {MIN_LINES_TO_REVIEW})")
         return None
+
     files = get_staged_files()
     is_merge = Path(".git/MERGE_HEAD").is_file()
     return truncate_diff(diff), files, is_merge
 
 
-def execute_review(diff, files, is_merge):
-    """Build prompts and run review. Returns (review_text, verdict)."""
+def run_review(diff, files, is_merge):
+    """Execute the review. Returns (review_text, verdict)."""
     system_prompt = build_system_prompt()
     if not system_prompt:
-        print("⚠️ No review_prompt.md found, skipping review", file=sys.stderr)
-        log_skip("no review_prompt.md found")
+        warn("No review_prompt.md found, skipping review")
+        save_log("SKIP", files=files, diff=diff, error_msg="no review_prompt.md")
         return None, "SKIP"
 
     user_prompt = build_user_prompt(diff, files, is_merge)
 
+    info(f"Reviewing {len(files.splitlines())} file(s)...")
+
     try:
-        review = run_claude(system_prompt, user_prompt)
+        review, claude_stderr, returncode = run_claude(system_prompt, user_prompt)
     except subprocess.TimeoutExpired:
-        print("⚠️ Code review timed out, allowing commit", file=sys.stderr)
-        save_log(files, diff, "", "TIMEOUT", error="Review timed out")
+        warn(f"Review timed out after {TIMEOUT_SECONDS}s — allowing commit")
+        save_log("TIMEOUT", files=files, diff=diff, error_msg="timed out")
         return None, "TIMEOUT"
     except FileNotFoundError:
-        print("⚠️ claude CLI not found, skipping review", file=sys.stderr)
-        save_log(files, diff, "", "SKIP", error="claude CLI not found")
+        warn("claude CLI not found — skipping review")
+        save_log("SKIP", files=files, diff=diff, error_msg="claude CLI not found")
         return None, "SKIP"
 
+    if returncode != 0:
+        detail = f"claude exited with code {returncode}\nstderr: {claude_stderr}\nstdout: {review}"
+        warn(f"claude failed (rc={returncode}) — allowing commit")
+        save_log("ERROR", files=files, diff=diff, error_msg=detail)
+        return None, "ERROR"
+
+    if not review:
+        warn("claude returned empty output — allowing commit")
+        save_log("EMPTY", files=files, diff=diff,
+                 error_msg=f"empty output. stderr: {claude_stderr}")
+        return None, "EMPTY"
+
     verdict = parse_verdict(review)
-    save_log(files, diff, review, verdict)
+    save_log(verdict, files=files, diff=diff, review=review)
     return review, verdict
 
 
-def report_and_exit(review, verdict):
-    """Print review results to stderr and exit with appropriate code."""
-    if verdict == "OK":
-        if review and review.strip() != "OK":
-            print(f"⚠️ Code review notes:\n{review}", file=sys.stderr)
-        sys.exit(0)
-    else:
-        print(f"❌ Code review BLOCKED commit:\n\n{review}", file=sys.stderr)
-        sys.exit(2)
-
-
 def main():
-    cmd = parse_hook_input()
-    if not cmd:
+    try:
+        context = collect_diff()
+        if not context:
+            sys.exit(0)
+
+        diff, files, is_merge = context
+        review, verdict = run_review(diff, files, is_merge)
+
+        if review is None:
+            sys.exit(0)
+
+        if verdict == "BLOCK":
+            error(f"Review BLOCKED this commit:\n\n{review}")
+            sys.exit(1)
+
+        if review.strip() != "OK":
+            warn(f"Review notes:\n{review}")
         sys.exit(0)
 
-    # Run git add/staging steps so git diff --cached has data
-    run_pre_commit_steps(cmd)
-
-    context = collect_diff_context()
-    if not context:
+    except Exception as exc:
+        # Never let a bug in this script block a commit
+        warn(f"Review script crashed: {exc} — allowing commit")
+        save_log("CRASH", error_msg=f"{type(exc).__name__}: {exc}")
         sys.exit(0)
-
-    diff, files, is_merge = context
-    review, verdict = execute_review(diff, files, is_merge)
-
-    if review is None:
-        sys.exit(0)
-
-    report_and_exit(review, verdict)
 
 
 if __name__ == "__main__":

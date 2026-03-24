@@ -19,18 +19,6 @@
     "command": "bash /home/kern/.claude/statusline-command.sh"
   },
   "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /home/kern/.claude/hooks/pre_commit_review.py",
-            "timeout": 330
-          }
-        ]
-      }
-    ],
     "Notification": [
       {
         "matcher": "permission_prompt",

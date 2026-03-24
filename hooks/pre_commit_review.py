@@ -25,7 +25,7 @@ MAX_DIFF_LINES = 2000
 MIN_LINES_TO_REVIEW = 3
 TIMEOUT_SECONDS = 300
 
-
+# comment for testing hook
 def read_file(path):
     """Read file contents, return empty string if not found."""
     try:

@@ -69,11 +69,12 @@ Ask the user how to proceed. Suggest:
 
 Review all changes and group them into logical commits. A logical commit is a cohesive set of changes that represents one idea:
 
-- A bug fix (including its test)
-- A new feature (model + view + template)
+- A bug fix + its tests
+- A new feature + its tests (model + view + template + test)
+- A refactoring + updated tests
 - A config change
-- A refactoring
 - Documentation updates (only if the user explicitly requested it)
+- Standalone test improvements (refactoring existing tests, adding coverage for old code)
 
 ### Splitting rules
 
@@ -81,6 +82,8 @@ Review all changes and group them into logical commits. A logical commit is a co
 - If there are 2+ distinct changes — propose a split to the user with a short summary of each commit.
 - Wait for the user to confirm or adjust the split before proceeding.
 - Never mix unrelated changes in one commit.
+- ALWAYS keep code and its tests in the same commit. A commit with new business logic must include the tests for that logic. Never split "feat: add X" and "test: add X tests" into separate commits.
+- Only create standalone test commits for: test refactoring, adding coverage for previously untested existing code, or test infrastructure changes.
 
 ## Phase 5: Lint Check
 

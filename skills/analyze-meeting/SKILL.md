@@ -103,8 +103,8 @@ Use the Read tool on `<dir>/frames/<filename>`. Claude is multimodal and will se
 
 ## Phase 5: Write Output
 
-Create directory `.tasks/` in the current working directory if it doesn't exist.
-Write the analysis to `.tasks/<meeting_name>.md` where `meeting_name` comes from `transcript.json`.
+Create directory `.meetings/summaries/` in the current working directory if it doesn't exist.
+Write the analysis to `.meetings/summaries/<meeting_name>.md` where `meeting_name` comes from `transcript.json`.
 
 **Output is ALWAYS in English**, regardless of the transcript language.
 

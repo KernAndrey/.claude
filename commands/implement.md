@@ -5,12 +5,14 @@ Implement an approved specification using an agent team.
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
 2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/ready/`.
 3. Read the full specification.
-4. If `auto_branch = true`: switch to branch `task/{ID}-{slug}` if it exists, otherwise create it. If `auto_branch = false`: stay on the current branch.
+4. Branch and worktree setup:
+   - If `auto_branch = true`: create an isolated worktree using the `wt` script: `wt create task/{ID}-{slug}`. All implementation work (Coder and Reviewer agents) MUST run inside the worktree directory. The worktree path is returned by `wt create` — pass it to agents as their working directory.
+   - If `auto_branch = false`: stay on the current branch, no worktree.
 5. Move spec file to `tasks/in-progress/`. Update `status: in-progress`.
 
 ## Agent Team
 
-Create an agent team:
+Create an agent team (not subagents):
 
 ### Teammate: Coder
 
@@ -59,7 +61,7 @@ Create an agent team:
 
 ## Finalization (Lead)
 
-After the team finishes:
+After the team finishes (run all finalization steps inside the worktree directory when `auto_branch = true`):
 
 1. Append sections from `~/.claude/templates/sdd/implementation-sections.md` to the spec file:
    - **Implementation Summary**: what was done, key decisions, what was deferred
@@ -79,7 +81,9 @@ After the team finishes:
 
 4. Git commit: `feat({ID}): {title}`
 
-5. Output:
+5. If `auto_branch = true`: remove the worktree with `wt remove task/{ID}-{slug}`.
+
+6. Output:
    - Implementation Summary (brief)
    - Known Concerns (if any)
    - Steps for Manual Review (full list)

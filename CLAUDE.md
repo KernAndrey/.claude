@@ -41,3 +41,18 @@ When working with library/framework APIs, use the context7 MCP tool to fetch up-
 
 ## Ports availability
 Always check which ports are free before starting the server
+
+## Terminal Notifications
+
+When you finish working on a task, signal completion via terminal:
+
+- If task completed successfully, no action required:
+  `echo -e '\033]0;✅ DONE\007\a'`
+
+- If human action is required (manual testing, decision needed, merge conflict, etc.):
+  `echo -e '\033]0;⚠️ ACTION REQUIRED\007\a'`
+
+- If task failed or blocked:
+  `echo -e '\033]0;❌ BLOCKED\007\a'`
+
+Always execute the appropriate echo as your very last command.

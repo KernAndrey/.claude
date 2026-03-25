@@ -19,9 +19,9 @@ Create an agent team (not subagents):
 **Role:** Implement code strictly according to the specification.
 
 **Tasks:**
-1. Read the spec thoroughly: Objective, Scope, Technical Approach, Acceptance Criteria.
-2. Study the files listed in "Files to Modify".
-3. Implement following the Technical Approach:
+1. Read the spec thoroughly: Objective, Scope, Behavior, Acceptance Criteria.
+2. Study the Affected Areas described in the spec — explore the relevant parts of the codebase to understand current behavior and find the specific files/classes to change.
+3. Implement following the described Behavior:
    - Write code incrementally — one logical block at a time
    - Verify no syntax errors after each block
    - Write tests for EACH acceptance criterion

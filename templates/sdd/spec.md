@@ -23,11 +23,13 @@ draft_source: "{{DRAFT_PATH}}"
 
 -
 
-## Technical Approach
+## Behavior
 
-<!-- Concrete plan: models, views, cron jobs, API endpoints, migrations, etc. -->
+<!-- Describe what the system should do in plain English: user-facing changes, data flow, system interactions. No code, no file paths, no class names. Write as a narrative a non-technical stakeholder can read. -->
 
 ## Acceptance Criteria
+
+<!-- Each criterion should be verifiable. Use "Given / When / Then" or simple declarative statements. No code. -->
 
 - [ ]
 - [ ]
@@ -35,12 +37,12 @@ draft_source: "{{DRAFT_PATH}}"
 
 ## Edge Cases & Risks
 
-<!-- Found by Critic agent. Potential issues, race conditions, data volume concerns. -->
+<!-- Found by Critic agent. Potential issues, error scenarios, data volume concerns, security considerations. Describe in business terms. -->
 
-## Files to Modify
+## Affected Areas
 
-<!-- Specific list of files to create or change -->
+<!-- Which parts of the system are affected (e.g. "user authentication flow", "order processing pipeline"). Do NOT list file paths or class names. -->
 
 ## Dependencies
 
-<!-- Dependencies on other tasks or external systems -->
+<!-- Dependencies on other tasks, external systems, or business decisions -->

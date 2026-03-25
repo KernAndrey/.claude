@@ -17,5 +17,5 @@ fi
 # --- Step 2: Run code review (on already-linted code) ---
 REVIEW_SCRIPT="$HOME/.claude/hooks/pre_commit_review.py"
 if [ -f "$REVIEW_SCRIPT" ]; then
-    python3 "$REVIEW_SCRIPT"
+    python3 -B "$REVIEW_SCRIPT"
 fi

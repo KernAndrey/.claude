@@ -1,26 +1,21 @@
 #!/usr/bin/env bash
-# Global pre-commit hook: runs code review, then chains to repo-local hooks.
+# Global pre-commit hook: runs repo-local linters first, then code review.
 # Skip with: git commit --no-verify
 
 set -euo pipefail
 
-REVIEW_SCRIPT="$HOME/.claude/hooks/pre_commit_review.py"
-
-# --- Run code review ---
-if [ -f "$REVIEW_SCRIPT" ]; then
-    python3 "$REVIEW_SCRIPT"
-    rc=$?
-    if [ $rc -ne 0 ]; then
-        exit $rc
-    fi
-fi
-
-# --- Chain to repo-local pre-commit hook ---
+# --- Step 1: Run repo-local pre-commit hook (linters: ruff, pylint, xmllint) ---
 # core.hooksPath overrides .git/hooks/, so we call the local one explicitly.
 # In worktrees, git-dir points to .git/worktrees/<name> which has no hooks/.
 # Use git-common-dir to find the shared hooks directory.
 COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null)"
 LOCAL_HOOK="$COMMON_DIR/hooks/pre-commit"
 if [ -f "$LOCAL_HOOK" ] && [ -x "$LOCAL_HOOK" ]; then
-    exec "$LOCAL_HOOK"
+    "$LOCAL_HOOK"
+fi
+
+# --- Step 2: Run code review (on already-linted code) ---
+REVIEW_SCRIPT="$HOME/.claude/hooks/pre_commit_review.py"
+if [ -f "$REVIEW_SCRIPT" ]; then
+    python3 "$REVIEW_SCRIPT"
 fi

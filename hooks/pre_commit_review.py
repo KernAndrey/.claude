@@ -82,12 +82,13 @@ def get_git_status():
     return result.stdout.strip() if result.returncode == 0 else "(git status failed)"
 
 
-def count_added_lines(diff):
-    """Count lines added in the diff (excluding file headers)."""
+def count_changed_lines(diff):
+    """Count lines added or removed in the diff (excluding file headers)."""
     return sum(
         1
         for line in diff.split("\n")
-        if line.startswith("+") and not line.startswith("+++")
+        if (line.startswith("+") and not line.startswith("+++"))
+        or (line.startswith("-") and not line.startswith("---"))
     )
 
 
@@ -280,9 +281,9 @@ def collect_diff():
         save_log("SKIP", diag=diag)
         return None
 
-    added = count_added_lines(diff)
-    if added < MIN_LINES_TO_REVIEW:
-        save_log("SKIP", diag=f"only {added} added lines (min {MIN_LINES_TO_REVIEW})")
+    changed = count_changed_lines(diff)
+    if changed < MIN_LINES_TO_REVIEW:
+        save_log("SKIP", diag=f"only {changed} changed lines (min {MIN_LINES_TO_REVIEW})")
         return None
 
     files = get_staged_files()

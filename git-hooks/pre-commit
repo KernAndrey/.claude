@@ -17,7 +17,10 @@ fi
 
 # --- Chain to repo-local pre-commit hook ---
 # core.hooksPath overrides .git/hooks/, so we call the local one explicitly.
-LOCAL_HOOK="$(git rev-parse --git-dir 2>/dev/null)/hooks/pre-commit"
+# In worktrees, git-dir points to .git/worktrees/<name> which has no hooks/.
+# Use git-common-dir to find the shared hooks directory.
+COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null)"
+LOCAL_HOOK="$COMMON_DIR/hooks/pre-commit"
 if [ -f "$LOCAL_HOOK" ] && [ -x "$LOCAL_HOOK" ]; then
     exec "$LOCAL_HOOK"
 fi

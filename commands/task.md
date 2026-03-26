@@ -8,7 +8,7 @@ Create a task draft from the description below.
 4. Generate a slug from the description (kebab-case, max 5 words, ASCII only).
 5. Copy template from `~/.claude/templates/sdd/draft.md`. If `.claude/templates/draft.md` exists in the project, use that instead (project override).
 6. Fill placeholders: `{{ID}}`, `{{TITLE}}`, `{{DATE}}`, `{{DESCRIPTION}}`.
-7. Save to `{dir}/draft/{ID}-{slug}.md`.
+7. Save to `{dir}/1-draft/{ID}-{slug}.md`.
 8. Output: ID, file path, brief summary.
 
 ## Description

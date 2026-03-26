@@ -3,7 +3,7 @@ Generate a specification from a draft task using an agent team.
 ## Instructions
 
 1. Read `.tasks.toml`. If missing → tell user to run `/task-init` and stop.
-2. Locate the draft by `$ARGUMENTS` — match by ID, slug, or full path in `tasks/draft/`.
+2. Locate the draft by `$ARGUMENTS` — match by ID, slug, or full path in `tasks/1-draft/`.
 3. Read the draft file content.
 4. Read `CLAUDE.md` for project context.
 
@@ -13,22 +13,41 @@ This phase is **mandatory** and cannot be skipped.
 
 1. Read the draft task carefully.
 2. Explore the project codebase: domain structure, existing behavior related to the draft, constraints, conventions.
-3. Compile a list of clarifying questions for the user. Questions must cover:
-   - **Intent**: What is the business goal? Who benefits and how?
-   - **Scope boundaries**: What is explicitly out of scope? Are there adjacent features the user does NOT want touched?
-   - **Behavior details**: Any ambiguous "how should it work" scenarios — ask, don't assume.
-   - **Edge cases**: What should happen with empty data, errors, permissions, large volumes?
-   - **Priority & constraints**: Are there deadlines, performance budgets, or dependencies on other work?
-   - **Existing behavior**: If the draft changes existing functionality — confirm what the current behavior is and what exactly should change.
-4. **Ask the user ALL questions at once.** Group them logically. Minimum 3 questions, even if the draft seems clear — there are always unstated assumptions.
-5. **Wait for answers.** Do NOT proceed to Phase 2 until the user responds.
-6. If answers reveal new ambiguities — ask follow-up questions. Continue Q&A rounds until there are no more open questions. There is no limit on the number of rounds.
+3. Compile a list of clarifying questions for the user. Topics to cover:
+   - **Цель**: Какая бизнес-задача решается? Кому и как это поможет?
+   - **Границы**: Что явно НЕ входит в задачу? Есть ли смежные фичи, которые трогать не нужно?
+   - **Поведение**: Любые неоднозначные сценарии "как оно должно работать" — спроси, не додумывай.
+   - **Крайние случаи**: Что происходит при пустых данных, ошибках, нехватке прав, больших объёмах?
+   - **Приоритет и ограничения**: Есть ли дедлайны, требования к производительности, зависимости от другой работы?
+   - **Существующее поведение**: Если драфт меняет существующую функциональность — уточни, что сейчас и что именно должно измениться.
+4. **Ask questions ONE AT A TIME.** Follow this format for each question:
+
+   ```
+   **Вопрос N/M**: {краткий контекст — что ты нашёл в кодовой базе, если релевантно}
+
+   {Сам вопрос}
+
+   Варианты:
+   1. {вариант А}
+   2. {вариант Б}
+   3. {вариант В — если нужен}
+   4. Другое (напиши свой вариант)
+   ```
+
+   - Always provide answer options based on what you learned from the codebase and the draft. Options should represent realistic choices, not filler.
+   - The user can pick a number, write their own answer, or elaborate.
+   - Wait for the user's answer before asking the next question.
+   - Minimum 3 questions total, even if the draft seems clear.
+
+5. After each answer, if it reveals new ambiguities — add follow-up questions to the queue. Continue until there are no more open questions. There is no limit on the number of rounds.
 
 **Rules for this phase:**
+- ALL questions and options must be in **Russian**.
 - NEVER assume an answer. If something is unclear — ask.
 - NEVER skip this phase. Even a detailed draft has gaps that only the user can fill.
 - Frame questions in business/domain terms, not technical terms.
-- Include what you learned from exploring the codebase as context in your questions (e.g. "I see the system currently does X — should Y replace it or work alongside it?").
+- Include what you learned from exploring the codebase as context (e.g. "Я вижу, что сейчас система делает X — Y должен заменить это или работать параллельно?").
+- ONE question at a time. Do NOT dump all questions at once.
 
 ## Phase 2: Specification (Agent Team)
 
@@ -51,7 +70,7 @@ Create an agent team with two teammates:
    - **Acceptance Criteria**: each must be independently verifiable, written as "Given / When / Then" or simple declarative statements
    - **Edge Cases & Risks**: data volume, permissions, concurrency, empty states, error scenarios
    - **Affected Areas**: which parts of the system are affected (e.g. "user authentication flow", "order processing pipeline") — NOT file paths or class names
-4. Save draft spec to `tasks/spec/{ID}-{slug}.md`. Ensure frontmatter `status: awaiting-approval` is set (it comes from the template).
+4. Save draft spec to `tasks/2-spec/{ID}-{slug}.md`. Ensure frontmatter `status: awaiting-approval` is set (it comes from the template).
 5. Message Critic that the draft spec is ready for review.
 
 **Rules:**
@@ -90,7 +109,7 @@ Create an agent team with two teammates:
 ## Finalization (Lead)
 
 After the team finishes:
-1. Verify the spec file in `tasks/spec/` has `status: awaiting-approval`.
+1. Verify the spec file in `tasks/2-spec/` has `status: awaiting-approval`.
 2. Move the draft to `tasks/archive/drafts/`.
 3. Output:
    - Brief spec summary (3-5 sentences)

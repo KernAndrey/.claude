@@ -3,12 +3,12 @@ Implement an approved specification using an agent team.
 ## Instructions
 
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
-2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/ready/`.
+2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`.
 3. Read the full specification.
 4. Branch and worktree setup:
    - If `auto_branch = true`: create an isolated worktree using the `wt` script: `wt create task/{ID}-{slug}`. All implementation work (Coder and Reviewer agents) MUST run inside the worktree directory. The worktree path is returned by `wt create` — pass it to agents as their working directory.
    - If `auto_branch = false`: stay on the current branch, no worktree.
-5. Move spec file to `tasks/in-progress/`. Update `status: in-progress`.
+5. Move spec file to `tasks/4-in-progress/`. Update `status: in-progress`.
 
 ## Agent Team
 
@@ -77,7 +77,7 @@ After the team finishes (run all finalization steps inside the worktree director
    - `branch: task/{ID}-{slug}` (only if `auto_branch = true`; otherwise set to current branch name)
    - `updated: {TODAY}`
 
-3. Move file from `tasks/in-progress/` to `tasks/review/`.
+3. Move file from `tasks/4-in-progress/` to `tasks/5-review/`.
 
 4. Git commit: `feat({ID}): {title}`
 

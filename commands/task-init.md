@@ -6,13 +6,13 @@ Initialize Spec-Driven Development for the current project.
 2. Create the task directory structure:
    ```
    tasks/
-     draft/
-     spec/
-     ready/
-     in-progress/
-     review/
-     done/
-     blocked/
+     1-draft/
+     2-spec/
+     3-ready/
+     4-in-progress/
+     5-review/
+     6-done/
+     7-blocked/
      archive/
        drafts/
    ```
@@ -52,6 +52,7 @@ Initialize Spec-Driven Development for the current project.
    | `/implement <ID>` | Implement approved spec | Yes (Coder + Reviewer) |
    | `/task-done <ID>` | Mark task as done | No |
    | `/task-block <ID> <reason>` | Block task | No |
+   | `/decompose <idea>` | Decompose big idea into tasks | No |
    | `/task-list [filter]` | Show task board | No |
 
    ### Task Lifecycle
@@ -70,7 +71,7 @@ Initialize Spec-Driven Development for the current project.
 
    - Project config: `.tasks.toml`
    - Templates: `~/.claude/templates/sdd/` (global) or `.claude/templates/` (project override)
-   - Tasks: `tasks/`
+   - Tasks: `tasks/` (directories numbered for workflow order: `1-draft`, `2-spec`, etc.)
 
    ### Human-in-the-Loop Checkpoints
 

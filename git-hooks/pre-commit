@@ -4,6 +4,10 @@
 
 set -euo pipefail
 
+# Guard: prevent infinite recursion if .git/hooks/pre-commit forwards here
+[ "${_CLAUDE_HOOK_RUNNING:-}" = "1" ] && exit 0
+export _CLAUDE_HOOK_RUNNING=1
+
 # --- Step 1: Run repo-local pre-commit hook (linters: ruff, pylint, xmllint) ---
 # core.hooksPath overrides .git/hooks/, so we call the local one explicitly.
 # In worktrees, git-dir points to .git/worktrees/<name> which has no hooks/.

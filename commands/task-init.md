@@ -32,7 +32,7 @@ Initialize Spec-Driven Development for the current project.
    # critic_prompt = ".claude/prompts/spec-critic.md"
 
    [implement]
-   max_review_iterations = 2
+   max_review_iterations = 3
    ```
 5. Read existing `CLAUDE.md` (if present). Append the following section (do NOT overwrite existing content):
 

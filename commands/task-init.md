@@ -49,7 +49,7 @@ Initialize Spec-Driven Development for the current project.
    | `/task <description>` | Create draft from description | No |
    | `/spec <ID>` | Generate spec from draft | Yes (Analyst + Critic) |
    | `/task-approve <ID>` | Approve spec → ready | No |
-   | `/implement <ID>` | Implement approved spec | Yes (Coder + Reviewer) |
+   | `/implement <ID>` | Implement approved spec | Yes (Coder, Tester, 4 Reviewers) |
    | `/task-done <ID>` | Mark task as done | No |
    | `/task-block <ID> <reason>` | Block task | No |
    | `/decompose <idea>` | Decompose big idea into tasks | No |

@@ -76,25 +76,47 @@ Monitor: if Tester goes idle without a done signal — send a status check.
 
 ---
 
-### Phase 2: Review (4 parallel reviewers)
+### Phase 2: Review (4–5 parallel reviewers)
 
-This phase runs after Phase 1 regardless of time spent or code quality. All 4 reviewers must report. Hooks, automated linters, CI checks, or prior review rounds do not substitute for Phase 2.
+This phase runs after Phase 1 regardless of time spent or code quality. All reviewers must report. Hooks, automated linters, CI checks, or prior review rounds do not substitute for Phase 2.
 
 **Start only after Phase 1b is complete.**
 
-Spawn all 4 as teammates and send each their task:
+#### Determine if UI review is needed
+
+Check the changed files list from Coder. If ANY file matches a frontend pattern — spawn the UI-Reviewer:
+- `.xml`, `.html`, `.css`, `.scss`, `.less` — always
+- `.js`, `.jsx`, `.ts`, `.tsx`, `.vue`, `.svelte` — always
+- `.qweb`, `.mako`, `.jinja2` — template files
+
+If all changes are purely backend (`.py`, `.sql`, config `.json`) — skip UI-Reviewer.
+
+#### Spawn reviewers
+
+Spawn all as teammates and send each their task:
 
 - **Code-Reviewer** (`name: "code-reviewer"`) — production code quality
 - **Test-Reviewer** (`name: "test-reviewer"`) — test quality and coverage
 - **Spec-Auditor** (`name: "spec-auditor"`) — spec compliance
 - **Security-Reviewer** (`name: "security-reviewer"`) — security and architecture
+- **UI-Reviewer** (`name: "ui-reviewer"`) — visual verification *(only if frontend files changed)*
 
-Each reviewer message:
+Each code reviewer message:
 
 > Read your instructions: `~/.claude/agents/{agent-name}.md`
 > Spec file: `{spec_path}`
 > Working directory: `{worktree_path}`
 > Base branch for diff: `{base_branch}`
+> Report findings to me using the format from your agent file.
+
+UI-Reviewer message (when spawned):
+
+> Read your instructions: `~/.claude/agents/ui-reviewer.md`
+> Spec file: `{spec_path}`
+> Working directory: `{worktree_path}`
+> Base branch for diff: `{base_branch}`
+> Changed files: {changed_files_from_coder}
+> URL hints: {any relevant URLs or pages you can identify from the spec}
 > Report findings to me using the format from your agent file.
 
 Each reviewer will report in this format (defined in their agent file):
@@ -107,18 +129,18 @@ SUMMARY: X findings (Y MUST FIX, Z ...)
 
 Monitor: track which reviewers have reported. If any goes idle without reporting — send a status check.
 
-**Phase 2 is complete when ALL 4 reviewers have reported to the lead.**
+**Phase 2 is complete when ALL spawned reviewers have reported to the lead.**
 
 ---
 
 ### Phase 3: Fix & Verify (lead-orchestrated)
 
-Precondition: All 4 Phase 2 reviewers must have reported.
+Precondition: All spawned Phase 2 reviewers must have reported.
 
 #### Step 1: Assess
 
-From all 4 reviewer reports, build two fix lists:
-- **Coder fixes**: `MUST FIX` / `CRITICAL` findings from Code-Reviewer, Spec-Auditor, Security-Reviewer
+From all reviewer reports, build two fix lists:
+- **Coder fixes**: `MUST FIX` / `CRITICAL` findings from Code-Reviewer, Spec-Auditor, Security-Reviewer, UI-Reviewer
 - **Tester fixes**: `MUST FIX` findings from Test-Reviewer, missing coverage from Spec-Auditor
 
 If zero `MUST FIX` / `CRITICAL` across all reviewers — move all `SHOULD FIX` items to Known Concerns and skip to Finalization.
@@ -168,6 +190,7 @@ After 5 iterations: move all remaining items to Known Concerns with full detail.
 - Phase 2 — Test-Reviewer reported? If NO → message or spawn NOW.
 - Phase 2 — Spec-Auditor reported? If NO → message or spawn NOW.
 - Phase 2 — Security-Reviewer reported? If NO → message or spawn NOW.
+- Phase 2 — UI-Reviewer reported? (only if spawned) If NO → message or spawn NOW.
 - Phase 3 — Fix iterations completed (or no MUST FIX items)? If NO → run NOW.
 
 ### Steps
@@ -177,7 +200,7 @@ Run inside the worktree directory when `auto_branch = true`:
 1. Append sections from `~/.claude/templates/sdd/implementation-sections.md` to the spec file:
    - **Implementation Summary**: what was done, key decisions, what was deferred
    - **Known Concerns**: unresolved findings (reviewer name, severity, description for each)
-   - **Auto-Review Results**: test results, criteria coverage, verbatim VERDICT and SUMMARY from each of the 4 reviewers
+   - **Auto-Review Results**: test results, criteria coverage, verbatim VERDICT and SUMMARY from each spawned reviewer
    - **Steps for Manual Review**: 3-7 concrete steps. Format: `N. [Action] → [Expected result]`
 
 2. Update frontmatter:

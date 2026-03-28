@@ -49,3 +49,4 @@ projects/**//*.jsonl
 projects/**/*-*-*-*-*
 
 *.pyc
+__pycache__/

@@ -1,13 +1,11 @@
 ---
 name: prompt-engineer
 description: >
-  Helps write high-quality prompts, instructions, CLAUDE.md files, rules (.claude/rules/),
-  skills, and slash commands for Claude Code. Use this skill when the user:
-  creates or edits CLAUDE.md, writes rules or skills, formulates agent instructions,
-  asks to "make a prompt", "write an instruction", "optimize CLAUDE.md", "create a rule",
-  "make a skill", or any task related to structuring instructions for Claude Code.
-  Also use when the user complains that Claude ignores instructions, skips steps,
-  or doesn't follow rules.
+  Review prompt quality when editing ANY file that contains instructions for Claude Code.
+  TRIGGER when creating or editing files in: CLAUDE.md, .claude/rules/, .claude/commands/,
+  .claude/skills/, .claude/agents/, or any file whose purpose is to instruct an LLM agent.
+  Also trigger when the user asks to write a prompt, instruction, rule, skill, or agent definition,
+  or complains that Claude ignores instructions, skips steps, or doesn't follow rules.
 allowed-tools: Read, Write, Edit, Grep, Glob, Bash(cat *), Bash(wc *)
 ---
 

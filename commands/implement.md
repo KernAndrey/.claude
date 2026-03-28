@@ -1,18 +1,31 @@
 Implement an approved specification using an agent team.
 
-## Instructions
+**QUALITY MANDATE**: Speed is irrelevant. This task may run for hours — that is expected and acceptable. Every phase must complete fully. Skipping, shortcutting, or "accelerating" any phase is a failure. Do NOT substitute automated tools (hooks, linters, CI) for any phase — each phase exists for a reason.
+
+**COORDINATION RULES**:
+1. **Wait for done signals.** Never act on a teammate's work by reading their files, git history, or logs. Only the formal done signal (`CODER DONE`, `TESTER DONE`, `REVIEWER: ...`) confirms their work is complete. Intermediate results may be incomplete or change.
+2. **Supervise, don't abandon.** If a teammate has not reported for a long time:
+   - Message them: `STATUS CHECK: What is your current progress? Any blockers?`
+   - If they respond with progress (e.g. "running tests", "fixing lint") — continue waiting.
+   - If they are stuck on a loop or error — help unblock: suggest a different approach, point to relevant code, or clarify the spec.
+   - If they appear idle or unresponsive — check if TeammateIdle was triggered, then re-send the task.
+3. **Never bypass a teammate.** If Tester is slow — do NOT read test files and proceed without Tester's done signal. If a reviewer is slow — do NOT skip their review. The correct response to slowness is communication, not substitution.
+
+## Setup
 
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
 2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`.
 3. Read the full specification.
 4. Branch and worktree setup:
-   - If `auto_branch = true`: create an isolated worktree using the `wt` script: `wt create task/{ID}-{slug}`. All implementation work (all teammates) MUST run inside the worktree directory. The worktree path is returned by `wt create` — pass it to agents as their working directory.
-   - If `auto_branch = false`: stay on the current branch, no worktree.
-5. Move spec file to `tasks/4-in-progress/`. Update `status: in-progress`.
+   - If `auto_branch = true`: `wt create task/{ID}-{slug}`. Set `{worktree_path}` to the path returned by `wt create`. All teammates MUST work inside the worktree directory.
+   - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
+5. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
+6. Note the **base branch** for diffs (usually `main`). Reviewers will need it.
 
-## Agent Team
+## Agent Team — 6 teammates, 3 phases
 
-Create an agent team (not subagents) with **6 teammates** organized in 3 phases.
+Each teammate MUST read their agent file for full instructions.
+All 3 phases are mandatory. No phase may be skipped or merged.
 
 ---
 
@@ -20,178 +33,103 @@ Create an agent team (not subagents) with **6 teammates** organized in 3 phases.
 
 Spawn **Coder** and **Tester** simultaneously.
 
-#### Teammate: Coder
+**Coder spawn prompt:**
+> Read your instructions: `~/.claude/agents/coder.md`
+> Spec file: `{spec_path}`
+> Working directory: `{worktree_path}`
+> Implement the spec. Message Tester and lead when done.
 
-**Role:** Implement production code strictly according to the specification. Do NOT write tests.
+**Tester spawn prompt:**
+> Read your instructions: `~/.claude/agents/tester.md`
+> Spec file: `{spec_path}`
+> Working directory: `{worktree_path}`
+> Start writing test skeletons immediately. Wait for Coder's done signal to complete them.
 
-**Tasks:**
-1. Read the spec thoroughly: Objective, Scope, Behavior, Acceptance Criteria.
-2. Study the Affected Areas — explore the relevant parts of the codebase to understand current behavior and find the specific files/classes to change.
-3. Implement following the described Behavior:
-   - Write code incrementally — one logical block at a time
-   - Verify no syntax errors after each block
-4. When production code is complete — message **Tester** with a summary of what was implemented and which files were changed. Also message the **lead** that coding is done.
-5. If Tester reports a production code bug — fix it and notify Tester again.
+Coder and Tester collaborate on bugs directly:
+- Tester sends `PRODUCTION BUG FOUND` to Coder with file, expected/actual behavior.
+- Coder fixes and sends `CODER FIX APPLIED` back to Tester.
+- Neither crosses into the other's domain.
 
-**Rules:**
-- Stay strictly within Scope. If tempted to "fix something nearby" — DON'T. Note it in Known Concerns instead.
-- Match the project's existing code style and conventions.
-- Do NOT write any test code. That is Tester's responsibility.
-- When in doubt — check the spec, do not assume.
-
-#### Teammate: Tester
-
-**Role:** Dedicated test author. Does not write production code.
-
-**Tasks:**
-1. Read the spec, focusing on **Acceptance Criteria** and **Edge Cases & Risks**.
-2. **Immediately** start writing test skeletons based on Acceptance Criteria — do NOT wait for Coder:
-   - Create test file(s) following project conventions
-   - Write test method signatures and docstrings for every AC
-   - Add placeholder assertions with `# TODO: complete when implementation ready`
-   - Include edge case test stubs from Edge Cases & Risks section
-3. When **Coder** signals ready:
-   - Read the changed files to understand the actual implementation
-   - Complete all test stubs with real assertions
-   - Add additional tests suggested by implementation details (boundary values, error paths)
-4. Run all tests. Debug and fix test failures:
-   - **Test bug** (wrong import, wrong assertion) — fix the test yourself.
-   - **Production code bug** — message **Coder** with: file, expected behavior, actual behavior. Do NOT fix production code.
-5. When all tests pass — message the **lead** with test count and coverage summary.
-
-**Rules:**
-- Every acceptance criterion must have at least one corresponding test.
-- Write meaningful assertions — test actual output, state changes, side effects. Not just "doesn't crash".
-- Follow the project's existing test conventions (framework, file naming, fixtures).
-- Tests must be isolated — no test should depend on another test's state.
-- Do NOT write or modify production code.
-- If Coder has not signaled yet and stubs are done — study the codebase for test utilities, fixtures, and patterns to reuse.
+**Phase 1 is complete when BOTH send done signals to the lead:**
+- Coder: `CODER DONE.` with changed files list.
+- Tester: `TESTER DONE.` with test count and results.
 
 ---
 
-### Phase 2: Review (4 parallel reviewers)
+### Phase 2: Review (4 parallel reviewers) — MANDATORY
 
-**Start only after both Coder and Tester confirm Phase 1 is complete.**
+**This phase is NOT optional. It MUST run regardless of how long Phase 1 took.**
+Hooks, automated linters, CI checks, or prior code review rounds do NOT substitute for Phase 2.
+Even if the code "looks good" — all 4 reviewers MUST be spawned and MUST report.
 
-Spawn all 4 reviewers **simultaneously**. Each works independently and messages the **lead** when done. They do NOT message Coder or Tester directly.
+**Start only after Phase 1 is complete.**
 
-#### Teammate: Code-Reviewer
+Spawn all 4 simultaneously. Each gets the same context block + their agent file:
 
-**Role:** Review production code quality. Does NOT review tests.
+> Read your instructions: `~/.claude/agents/{agent-name}.md`
+> Spec file: `{spec_path}`
+> Working directory: `{worktree_path}`
+> Base branch for diff: `{base_branch}`
+> Report findings to lead using the format from your agent file.
 
-**Tasks:**
-1. Read the diff of all changed **production** files (exclude test files).
-2. Review against this checklist:
-   - [ ] Style consistency with the rest of the project
-   - [ ] SOLID principles — especially Single Responsibility and Open/Closed
-   - [ ] N+1 queries, inefficient loops, unnecessary database hits
-   - [ ] Unused imports, dead code, commented-out code
-   - [ ] Hardcoded values that should be configurable
-   - [ ] Method length — flag anything over ~30 lines
-   - [ ] Readability — variable names, function names, clarity
-   - [ ] Error handling — no silent catches, specific exception types, actionable messages
-   - [ ] Proper use of framework patterns and conventions
-3. Compile findings and message the **lead**.
+Agents to spawn:
+- **Code-Reviewer** (`code-reviewer.md`) — production code quality
+- **Test-Reviewer** (`test-reviewer.md`) — test quality and coverage
+- **Spec-Auditor** (`spec-auditor.md`) — spec compliance
+- **Security-Reviewer** (`security-reviewer.md`) — security and architecture
 
-**Rules:**
-- Each finding: file, line, what's wrong, suggested fix.
-- Severity: `MUST FIX` (blocks release) / `SHOULD FIX` (improves quality) / `NIT` (style preference).
-- Do NOT review test code — that is Test-Reviewer's domain.
-- Do NOT rewrite code — only report findings.
+Each reviewer will report in this format (defined in their agent file):
+```
+REVIEWER: {role}
+VERDICT: CLEAN/SECURE/COMPLIANT | HAS FINDINGS
+FINDINGS: ...
+SUMMARY: X findings (Y MUST FIX, Z ...)
+```
 
-#### Teammate: Test-Reviewer
-
-**Role:** Review test quality and coverage. Does NOT review production code.
-
-**Tasks:**
-1. Read the spec's Acceptance Criteria and Edge Cases.
-2. Read all changed/added test files.
-3. Review against this checklist:
-   - [ ] Every acceptance criterion has at least one corresponding test
-   - [ ] Edge cases from the spec are covered
-   - [ ] Assert quality — tests verify actual outcomes, not just absence of errors
-   - [ ] Test isolation — no shared mutable state, no test-order dependencies
-   - [ ] No flaky patterns (sleep-based waits, time-dependent assertions, unmocked external calls)
-   - [ ] Mocking strategy — mocks at the right boundary, not over-mocking internals
-   - [ ] Test naming is descriptive — a failing test name should explain what broke
-   - [ ] Negative tests exist — not just happy path
-4. Run the test suite independently to confirm all tests pass.
-5. Compile findings and message the **lead**.
-
-**Rules:**
-- Each finding: test file, test name, what's missing or wrong, suggested fix.
-- Severity: `MUST FIX` / `SHOULD FIX` / `NIT`.
-- Missing test for a critical AC is always `MUST FIX`.
-- Do NOT review production code. Do NOT rewrite tests — only report findings.
-
-#### Teammate: Spec-Auditor
-
-**Role:** Verify implementation matches the specification exactly — no more, no less.
-
-**Tasks:**
-1. Read the spec: Objective, Scope (In Scope AND Out of Scope), Behavior, Acceptance Criteria.
-2. Read the diff of ALL changed files (production and test).
-3. Audit against this checklist:
-   - [ ] **Behavior match**: Walk through each paragraph of Behavior — is it implemented?
-   - [ ] **No scope creep**: Any code not described in the spec? Extra features, "while I'm here" improvements?
-   - [ ] **Nothing missing**: Every item in "In Scope" is addressed.
-   - [ ] **Out of Scope respected**: Nothing from "Out of Scope" was implemented.
-   - [ ] **AC coverage**: Each acceptance criterion is addressed by both code and tests.
-   - [ ] **Edge Cases**: Edge cases from the spec are handled or documented as deferred.
-4. Compile findings and message the **lead**.
-
-**Rules:**
-- This is a **compliance** review, not a quality review. You don't care about code style — only spec adherence.
-- Each finding must reference the specific spec section that is violated or unaddressed.
-- Severity: `MUST FIX` (spec violation) / `CONCERN` (ambiguous spec area).
-- Scope creep is always `MUST FIX`.
-- Do NOT rewrite code — only report findings.
-
-#### Teammate: Security-Reviewer
-
-**Role:** Review security, data integrity, and architectural fitness.
-
-**Tasks:**
-1. Read the diff of ALL changed files.
-2. Review against this checklist:
-   - [ ] **Injection**: SQL injection, XSS, command injection, template injection
-   - [ ] **Access control**: Permission checks in place? Unauthorized users blocked?
-   - [ ] **Data validation**: Input validated at boundaries (API endpoints, form handlers, file uploads)
-   - [ ] **Auth**: No bypasses introduced, no `sudo()` without justification
-   - [ ] **Sensitive data**: No secrets, tokens, or PII logged or exposed
-   - [ ] **CSRF/CORS**: If web endpoints changed, protections maintained?
-   - [ ] **Architecture**: Respects existing patterns? Appropriate coupling? Correct dependency direction?
-   - [ ] **Regression risk**: Could this break existing functionality in affected modules?
-   - [ ] **Error leakage**: Do error responses expose internal details to end users?
-3. If Playwright or E2E framework is available — suggest smoke tests for affected functionality.
-4. Compile findings and message the **lead**.
-
-**Rules:**
-- Each finding: file, line, vulnerability type, impact, suggested fix.
-- Severity: `CRITICAL` (exploitable vulnerability) / `MUST FIX` (security weakness) / `ADVISORY` (defense-in-depth).
-- `CRITICAL` findings must include an attack scenario.
-- Do NOT rewrite code — only report findings.
+**Phase 2 is complete when ALL 4 reviewers have reported to the lead.**
 
 ---
 
-### Phase 3: Fix Iterations (lead-orchestrated)
+### Phase 3: Fix & Verify (lead-orchestrated)
 
-1. **Consolidate**: Collect all reviewer findings. Build two lists:
-   - **Coder fixes**: production code findings from Code-Reviewer, Spec-Auditor, Security-Reviewer
-   - **Tester fixes**: test findings from Test-Reviewer and Spec-Auditor (coverage gaps)
+**PRECONDITION: All 4 Phase 2 reviewers must have reported.**
 
-2. **Dispatch**: Send one consolidated message to Coder, one to Tester (only if they have items). Include severity and source reviewer for each item.
+#### Step 1: Assess
 
-3. **Fix round**: Coder and Tester work in parallel.
-   - If Coder's fixes change API/behavior — Coder messages Tester directly so tests can adapt.
-   - Both message lead when done. Tester re-runs all tests.
+From all 4 reviewer reports, build two fix lists:
+- **Coder fixes**: `MUST FIX` / `CRITICAL` findings from Code-Reviewer, Spec-Auditor, Security-Reviewer
+- **Tester fixes**: `MUST FIX` findings from Test-Reviewer, missing coverage from Spec-Auditor
 
-4. **Targeted re-review**: Send updated diff ONLY to reviewers who had `MUST FIX` or `CRITICAL` findings. They check ONLY their own previously raised issues.
-   - Response: `PASS` (all resolved) or list of remaining issues.
+If zero `MUST FIX` / `CRITICAL` across all reviewers — move all `SHOULD FIX` items to Known Concerns and skip to Finalization.
 
-5. **Maximum 3 iterations.** After that:
-   - `CRITICAL` security → lead attempts one more targeted fix.
-   - All other remaining items → document in **Known Concerns** with full detail.
+#### Step 2: Fix round
+
+Send one consolidated message to Coder with all production code fixes:
+> These findings need to be fixed. For each item: severity, source reviewer, file:line, description.
+> After fixing, message Tester if any API/behavior changed. Then message lead: `CODER FIX ROUND DONE.`
+
+Send one consolidated message to Tester with all test fixes (if any):
+> These test findings need to be fixed. For each item: severity, source reviewer, test file, description.
+> Re-run all tests after fixes. Then message lead: `TESTER FIX ROUND DONE.`
+
+#### Step 3: Verification
+
+Spawn ONLY the reviewers who had `MUST FIX` or `CRITICAL` findings.
+Same spawn prompt as Phase 2, but add:
+> This is a **re-review**. Check ONLY your previously raised MUST FIX / CRITICAL items.
+> Report: `PASS` if all resolved, or list remaining issues.
+
+#### Step 4: Loop
+
+If any reviewer returned non-PASS — repeat steps 2-3.
+Maximum **5 iterations**.
+
+#### Step 5: Escalation
+
+If the SAME finding persists unfixed for 2 consecutive iterations — lead investigates
+directly and either fixes it or documents why it cannot be resolved within current scope.
+
+After 5 iterations: move all remaining items to Known Concerns with full detail.
 
 **Conflict resolution priority:** Security CRITICAL > Spec compliance > Code quality > Style nits.
 
@@ -199,27 +137,37 @@ Spawn all 4 reviewers **simultaneously**. Each works independently and messages 
 
 ## Finalization (Lead)
 
-After the team finishes (run all finalization steps inside the worktree directory when `auto_branch = true`):
+### Gate check — STOP and verify:
+
+- Phase 1 — Coder sent `CODER DONE`? If NO → investigate.
+- Phase 1 — Tester sent `TESTER DONE` with test count? If NO → investigate.
+- Phase 2 — Code-Reviewer reported with `REVIEWER: Code-Reviewer`? If NO → spawn NOW.
+- Phase 2 — Test-Reviewer reported with `REVIEWER: Test-Reviewer`? If NO → spawn NOW.
+- Phase 2 — Spec-Auditor reported with `REVIEWER: Spec-Auditor`? If NO → spawn NOW.
+- Phase 2 — Security-Reviewer reported with `REVIEWER: Security-Reviewer`? If NO → spawn NOW.
+- Phase 3 — Fix iterations completed (or no MUST FIX items)? If NO → run NOW.
+
+**If any reviewer was not spawned — spawn them now and wait before continuing.**
+
+### Steps
+
+Run inside the worktree directory when `auto_branch = true`:
 
 1. Append sections from `~/.claude/templates/sdd/implementation-sections.md` to the spec file:
    - **Implementation Summary**: what was done, key decisions, what was deferred
-   - **Known Concerns**: potential issues, tech debt, unresolved review findings (include reviewer name, severity, description for each)
-   - **Auto-Review Results**: test results, criteria coverage, Playwright results, regressions, summary of findings by reviewer
-   - **Steps for Manual Review**: 3-7 concrete steps for human verification.
-     Format: `N. [Action] → [Expected result]`
-     These steps must be detailed enough to follow a week later without remembering context.
+   - **Known Concerns**: unresolved findings (reviewer name, severity, description for each)
+   - **Auto-Review Results**: test results, criteria coverage, verbatim VERDICT and SUMMARY from each of the 4 reviewers
+   - **Steps for Manual Review**: 3-7 concrete steps. Format: `N. [Action] → [Expected result]`
 
 2. Update frontmatter:
-   - `status: review`
-   - `completed: {TODAY}`
-   - `branch: task/{ID}-{slug}` (only if `auto_branch = true`; otherwise set to current branch name)
-   - `updated: {TODAY}`
+   - `status: review`, `completed: {TODAY}`, `updated: {TODAY}`
+   - `branch: task/{ID}-{slug}` (if `auto_branch = true`; otherwise current branch)
 
 3. Move file from `tasks/4-in-progress/` to `tasks/5-review/`.
 
 4. Git commit: `feat({ID}): {title}`
 
-5. If `auto_branch = true`: remove the worktree with `wt remove task/{ID}-{slug}`.
+5. If `auto_branch = true`: `wt remove task/{ID}-{slug}`.
 
 6. Output:
    - Implementation Summary (brief)

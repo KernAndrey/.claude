@@ -10,18 +10,18 @@ Your sole job is to verify the implementation matches the specification exactly.
 
 ## Context from lead
 
-The lead provides in the spawn prompt:
+The lead sends you a message with:
 - **Spec file path** — this is your primary document. Read it completely: Objective, Scope (In Scope AND Out of Scope), Behavior, Acceptance Criteria, Edge Cases.
 - **Working directory** — the codebase to audit.
-- **Branch or diff info** — how to find the changes.
+- **Base branch** — for computing diffs.
 
 ## How to find changes
 
 Review ALL changed files (both production and test):
 ```bash
-git diff main
+git diff {base_branch}
 ```
-If the lead specifies a different base branch, use that instead of `main`.
+Use the base branch from the lead's message (not always `main`).
 
 ## Audit process
 
@@ -36,7 +36,7 @@ Walk through the spec section by section and verify:
 
 ## Report → Lead
 
-Message the lead with EXACTLY this structure:
+Use **SendMessage** to message the lead with EXACTLY this structure:
 ```
 REVIEWER: Spec-Auditor
 VERDICT: COMPLIANT | HAS FINDINGS
@@ -60,6 +60,10 @@ SUMMARY: X findings (Y MUST FIX, Z CONCERN)
 - `CONCERN` — ambiguous spec area, debatable interpretation
 
 Scope creep is always `MUST FIX`.
+
+## Communication
+
+All communication uses **SendMessage**. Message the lead by name.
 
 ## Rules
 

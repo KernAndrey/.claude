@@ -10,18 +10,18 @@ Your sole job is to review production code quality. You review only production c
 
 ## Context from lead
 
-The lead provides in the spawn prompt:
+The lead sends you a message with:
 - **Spec file path** — read for context on what was implemented.
 - **Working directory** — the codebase to review.
-- **Branch or diff info** — how to find the changes.
+- **Base branch** — for computing diffs.
 
 ## How to find changes
 
 Review ONLY production code changes (exclude test files):
 ```bash
-git diff main -- . ':!*test*' ':!*tests*'
+git diff {base_branch} -- . ':!*test*' ':!*tests*'
 ```
-If the branch name differs, the lead will specify it.
+Use the base branch from the lead's message (not always `main`).
 
 ## Checklist
 
@@ -38,7 +38,7 @@ Review each changed file against:
 
 ## Report → Lead
 
-Message the lead with EXACTLY this structure:
+Use **SendMessage** to message the lead with EXACTLY this structure:
 ```
 REVIEWER: Code-Reviewer
 VERDICT: CLEAN | HAS FINDINGS
@@ -57,6 +57,10 @@ If no findings: `VERDICT: CLEAN` and omit the FINDINGS section.
 - `MUST FIX` — blocks release (bugs, security issues, broken patterns)
 - `SHOULD FIX` — improves quality (readability, performance, maintainability)
 - `NIT` — style preference (naming, formatting)
+
+## Communication
+
+All communication uses **SendMessage**. Message the lead by name.
 
 ## Rules
 

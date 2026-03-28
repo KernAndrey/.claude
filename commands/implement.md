@@ -2,15 +2,6 @@ Implement an approved specification using an agent team.
 
 **QUALITY MANDATE**: Thoroughness over speed. This task may run for hours — that is expected and acceptable. Every phase completes fully. Each phase exists for a reason that automated tools (hooks, linters, CI) cannot replace.
 
-**COORDINATION RULES**:
-1. **Wait for done signals.** Only the formal done signal (`CODER DONE`, `TESTER DONE`, `REVIEWER: ...`) confirms a teammate's work is complete. Intermediate results may be incomplete or change.
-2. **Supervise, don't abandon.** If a teammate has not reported for a long time:
-   - Message them: `STATUS CHECK: What is your current progress? Any blockers?`
-   - If they respond with progress (e.g. "running tests", "fixing lint") — continue waiting.
-   - If they are stuck on a loop or error — help unblock: suggest a different approach, point to relevant code, or clarify the spec.
-   - If they appear idle or unresponsive — check if TeammateIdle was triggered, then re-send the task.
-3. **The correct response to a slow teammate is communication, not substitution.** If Tester is slow — wait and ask for status. If a reviewer is slow — wait. Wait for every done signal before proceeding.
-
 ## Setup
 
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
@@ -21,60 +12,90 @@ Implement an approved specification using an agent team.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
 5. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
 6. Note the **base branch** for diffs (usually `main`). Reviewers will need it.
+7. **Create the team:** `TeamCreate` with `team_name: "impl-{ID}"`. You are the lead.
 
-## Agent Team — 6 teammates, 3 phases
+## Team & Communication
+
+All agents are spawned as **teammates** (`team_name: "impl-{ID}"`). This gives the lead:
+- **Live messaging** — SendMessage to any teammate at any time (even idle ones).
+- **Automatic delivery** — teammate messages arrive as conversation turns, no polling needed.
+- **Idle notifications** — the system notifies the lead when a teammate goes idle.
+
+**COORDINATION RULES**:
+1. **Teammates go idle between turns — this is normal.** Idle means "waiting for input", not "stuck". Send a message to wake them up.
+2. **Supervise actively.** If a teammate goes idle without sending a done signal — message them: `STATUS CHECK: What is your current progress? Any blockers?`
+3. **Unstick looping agents.** If a teammate reports the same error or action repeatedly — intervene with a specific suggestion: point to relevant code, suggest a different approach, or clarify the spec.
+4. **Done signals are mandatory.** Only `CODER DONE`, `TESTER DONE`, or `REVIEWER: ...` confirms completion.
+5. **Replace a non-responsive teammate:** read their output → diagnose the issue → spawn a replacement with a corrected prompt.
+
+## Agent Team — 6 teammates, sequential phases
 
 Each teammate reads their agent file for full instructions.
-All 3 phases are mandatory. No phase may be skipped or merged.
+All phases are mandatory. No phase may be skipped or merged.
 
 ---
 
-### Phase 1: Implementation (parallel)
+### Phase 1a: Code
 
-Spawn **Coder** and **Tester** simultaneously.
+Spawn **Coder** as a teammate (`name: "coder"`, `team_name: "impl-{ID}"`).
+Send the task via message:
 
-**Coder spawn prompt:**
 > Read your instructions: `~/.claude/agents/coder.md`
 > Spec file: `{spec_path}`
 > Working directory: `{worktree_path}`
-> Implement the spec. Message Tester and lead when done.
+> Implement the spec. Message me when done with `CODER DONE.` and list of changed files.
 
-**Tester spawn prompt:**
+Monitor: if Coder goes idle without a done signal — send a status check.
+
+**Phase 1a is complete when Coder messages:** `CODER DONE.` with changed files list.
+
+---
+
+### Phase 1b: Test
+
+Start only after Phase 1a is complete.
+Spawn **Tester** as a teammate (`name: "tester"`, `team_name: "impl-{ID}"`).
+Send the task via message:
+
 > Read your instructions: `~/.claude/agents/tester.md`
 > Spec file: `{spec_path}`
 > Working directory: `{worktree_path}`
-> Start writing test skeletons immediately. Wait for Coder's done signal to complete them.
+> Coder is done. Changed files: {changed_files_from_coder}
+> Write tests for the implementation. Message me when done with `TESTER DONE.` and test results.
+> If you find a production bug, message me with `PRODUCTION BUG FOUND` and details.
 
-Coder and Tester collaborate on bugs directly:
-- Tester sends `PRODUCTION BUG FOUND` to Coder with file, expected/actual behavior.
-- Coder fixes and sends `CODER FIX APPLIED` back to Tester.
-- Neither crosses into the other's domain.
+If Tester reports `PRODUCTION BUG FOUND`:
+- Message Coder with the bug report (Coder is still alive as a teammate).
+- Wait for Coder's `CODER FIX APPLIED` message.
+- Message Tester to re-run affected tests.
+- Repeat until all bugs resolved.
 
-**Phase 1 is complete when BOTH send done signals to the lead:**
-- Coder: `CODER DONE.` with changed files list.
-- Tester: `TESTER DONE.` with test count and results.
+Monitor: if Tester goes idle without a done signal — send a status check.
+
+**Phase 1b is complete when Tester messages:** `TESTER DONE.` with test count and results.
 
 ---
 
 ### Phase 2: Review (4 parallel reviewers)
 
-This phase runs after Phase 1 regardless of time spent or code quality. All 4 reviewers are spawned and all 4 must report. Hooks, automated linters, CI checks, or prior review rounds do not substitute for Phase 2.
+This phase runs after Phase 1 regardless of time spent or code quality. All 4 reviewers must report. Hooks, automated linters, CI checks, or prior review rounds do not substitute for Phase 2.
 
-**Start only after Phase 1 is complete.**
+**Start only after Phase 1b is complete.**
 
-Spawn all 4 simultaneously. Each gets the same context block + their agent file:
+Spawn all 4 as teammates and send each their task:
+
+- **Code-Reviewer** (`name: "code-reviewer"`) — production code quality
+- **Test-Reviewer** (`name: "test-reviewer"`) — test quality and coverage
+- **Spec-Auditor** (`name: "spec-auditor"`) — spec compliance
+- **Security-Reviewer** (`name: "security-reviewer"`) — security and architecture
+
+Each reviewer message:
 
 > Read your instructions: `~/.claude/agents/{agent-name}.md`
 > Spec file: `{spec_path}`
 > Working directory: `{worktree_path}`
 > Base branch for diff: `{base_branch}`
-> Report findings to lead using the format from your agent file.
-
-Agents to spawn:
-- **Code-Reviewer** (`code-reviewer.md`) — production code quality
-- **Test-Reviewer** (`test-reviewer.md`) — test quality and coverage
-- **Spec-Auditor** (`spec-auditor.md`) — spec compliance
-- **Security-Reviewer** (`security-reviewer.md`) — security and architecture
+> Report findings to me using the format from your agent file.
 
 Each reviewer will report in this format (defined in their agent file):
 ```
@@ -83,6 +104,8 @@ VERDICT: CLEAN/SECURE/COMPLIANT | HAS FINDINGS
 FINDINGS: ...
 SUMMARY: X findings (Y MUST FIX, Z ...)
 ```
+
+Monitor: track which reviewers have reported. If any goes idle without reporting — send a status check.
 
 **Phase 2 is complete when ALL 4 reviewers have reported to the lead.**
 
@@ -102,18 +125,20 @@ If zero `MUST FIX` / `CRITICAL` across all reviewers — move all `SHOULD FIX` i
 
 #### Step 2: Fix round
 
-Send one consolidated message to Coder with all production code fixes:
+Message Coder with all production code fixes:
 > These findings need to be fixed. For each item: severity, source reviewer, file:line, description.
-> After fixing, message Tester if any API/behavior changed. Then message lead: `CODER FIX ROUND DONE.`
+> After fixing, message me: `CODER FIX ROUND DONE.` Include a note if any API or behavior changed.
 
-Send one consolidated message to Tester with all test fixes (if any):
+If Coder reports API/behavior changes — forward those to Tester.
+
+Message Tester with all test fixes (if any):
 > These test findings need to be fixed. For each item: severity, source reviewer, test file, description.
-> Re-run all tests after fixes. Then message lead: `TESTER FIX ROUND DONE.`
+> Re-run all tests after fixes. Then message me: `TESTER FIX ROUND DONE.`
 
 #### Step 3: Verification
 
-Spawn ONLY the reviewers who had `MUST FIX` or `CRITICAL` findings.
-Same spawn prompt as Phase 2, but add:
+Spawn ONLY the reviewers who had `MUST FIX` or `CRITICAL` findings (or message existing ones).
+Same task as Phase 2, but add:
 > This is a **re-review**. Check ONLY your previously raised MUST FIX / CRITICAL items.
 > Report: `PASS` if all resolved, or list remaining issues.
 
@@ -137,15 +162,13 @@ After 5 iterations: move all remaining items to Known Concerns with full detail.
 
 ### Gate check — verify before continuing:
 
-- Phase 1 — Coder sent `CODER DONE`? If NO → investigate.
-- Phase 1 — Tester sent `TESTER DONE` with test count? If NO → investigate.
-- Phase 2 — Code-Reviewer reported with `REVIEWER: Code-Reviewer`? If NO → spawn NOW.
-- Phase 2 — Test-Reviewer reported with `REVIEWER: Test-Reviewer`? If NO → spawn NOW.
-- Phase 2 — Spec-Auditor reported with `REVIEWER: Spec-Auditor`? If NO → spawn NOW.
-- Phase 2 — Security-Reviewer reported with `REVIEWER: Security-Reviewer`? If NO → spawn NOW.
+- Phase 1a — Coder sent `CODER DONE`? If NO → message Coder NOW.
+- Phase 1b — Tester sent `TESTER DONE` with test count? If NO → message Tester NOW.
+- Phase 2 — Code-Reviewer reported? If NO → message or spawn NOW.
+- Phase 2 — Test-Reviewer reported? If NO → message or spawn NOW.
+- Phase 2 — Spec-Auditor reported? If NO → message or spawn NOW.
+- Phase 2 — Security-Reviewer reported? If NO → message or spawn NOW.
 - Phase 3 — Fix iterations completed (or no MUST FIX items)? If NO → run NOW.
-
-**If any reviewer was not spawned — spawn them now and wait before continuing.**
 
 ### Steps
 
@@ -167,7 +190,9 @@ Run inside the worktree directory when `auto_branch = true`:
 
 5. If `auto_branch = true`: `wt remove task/{ID}-{slug}`.
 
-6. Output:
+6. Shutdown all teammates: send `{type: "shutdown_request"}` to each.
+
+7. Output:
    - Implementation Summary (brief)
    - Known Concerns (if any)
    - Steps for Manual Review (full list)

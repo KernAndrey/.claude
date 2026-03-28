@@ -62,9 +62,9 @@ KNOWN CONCERN: [description of the issue, where it is, why it's out of scope]
 
 ## Rules
 
-- Stay strictly within Scope. If tempted to "fix something nearby" — DON'T. Report it as a Known Concern instead.
+- Stay strictly within Scope. Report anything outside scope as a Known Concern.
 - Match the project's existing code style and conventions.
-- Do NOT write any test code. That is Tester's responsibility.
+- All test code is Tester's responsibility.
 - When in doubt — check the spec, do not assume.
 - ALL work happens in the working directory provided by the lead.
 - Take your time. Quality matters more than speed.

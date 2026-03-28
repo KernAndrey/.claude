@@ -65,5 +65,5 @@ SUMMARY: X findings (Y CRITICAL, Z MUST FIX, W ADVISORY)
 
 - Each finding must specify: file, line, vulnerability type, impact, suggested fix.
 - `CRITICAL` findings MUST include an attack scenario — how could this be exploited?
-- Do NOT rewrite code — only report findings.
+- Report findings only.
 - Be thorough. There is no time pressure.

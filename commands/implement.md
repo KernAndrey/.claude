@@ -1,15 +1,15 @@
 Implement an approved specification using an agent team.
 
-**QUALITY MANDATE**: Speed is irrelevant. This task may run for hours — that is expected and acceptable. Every phase must complete fully. Skipping, shortcutting, or "accelerating" any phase is a failure. Do NOT substitute automated tools (hooks, linters, CI) for any phase — each phase exists for a reason.
+**QUALITY MANDATE**: Thoroughness over speed. This task may run for hours — that is expected and acceptable. Every phase completes fully. Each phase exists for a reason that automated tools (hooks, linters, CI) cannot replace.
 
 **COORDINATION RULES**:
-1. **Wait for done signals.** Never act on a teammate's work by reading their files, git history, or logs. Only the formal done signal (`CODER DONE`, `TESTER DONE`, `REVIEWER: ...`) confirms their work is complete. Intermediate results may be incomplete or change.
+1. **Wait for done signals.** Only the formal done signal (`CODER DONE`, `TESTER DONE`, `REVIEWER: ...`) confirms a teammate's work is complete. Intermediate results may be incomplete or change.
 2. **Supervise, don't abandon.** If a teammate has not reported for a long time:
    - Message them: `STATUS CHECK: What is your current progress? Any blockers?`
    - If they respond with progress (e.g. "running tests", "fixing lint") — continue waiting.
    - If they are stuck on a loop or error — help unblock: suggest a different approach, point to relevant code, or clarify the spec.
    - If they appear idle or unresponsive — check if TeammateIdle was triggered, then re-send the task.
-3. **Never bypass a teammate.** If Tester is slow — do NOT read test files and proceed without Tester's done signal. If a reviewer is slow — do NOT skip their review. The correct response to slowness is communication, not substitution.
+3. **The correct response to a slow teammate is communication, not substitution.** If Tester is slow — wait and ask for status. If a reviewer is slow — wait. Wait for every done signal before proceeding.
 
 ## Setup
 
@@ -17,14 +17,14 @@ Implement an approved specification using an agent team.
 2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`.
 3. Read the full specification.
 4. Branch and worktree setup:
-   - If `auto_branch = true`: `wt create task/{ID}-{slug}`. Set `{worktree_path}` to the path returned by `wt create`. All teammates MUST work inside the worktree directory.
+   - If `auto_branch = true`: `wt create task/{ID}-{slug}`. Set `{worktree_path}` to the path returned by `wt create`. All teammates work inside the worktree directory.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
 5. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
 6. Note the **base branch** for diffs (usually `main`). Reviewers will need it.
 
 ## Agent Team — 6 teammates, 3 phases
 
-Each teammate MUST read their agent file for full instructions.
+Each teammate reads their agent file for full instructions.
 All 3 phases are mandatory. No phase may be skipped or merged.
 
 ---
@@ -56,11 +56,9 @@ Coder and Tester collaborate on bugs directly:
 
 ---
 
-### Phase 2: Review (4 parallel reviewers) — MANDATORY
+### Phase 2: Review (4 parallel reviewers)
 
-**This phase is NOT optional. It MUST run regardless of how long Phase 1 took.**
-Hooks, automated linters, CI checks, or prior code review rounds do NOT substitute for Phase 2.
-Even if the code "looks good" — all 4 reviewers MUST be spawned and MUST report.
+This phase runs after Phase 1 regardless of time spent or code quality. All 4 reviewers are spawned and all 4 must report. Hooks, automated linters, CI checks, or prior review rounds do not substitute for Phase 2.
 
 **Start only after Phase 1 is complete.**
 
@@ -92,7 +90,7 @@ SUMMARY: X findings (Y MUST FIX, Z ...)
 
 ### Phase 3: Fix & Verify (lead-orchestrated)
 
-**PRECONDITION: All 4 Phase 2 reviewers must have reported.**
+Precondition: All 4 Phase 2 reviewers must have reported.
 
 #### Step 1: Assess
 
@@ -137,7 +135,7 @@ After 5 iterations: move all remaining items to Known Concerns with full detail.
 
 ## Finalization (Lead)
 
-### Gate check — STOP and verify:
+### Gate check — verify before continuing:
 
 - Phase 1 — Coder sent `CODER DONE`? If NO → investigate.
 - Phase 1 — Tester sent `TESTER DONE` with test count? If NO → investigate.

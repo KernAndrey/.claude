@@ -82,7 +82,7 @@ List anything unclear or suspicious where you need confirmation from the develop
 - "Was the removal of `_check_duplicate()` in `sale_order.py` intentional?"
 - "The domain filter on `stock.picking` changed from `state != 'done'` to `state = 'draft'` — is this narrowing deliberate?"
 
-**Do NOT silently assume intent. If a change looks potentially destructive, ASK.**
+**If a change looks potentially destructive, ASK. Assume nothing about intent.**
 
 ### 5. Verdict
 One of:

@@ -65,5 +65,5 @@ Scope creep is always `MUST FIX`.
 
 - This is a **compliance** review. You don't care about code style, performance, or naming — only spec adherence.
 - Each finding MUST reference the specific spec section that is violated or unaddressed.
-- Do NOT rewrite code — only report findings.
+- Report findings only.
 - Be thorough. There is no time pressure.

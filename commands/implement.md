@@ -1,6 +1,10 @@
 Implement an approved specification using an agent team.
 
-**QUALITY MANDATE**: Thoroughness over speed. This task may run for hours — that is expected and acceptable. Every phase completes fully. Each phase exists for a reason that automated tools (hooks, linters, CI) cannot replace.
+Begin by saying to the user: **"I will spawn an agent team to implement this spec. I am the lead — I coordinate, I don't code or review."**
+
+## Quality mandate
+
+Thoroughness over speed. This task may run for hours — that is expected and acceptable. Every phase completes fully. Each phase exists for a reason that automated tools (hooks, linters, CI) cannot replace.
 
 ## Setup
 
@@ -21,17 +25,22 @@ All agents are spawned as **teammates** (`team_name: "impl-{ID}"`). This gives t
 - **Automatic delivery** — teammate messages arrive as conversation turns, no polling needed.
 - **Idle notifications** — the system notifies the lead when a teammate goes idle.
 
-**COORDINATION RULES**:
+### Coordination rules
 1. **Teammates go idle between turns — this is normal.** Idle means "waiting for input", not "stuck". Send a message to wake them up.
 2. **Supervise actively.** If a teammate goes idle without sending a done signal — message them: `STATUS CHECK: What is your current progress? Any blockers?`
 3. **Unstick looping agents.** If a teammate reports the same error or action repeatedly — intervene with a specific suggestion: point to relevant code, suggest a different approach, or clarify the spec.
 4. **Done signals are mandatory.** Only `CODER DONE`, `TESTER DONE`, or `REVIEWER: ...` confirms completion.
 5. **Replace a non-responsive teammate:** read their output → diagnose the issue → spawn a replacement with a corrected prompt.
+6. **Recover from crashes.** If any teammate's process terminates (tmux pane closes, context overflow):
+   - Read their last output.
+   - Spawn a replacement with (a) narrowed context — only relevant files, (b) summary of completed work, (c) specific remaining tasks.
+   - Resume from where the previous teammate stopped.
+   - Maximum **3 restart attempts** per teammate. After 3 failed restarts — lead takes over the remaining work directly or documents in Known Concerns.
 
 ## Agent Team — 6 teammates, sequential phases
 
 Each teammate reads their agent file for full instructions.
-All phases are mandatory. No phase may be skipped or merged.
+Complete every phase in sequence. All phases are mandatory.
 
 ---
 
@@ -53,6 +62,8 @@ Monitor: if Coder goes idle without a done signal — send a status check.
 
 ### Phase 1b: Test
 
+Say: **"Coder is done. Spawning Tester to write tests. I will coordinate bug fixes between them if needed."**
+
 Start only after Phase 1a is complete.
 Spawn **Tester** as a teammate (`name: "tester"`, `team_name: "impl-{ID}"`).
 Send the task via message:
@@ -69,6 +80,7 @@ If Tester reports `PRODUCTION BUG FOUND`:
 - Wait for Coder's `CODER FIX APPLIED` message.
 - Message Tester to re-run affected tests.
 - Repeat until all bugs resolved.
+- Maximum **7 bug-fix rounds**. If bugs persist after 7 rounds — lead investigates directly: read the failing test, read the production code, diagnose and fix, or document in Known Concerns.
 
 Monitor: if Tester goes idle without a done signal — send a status check.
 
@@ -77,6 +89,8 @@ Monitor: if Tester goes idle without a done signal — send a status check.
 ---
 
 ### Phase 2: Review (4–5 parallel reviewers)
+
+Say: **"Code and tests are done. Spawning 4-5 reviewers in parallel. I will wait for all reports before proceeding."**
 
 This phase runs after Phase 1 regardless of time spent or code quality. All reviewers must report. Hooks, automated linters, CI checks, or prior review rounds do not substitute for Phase 2.
 
@@ -119,6 +133,11 @@ UI-Reviewer message (when spawned):
 > URL hints: {any relevant URLs or pages you can identify from the spec}
 > Report findings to me using the format from your agent file.
 
+If UI-Reviewer reports `VERDICT: BLOCKED` (cannot start dev server, browser unavailable):
+- Kill the reviewer and spawn a replacement with a troubleshooting hint (check port, install deps, try alternative start command).
+- Retry up to **3 times**, each with a different hint.
+- After 3 failed attempts: document reason in Known Concerns, add manual UI check to Steps for Manual Review, and continue.
+
 Each reviewer will report in this format (defined in their agent file):
 ```
 REVIEWER: {role}
@@ -135,6 +154,8 @@ Monitor: track which reviewers have reported. If any goes idle without reporting
 
 ### Phase 3: Fix & Verify (lead-orchestrated)
 
+Say: **"All reviewers reported. I will now orchestrate fix rounds — sending findings to Coder and Tester, then re-reviewing until all MUST FIX items are resolved."**
+
 Precondition: All spawned Phase 2 reviewers must have reported.
 
 #### Step 1: Assess
@@ -143,7 +164,9 @@ From all reviewer reports, build two fix lists:
 - **Coder fixes**: `MUST FIX` / `CRITICAL` findings from Code-Reviewer, Spec-Auditor, Security-Reviewer, UI-Reviewer
 - **Tester fixes**: `MUST FIX` findings from Test-Reviewer, missing coverage from Spec-Auditor
 
-If zero `MUST FIX` / `CRITICAL` across all reviewers — move all `SHOULD FIX` items to Known Concerns and skip to Finalization.
+If zero `MUST FIX` / `CRITICAL` across all reviewers — skip to Step 5 (SHOULD FIX).
+
+**Conflict resolution priority:** Security CRITICAL > Spec compliance > Code quality > Style nits.
 
 #### Step 2: Fix round
 
@@ -159,28 +182,38 @@ Message Tester with all test fixes (if any):
 
 #### Step 3: Verification
 
-Spawn ONLY the reviewers who had `MUST FIX` or `CRITICAL` findings (or message existing ones).
-Same task as Phase 2, but add:
+Message existing reviewers who had `MUST FIX` or `CRITICAL` findings:
 > This is a **re-review**. Check ONLY your previously raised MUST FIX / CRITICAL items.
 > Report: `PASS` if all resolved, or list remaining issues.
 
-#### Step 4: Loop
+If a reviewer is unresponsive after 1 status check — spawn a replacement with the same narrowed scope (re-check listed items only).
 
-If any reviewer returned non-PASS — repeat steps 2-3.
-Maximum **5 iterations**.
+#### Step 4: MUST FIX loop and escalation
 
-#### Step 5: Escalation
+If any reviewer returned non-PASS — repeat Steps 2-3. Maximum **7 iterations**.
 
-If the SAME finding persists unfixed for 2 consecutive iterations — lead investigates
-directly and either fixes it or documents why it cannot be resolved within current scope.
+If the SAME finding persists unfixed for 2 consecutive iterations — lead investigates directly and either fixes it or documents why it cannot be resolved within current scope.
 
-After 5 iterations: move all remaining items to Known Concerns with full detail.
+After 7 iterations with `CRITICAL` findings still unresolved:
+- **Ask user**: "CRITICAL findings remain after 7 fix rounds. Options:
+  (A) Continue to manual review with Known Concerns.
+  (B) Abort — return spec to `tasks/3-ready/` with findings attached as implementation notes."
+- If user picks B: revert worktree changes, move spec back, shutdown teammates.
 
-**Conflict resolution priority:** Security CRITICAL > Spec compliance > Code quality > Style nits.
+After 7 iterations with only non-CRITICAL remaining: move all to Known Concerns with full detail.
+
+#### Step 5: SHOULD FIX loop
+
+After all `MUST FIX` / `CRITICAL` resolved (or if there were none):
+- If `SHOULD FIX` count > 0 — run fix rounds (same flow as Steps 2-3) for `SHOULD FIX` items.
+- Maximum **3 iterations**. Unfixed items move to Known Concerns silently.
+- Proceed to Finalization.
 
 ---
 
 ## Finalization (Lead)
+
+Say: **"Fix rounds complete. Running gate check, final test suite, then committing and pushing."**
 
 ### Gate check — verify before continuing:
 
@@ -192,6 +225,11 @@ After 5 iterations: move all remaining items to Known Concerns with full detail.
 - Phase 2 — Security-Reviewer reported? If NO → message or spawn NOW.
 - Phase 2 — UI-Reviewer reported? (only if spawned) If NO → message or spawn NOW.
 - Phase 3 — Fix iterations completed (or no MUST FIX items)? If NO → run NOW.
+
+### Final test run
+
+Message Tester: "Run the full test suite and report results."
+All tests pass → proceed to Steps. Tests fail → back to Phase 3 Step 2 for one more fix round.
 
 ### Steps
 
@@ -211,11 +249,13 @@ Run inside the worktree directory when `auto_branch = true`:
 
 4. Git commit: `feat({ID}): {title}`
 
-5. If `auto_branch = true`: `wt remove task/{ID}-{slug}`.
+5. If `auto_branch = true`: `git push -u origin task/{ID}-{slug}` (inside worktree).
 
-6. Shutdown all teammates: send `{type: "shutdown_request"}` to each.
+6. If `auto_branch = true`: `wt remove task/{ID}-{slug}`.
 
-7. Output:
+7. Shutdown all teammates: send `{type: "shutdown_request"}` to each.
+
+8. Output:
    - Implementation Summary (brief)
    - Known Concerns (if any)
    - Steps for Manual Review (full list)

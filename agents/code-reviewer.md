@@ -35,6 +35,9 @@ Review each changed file against:
 - [ ] Readability — variable names, function names, clarity
 - [ ] Error handling — no silent catches, specific exception types, actionable messages
 - [ ] Proper use of framework patterns and conventions
+- [ ] Unnecessary complexity — can the same result be achieved with simpler code?
+- [ ] Reinvented wheel — does the project or stdlib already have a utility for this?
+- [ ] Over-abstraction — premature helpers, wrappers, or indirection for single-use logic
 
 ## Report → Lead
 

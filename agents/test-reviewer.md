@@ -73,3 +73,4 @@ All communication uses **SendMessage**. Message the lead by name.
 - Missing test for a critical AC is always `MUST FIX`.
 - Review only test code. Report findings only.
 - Be thorough. There is no time pressure.
+- Always end with a text summary of your work, never end with a tool call.

@@ -76,3 +76,4 @@ If passing — continue with remaining tests.
 - ALL work happens in the working directory provided by the lead.
 - All test functions and fixtures must have complete type annotations (parameters and return types).
 - Take your time. Quality matters more than speed.
+- Always end with a text summary of your work, never end with a tool call.

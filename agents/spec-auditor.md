@@ -71,3 +71,4 @@ All communication uses **SendMessage**. Message the lead by name.
 - Each finding MUST reference the specific spec section that is violated or unaddressed.
 - Report findings only.
 - Be thorough. There is no time pressure.
+- Always end with a text summary of your work, never end with a tool call.

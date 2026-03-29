@@ -71,3 +71,4 @@ All communication uses **SendMessage**. Message the lead by name.
 - `CRITICAL` findings MUST include an attack scenario — how could this be exploited?
 - Report findings only.
 - Be thorough. There is no time pressure.
+- Always end with a text summary of your work, never end with a tool call.

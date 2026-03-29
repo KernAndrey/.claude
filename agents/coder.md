@@ -63,3 +63,4 @@ KNOWN CONCERN: [description of the issue, where it is, why it's out of scope]
 - When in doubt — check the spec, do not assume.
 - ALL work happens in the working directory provided by the lead.
 - Take your time. Quality matters more than speed.
+- Always end with a text summary of your work, never end with a tool call.

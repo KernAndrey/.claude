@@ -71,3 +71,4 @@ All communication uses **SendMessage**. Message the lead by name.
 - Review only production code. Test code is Test-Reviewer's domain.
 - Report findings only.
 - Be thorough. There is no time pressure.
+- Always end with a text summary of your work, never end with a tool call.

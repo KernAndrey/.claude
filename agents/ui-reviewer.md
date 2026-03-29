@@ -138,3 +138,4 @@ All communication uses **SendMessage**. Message the lead by name.
 - Review only pages affected by the spec — scope checks to changed views and routes.
 - Report findings only.
 - Be thorough. There is no time pressure.
+- Always end with a text summary of your work, never end with a tool call.

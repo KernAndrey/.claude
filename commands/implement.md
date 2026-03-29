@@ -46,6 +46,23 @@ Complete every phase in sequence. All phases are mandatory.
 
 ### Phase 1a: Code
 
+#### Parallelization (optional)
+
+Before spawning, analyze the spec for independent work streams — groups of changes that touch **different files** with **no shared logic**. Examples: separate models, independent API endpoints, unrelated UI components.
+
+If 2+ independent streams exist — spawn parallel Coders (`name: "coder-1"`, `"coder-2"`, etc.). Each gets a scoped subset of the spec:
+
+> Read your instructions: `~/.claude/agents/coder.md`
+> Spec file: `{spec_path}`
+> Working directory: `{worktree_path}`
+> **Your scope:** {describe the subset — which files/modules to implement}
+> **Do not touch:** {list files assigned to other coders}
+> Implement your scope. Message me when done with `CODER DONE.` and list of changed files.
+
+If the spec is small or changes are tightly coupled — spawn a single Coder as usual.
+
+#### Single Coder (default)
+
 Spawn **Coder** as a teammate (`name: "coder"`, `team_name: "impl-{ID}"`).
 Send the task via message:
 
@@ -54,15 +71,15 @@ Send the task via message:
 > Working directory: `{worktree_path}`
 > Implement the spec. Message me when done with `CODER DONE.` and list of changed files.
 
-Monitor: if Coder goes idle without a done signal — send a status check.
+Monitor: if any Coder goes idle without a done signal — send a status check.
 
-**Phase 1a is complete when Coder messages:** `CODER DONE.` with changed files list.
+**Phase 1a is complete when all Coders have messaged:** `CODER DONE.` with changed files lists.
 
 ---
 
 ### Phase 1b: Test
 
-Say: **"Coder is done. Spawning Tester to write tests. I will coordinate bug fixes between them if needed."**
+Say: **"Coders are done. Spawning Tester to write tests. I will coordinate bug fixes between them if needed."**
 
 Start only after Phase 1a is complete.
 Spawn **Tester** as a teammate (`name: "tester"`, `team_name: "impl-{ID}"`).
@@ -71,12 +88,12 @@ Send the task via message:
 > Read your instructions: `~/.claude/agents/tester.md`
 > Spec file: `{spec_path}`
 > Working directory: `{worktree_path}`
-> Coder is done. Changed files: {changed_files_from_coder}
+> Coding is done. Changed files: {combined changed files from all coders}
 > Write tests for the implementation. Message me when done with `TESTER DONE.` and test results.
 > If you find a production bug, message me with `PRODUCTION BUG FOUND` and details.
 
 If Tester reports `PRODUCTION BUG FOUND`:
-- Message Coder with the bug report (Coder is still alive as a teammate).
+- Message the Coder responsible for the affected file (or the single Coder if only one was used).
 - Wait for Coder's `CODER FIX APPLIED` message.
 - Message Tester to re-run affected tests.
 - Repeat until all bugs resolved.

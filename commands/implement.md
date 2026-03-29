@@ -14,10 +14,10 @@ Thoroughness over speed. This task may run for hours — that is expected and ac
 2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`.
 3. Read the full specification.
 4. Branch and worktree setup:
-   - If `auto_branch = true`: `wt create task/{ID}-{slug}`. Set `{worktree_path}` to the path returned by `wt create`. All teammates work inside the worktree directory.
+   - If `auto_branch = true`: fetch latest `dev` branch (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All teammates work inside the worktree directory.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
 5. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
-6. Note the **base branch** for diffs (usually `main`). Reviewers will need it.
+6. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers will need it.
 7. **Create the team:** `TeamCreate` with `team_name: "impl-{ID}"`. You are the lead.
 
 ## Team & Communication

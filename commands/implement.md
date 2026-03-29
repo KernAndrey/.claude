@@ -1,5 +1,7 @@
 Implement an approved specification using an agent team.
 
+All agents in this workflow are **teammates** spawned via `TeamCreate` + `Agent` with `team_name`. Never use the `Agent` tool without `team_name` — standalone subagents break coordination, messaging, and idle tracking.
+
 Begin by saying to the user: **"I will spawn an agent team to implement this spec. I am the lead — I coordinate, I don't code or review."**
 
 ## Quality mandate
@@ -146,7 +148,7 @@ UI-Reviewer message (when spawned):
 > Spec file: `{spec_path}`
 > Working directory: `{worktree_path}`
 > Base branch for diff: `{base_branch}`
-> Changed files: {changed_files_from_coder}
+> Changed files: {combined changed files from all coders}
 > URL hints: {any relevant URLs or pages you can identify from the spec}
 > Report findings to me using the format from your agent file.
 

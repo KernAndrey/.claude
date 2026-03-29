@@ -34,6 +34,7 @@ Also read the spec's Acceptance Criteria to check coverage completeness.
 - [ ] Mocking strategy — mocks at the right boundary, not over-mocking internals
 - [ ] Test naming is descriptive — a failing test name should explain what broke
 - [ ] Negative tests exist — not just happy path
+- [ ] Type annotations — test functions, fixtures, and helpers are fully annotated
 
 ## Verify tests pass
 

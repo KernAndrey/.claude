@@ -35,6 +35,7 @@ Review each changed file against:
 - [ ] Readability — variable names, function names, clarity
 - [ ] Error handling — no silent catches, specific exception types, actionable messages
 - [ ] Proper use of framework patterns and conventions
+- [ ] Type annotations — all function parameters, return types, *args, **kwargs are annotated
 
 ## Report → Lead
 

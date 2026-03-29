@@ -46,11 +46,17 @@ Do NOT check for: hardcoded secrets, API keys, passwords — that is handled sep
 - God objects: classes doing too many unrelated things
 - Unclear control flow: deeply nested conditions, multiple early returns with complex logic
 
+### 7. Type Annotations
+- All function/method parameters must have type annotations
+- All functions/methods must have return type annotation
+- *args and **kwargs must be annotated
+- Missing annotations on new or changed functions are CRITICAL
+
 ## What NOT to review — linters handle this
 - Formatting, whitespace, line length
 - Import ordering or unused imports
 - Naming conventions
-- Type annotations or docstrings
+- Docstrings (presence/absence)
 - Code style preferences
 
 ## Rules

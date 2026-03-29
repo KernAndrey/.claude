@@ -18,6 +18,7 @@
 - Follow SOLID principles pragmatically, not dogmatically.
 - If a method exceeds ~30 lines, consider splitting it.
 - Handle errors explicitly: no silent catches, use specific exception types, write actionable error messages.
+- All Python code must have complete type annotations: every function parameter, return type, *args, and **kwargs. Use `from __future__ import annotations` for modern syntax.
 
 ## Git rules
 - NEVER force push
@@ -30,6 +31,8 @@ After modifying .py files, run `ruff check --fix <changed_files>`.
 Then verify with `ruff check <changed_files>`.
 Do NOT use `git commit --no-verify`.
 If ruff reports unfixable errors, fix them manually before proceeding.
+Verify type annotations with `ruff check --select ANN <changed_files>`.
+Missing annotations must be added before proceeding.
 
 ## Agent Teams
 When a task involves 3+ files across different domains (models, views, tests),

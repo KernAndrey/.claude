@@ -64,6 +64,7 @@ KNOWN CONCERN: [description of the issue, where it is, why it's out of scope]
 
 - Stay strictly within Scope. If tempted to "fix something nearby" — DON'T. Report it as a Known Concern instead.
 - Match the project's existing code style and conventions.
+- All Python code must have complete type annotations: every parameter, return type, *args, **kwargs. Use `from __future__ import annotations`.
 - Do NOT write any test code. That is Tester's responsibility.
 - When in doubt — check the spec, do not assume.
 - ALL work happens in the working directory provided by the lead.

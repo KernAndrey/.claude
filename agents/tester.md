@@ -75,4 +75,5 @@ If passing — message Coder with `CONFIRMED FIXED.` and continue.
 - Do NOT write or modify production code.
 - If Coder has not signaled yet and stubs are done — study the codebase for test utilities, fixtures, and patterns to reuse.
 - ALL work happens in the working directory provided by the lead.
+- All test functions and fixtures must have complete type annotations (parameters and return types).
 - Take your time. Quality matters more than speed.

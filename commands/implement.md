@@ -258,7 +258,11 @@ Run inside the worktree directory when `auto_branch = true`:
 
 3. Move file from `tasks/4-in-progress/` to `tasks/5-review/`.
 
-4. Git commit: `feat({ID}): {title}`
+4. Git commit — split changes into logical commits. Group by cohesive unit: each feature chunk together with its tests, config changes separately, etc. Each commit gets a conventional commit message prefixed with the task ID:
+   - `feat({ID}): add order model with validation and tests`
+   - `feat({ID}): add order API endpoints and tests`
+   - `chore({ID}): update config for order module`
+   Do not lump all changes into a single commit — logical splitting makes bisect and revert possible.
 
 5. If `auto_branch = true`: `git push -u origin task/{ID}-{slug}` (inside worktree).
 

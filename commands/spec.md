@@ -42,12 +42,12 @@ This phase is **mandatory** and cannot be skipped.
 5. After each answer, if it reveals new ambiguities — add follow-up questions to the queue. Continue until there are no more open questions. There is no limit on the number of rounds.
 
 **Rules for this phase:**
-- ALL questions and options must be in **Russian**.
-- NEVER assume an answer. If something is unclear — ask.
-- NEVER skip this phase. Even a detailed draft has gaps that only the user can fill.
+- Questions and options are in **Russian**.
+- Ask when something is unclear.
+- This phase is mandatory — even a detailed draft has gaps only the user can fill.
 - Frame questions in business/domain terms, not technical terms.
 - Include what you learned from exploring the codebase as context (e.g. "Я вижу, что сейчас система делает X — Y должен заменить это или работать параллельно?").
-- ONE question at a time. Do NOT dump all questions at once.
+- One question at a time.
 
 ## Phase 2: Specification (Agent Team)
 
@@ -74,8 +74,8 @@ Create an agent team with two teammates:
 5. Message Critic that the draft spec is ready for review.
 
 **Rules:**
-- **NEVER include code** — no snippets, no pseudocode, no SQL, no class/method names, no file paths. The spec must be readable by a non-technical stakeholder.
-- **NEVER invent requirements or assume answers** — every behavioral decision in the spec must be traceable to either the draft, the user's answers, or observable existing system behavior. If something wasn't asked or answered — put it in Edge Cases & Risks as an open question, do NOT fill in a guess.
+- **Write in plain English only** — no code, pseudocode, SQL, class/method names, or file paths. The spec must be readable by a non-technical stakeholder.
+- **Every behavioral decision must be traceable** to the draft, user answers, or observable existing system behavior. If something wasn't asked or answered, put it in Edge Cases & Risks as an open question.
 - Acceptance criteria must be concrete and verifiable, not subjective.
 - Describe *what* the system should do and *why*, never *how* in implementation terms.
 - Use domain language, not programming language.

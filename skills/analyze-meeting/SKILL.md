@@ -55,7 +55,7 @@ Scan the full transcript text and mark segments that contain:
 
 ## Phase 3: Cross-Reference with Project Codebase
 
-THIS IS THE MOST IMPORTANT PHASE. The meeting discusses features, components, and problems that exist (or will exist) in the current project. You must bridge the discussion to real code.
+This phase bridges the discussion to real code — it transforms raw conversation into actionable implementation notes. The meeting discusses features, components, and problems that exist (or will exist) in the current project. You must bridge the discussion to real code.
 
 For each signal segment:
 
@@ -79,11 +79,11 @@ For each signal segment:
 
 ## Phase 4: Selective Frame Analysis
 
-You MUST look at screenshots — they show what was on screen during the meeting (code editors, UIs, diagrams, browser tabs). This adds critical context that audio alone cannot capture.
+Look at screenshots — they show what was on screen during the meeting (code editors, UIs, diagrams, browser tabs). This adds critical context that audio alone cannot capture.
 
 ### Frame selection strategy — READ ALL MEANINGFUL FRAMES
 
-Quality over context savings. Do NOT limit yourself to a small sample. Read every frame that could add value:
+Quality over context savings. Read every frame that could add value:
 
 1. **ALL scene-change frames** (`_scene.jpg`) — every single one. These are triggered by visual changes and almost always carry useful information. The only exception: if 3+ scene frames fall within the same 3-second window, read the first and last (the rest are transition artifacts).
 
@@ -106,7 +106,7 @@ Use the Read tool on `<dir>/frames/<filename>`. Claude is multimodal and will se
 Create directory `.meetings/summaries/` in the current working directory if it doesn't exist.
 Write the analysis to `.meetings/summaries/<meeting_name>.md` where `meeting_name` comes from `transcript.json`.
 
-**Output is ALWAYS in English**, regardless of the transcript language.
+**Output language: English**, regardless of transcript language.
 
 If the user provided focus instructions in `$ARGUMENTS`, apply them: prioritize relevant topics, de-emphasize or skip irrelevant ones.
 

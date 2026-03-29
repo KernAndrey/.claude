@@ -43,11 +43,11 @@ This phase is **mandatory** and cannot be skipped.
 4. If an answer reveals new ambiguities — add follow-up questions.
 
 **Rules for this phase:**
-- ALL questions and options must be in **Russian**.
-- NEVER assume an answer. If something is unclear — ask.
-- NEVER skip this phase.
-- Focus on decomposition concerns (what are the pieces, how they relate), NOT implementation details (each task will get its own `/spec` Q&A later).
-- ONE question at a time.
+- Questions and options are in **Russian**.
+- Ask when something is unclear.
+- This phase is mandatory.
+- Focus on decomposition concerns (what are the pieces, how they relate), not implementation details (each task will get its own `/spec` Q&A later).
+- One question at a time.
 
 ## Phase 3: Decomposition Proposal
 

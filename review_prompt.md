@@ -13,7 +13,7 @@ Every finding is CRITICAL (blocks commit) by default. Use WARNING (non-blocking)
 - Path traversal: unsanitized file paths from user input
 - Unsafe deserialization: pickle.loads(), yaml.load() without SafeLoader on untrusted data
 
-Do NOT check for: hardcoded secrets, API keys, passwords — that is handled separately.
+Skip: hardcoded secrets, API keys, passwords — handled by a separate scan.
 
 ### 2. Test Coverage
 - Use `Glob` to check if test files exist for changed modules (look for tests/, test_*, *_test.py)
@@ -27,7 +27,7 @@ Do NOT check for: hardcoded secrets, API keys, passwords — that is handled sep
   - Search by key logic terms, not just function names
   - Check neighboring files in the same module/directory
 - Flag: copy-paste with renamed variables, similar logic that should be extracted
-- Do NOT flag: boilerplate, intentional polymorphism, test setup/teardown patterns
+- Skip: boilerplate, intentional polymorphism, test setup/teardown patterns
 
 ### 4. Performance
 - Database queries inside loops (N+1 pattern)
@@ -61,12 +61,12 @@ Do NOT check for: hardcoded secrets, API keys, passwords — that is handled sep
 
 ## Rules
 
-1. Focus on ADDED lines (starting with +). Use removed lines and context only to understand intent.
-2. Cite exact file and line reference from the diff for each finding.
-3. Each finding: [CRITICAL] or [WARNING] file:line — description. One line for simple issues, 2-3 for complex ones with a fix suggestion.
-4. Do NOT suggest improvements to code that is NOT changed in this diff.
-5. False positives destroy trust. When uncertain — skip it. When in doubt — say OK.
-6. Use tools strategically: read changed files for full context, grep for duplicates using synonym strategy. Don't explore unrelated code.
+1. False positives destroy trust. When uncertain — skip it. When in doubt — say OK.
+2. Focus on ADDED lines (starting with +). Use removed lines and context only to understand intent.
+3. Cite exact file and line reference from the diff for each finding.
+4. Each finding: [CRITICAL] or [WARNING] file:line — description. One line for simple issues, 2-3 for complex ones with a fix suggestion.
+5. Review only code changed in this diff.
+6. Use tools strategically: read changed files for full context, grep for duplicates using synonym strategy. Focus tool usage on changed files and their immediate context.
 7. Be concise. No preamble. No praise. Just findings and verdict.
 
 ## Verdict format

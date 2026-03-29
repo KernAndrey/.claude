@@ -5,45 +5,46 @@
 
 ## Behavior
 
-- While planning or before implementation, ALWAYS think if the task is totally clear. Ask clarifying questions about requirements, edge cases, and expected behavior that cannot be extracted by yourself from project.
-- User can be wrong or offer bad ideas. Always try to find and offer better solution.
-- While debugging always solve the root reason, not a cosmetic patch. Clean architecture on first place
-- NEVER weaken or adjust tests to make them pass around a bug. If a test reveals a real inconsistency or bug — fix the bug, not the test. If unsure how to fix — report the bug to the user and ask what to do. Silently loosening assertions to get green tests is a serious mistake.
-- User can be wrong. Critically evaluate proposed solutions and assumptions. If you see a better approach — suggest it, don't silently comply.
-- When creating or modifying config files (linters, formatters, etc.), always ask whether the scope should be global (~/.config/) or project-local. User has multiple projects with different requirements.
+<critical>
+When a test fails, fix the bug in production code, not the assertion. If unsure how to fix, report the bug to the user. Loosening assertions masks real bugs — this applies even under time pressure.
+</critical>
+
+- Before implementation, verify the task is fully clear. Ask about requirements, edge cases, and expected behavior that the codebase alone cannot answer.
+- Critically evaluate proposed solutions and assumptions. If you see a better approach, suggest it.
+- While debugging, fix the root cause. A cosmetic patch hiding the real problem is worse than no fix.
+- When modifying config files (linters, formatters), ask whether scope should be global (~/.config/) or project-local. This user maintains multiple projects with different configurations.
+
+## Git Safety
+- Use standard push — force push destroys shared history for all collaborators.
+- Preserve all branches — deleted branches are unrecoverable for collaborators.
+- Rebase only personal feature branches — rebasing main/master/dev rewrites shared history.
 
 ## Code Style
 
 - Keep methods short and focused — extract logic into helper methods.
-- Follow SOLID principles pragmatically, not dogmatically.
+- Extract a class when 2+ consumers exist. Single-use logic stays as a method.
 - If a method exceeds ~30 lines, consider splitting it.
 - Handle errors explicitly: no silent catches, use specific exception types, write actionable error messages.
 - All Python code must have complete type annotations: every function parameter, return type, *args, and **kwargs. Use `from __future__ import annotations` for modern syntax.
-
-## Git rules
-- NEVER force push
-- NEVER delete branches
-- NEVER rebase shared branches (main, master, dev)
 
 ## Linting
 
 After modifying .py files, run `ruff check --fix <changed_files>`.
 Then verify with `ruff check <changed_files>`.
-Do NOT use `git commit --no-verify`.
+Run all pre-commit hooks on every commit — hooks enforce lint and security checks.
 If ruff reports unfixable errors, fix them manually before proceeding.
 Verify type annotations with `ruff check --select ANN <changed_files>`.
 Missing annotations must be added before proceeding.
 
 ## Agent Teams
-When a task involves 3+ files across different domains (models, views, tests),
-consider spawning teammates with clear file ownership.
-Do NOT use teams for single-file changes or quick fixes.
+Use agent teams when 3+ files span different domains (models, views, tests).
+Single-file changes and quick fixes run faster without team coordination.
 
 ## MCP
 When working with library/framework APIs, use the context7 MCP tool to fetch up-to-date documentation before writing code.
 
-## Ports availability
-Always check which ports are free before starting the server
+## Ports
+Check port availability before starting a server (`ss -tlnp | grep :<port>`) — a blocked port causes silent startup failures.
 
 ## Terminal Notifications
 
@@ -59,3 +60,11 @@ When you finish working on a task, signal completion via terminal:
   `echo -e '\033]0;❌ BLOCKED\007\a'`
 
 Always execute the appropriate echo as your very last command.
+
+## Compact instructions
+On compaction preserve:
+- List of modified files with change descriptions
+- Current status of each task
+- Commands for running tests
+- Key architectural decisions from this session
+- Last test failures (if any)

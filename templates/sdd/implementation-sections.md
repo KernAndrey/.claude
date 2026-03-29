@@ -1,6 +1,6 @@
 ## Implementation Summary
 
-<!-- What was done, key decisions, what was deferred -->
+<!-- What was done, key decisions -->
 
 ### Changes Made
 
@@ -10,9 +10,9 @@
 
 <!-- Why X instead of Y -->
 
-### Deferred / Out of Scope
+### Out of Scope
 
-<!-- What was postponed or excluded -->
+<!-- What was excluded from this implementation -->
 
 ## Known Concerns
 

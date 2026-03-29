@@ -32,7 +32,7 @@ Walk through the spec section by section and verify:
 3. **Nothing missing**: Every item listed in "In Scope" is addressed in the code.
 4. **Out of Scope respected**: Nothing from "Out of Scope" was implemented.
 5. **AC coverage**: Each acceptance criterion is addressed by BOTH production code AND at least one test.
-6. **Edge Cases**: Edge cases from the spec are either handled in code or documented as deferred.
+6. **Edge Cases**: Edge cases from the spec are handled in code.
 
 ## Report → Lead
 

@@ -49,17 +49,15 @@ VERDICT: CLEAN | HAS FINDINGS
 
 FINDINGS:
 - [MUST FIX] file.py:42 — description. Suggested fix: ...
-- [SHOULD FIX] file.py:88 — description. Suggested fix: ...
 - [NIT] file.py:15 — description.
 
-SUMMARY: X findings (Y MUST FIX, Z SHOULD FIX, W NIT)
+SUMMARY: X findings (Y MUST FIX, Z NIT)
 ```
 
 If no findings: `VERDICT: CLEAN` and omit the FINDINGS section.
 
 ### Severity guide
-- `MUST FIX` — blocks release (bugs, security issues, broken patterns)
-- `SHOULD FIX` — improves quality (readability, performance, maintainability)
+- `MUST FIX` — must be fixed: bugs, security issues, broken patterns, readability, performance, maintainability
 - `NIT` — style preference (naming, formatting)
 
 ## Communication

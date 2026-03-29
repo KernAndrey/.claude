@@ -35,7 +35,7 @@ All agents are spawned as **teammates** (`team_name: "impl-{ID}"`). This gives t
    - Read their last output.
    - Spawn a replacement with (a) narrowed context — only relevant files, (b) summary of completed work, (c) specific remaining tasks.
    - Resume from where the previous teammate stopped.
-   - Maximum **3 restart attempts** per teammate. After 3 failed restarts — lead takes over the remaining work directly or documents in Known Concerns.
+   - Maximum **3 restart attempts** per teammate. After 3 failed restarts — lead takes over the remaining work directly.
 
 ## Agent Team — 6 teammates, sequential phases
 
@@ -80,7 +80,7 @@ If Tester reports `PRODUCTION BUG FOUND`:
 - Wait for Coder's `CODER FIX APPLIED` message.
 - Message Tester to re-run affected tests.
 - Repeat until all bugs resolved.
-- Maximum **7 bug-fix rounds**. If bugs persist after 7 rounds — lead investigates directly: read the failing test, read the production code, diagnose and fix, or document in Known Concerns.
+- Maximum **7 bug-fix rounds**. If bugs persist after 7 rounds — lead investigates directly: read the failing test, read the production code, diagnose and fix.
 
 Monitor: if Tester goes idle without a done signal — send a status check.
 
@@ -143,7 +143,7 @@ Each reviewer will report in this format (defined in their agent file):
 REVIEWER: {role}
 VERDICT: CLEAN/SECURE/COMPLIANT | HAS FINDINGS
 FINDINGS: ...
-SUMMARY: X findings (Y MUST FIX, Z ...)
+SUMMARY: X findings (Y MUST FIX, Z NIT/CONCERN)
 ```
 
 Monitor: track which reviewers have reported. If any goes idle without reporting — send a status check.
@@ -164,9 +164,9 @@ From all reviewer reports, build two fix lists:
 - **Coder fixes**: `MUST FIX` / `CRITICAL` findings from Code-Reviewer, Spec-Auditor, Security-Reviewer, UI-Reviewer
 - **Tester fixes**: `MUST FIX` findings from Test-Reviewer, missing coverage from Spec-Auditor
 
-If zero `MUST FIX` / `CRITICAL` across all reviewers — skip to Step 5 (SHOULD FIX).
+If zero `MUST FIX` / `CRITICAL` across all reviewers — skip to Finalization.
 
-**Conflict resolution priority:** Security CRITICAL > Spec compliance > Code quality > Style nits.
+**Conflict resolution priority:** Security CRITICAL > Spec compliance > Code quality.
 
 #### Step 2: Fix round
 
@@ -188,26 +188,18 @@ Message existing reviewers who had `MUST FIX` or `CRITICAL` findings:
 
 If a reviewer is unresponsive after 1 status check — spawn a replacement with the same narrowed scope (re-check listed items only).
 
-#### Step 4: MUST FIX loop and escalation
+#### Step 4: Fix loop and escalation
 
 If any reviewer returned non-PASS — repeat Steps 2-3. Maximum **7 iterations**.
 
-If the SAME finding persists unfixed for 2 consecutive iterations — lead investigates directly and either fixes it or documents why it cannot be resolved within current scope.
+If the SAME finding persists unfixed for 2 consecutive iterations — lead investigates directly and fixes it.
 
-After 7 iterations with `CRITICAL` findings still unresolved:
-- **Ask user**: "CRITICAL findings remain after 7 fix rounds. Options:
-  (A) Continue to manual review with Known Concerns.
+After 7 iterations with findings still unresolved:
+- Lead takes over: read the code, diagnose, and fix the remaining issues directly.
+- If lead cannot fix — **ask user**: "These findings remain after 7 fix rounds and my own attempt. Options:
+  (A) Continue to manual review — remaining issues documented in Known Concerns.
   (B) Abort — return spec to `tasks/3-ready/` with findings attached as implementation notes."
 - If user picks B: revert worktree changes, move spec back, shutdown teammates.
-
-After 7 iterations with only non-CRITICAL remaining: move all to Known Concerns with full detail.
-
-#### Step 5: SHOULD FIX loop
-
-After all `MUST FIX` / `CRITICAL` resolved (or if there were none):
-- If `SHOULD FIX` count > 0 — run fix rounds (same flow as Steps 2-3) for `SHOULD FIX` items.
-- Maximum **3 iterations**. Unfixed items move to Known Concerns silently.
-- Proceed to Finalization.
 
 ---
 
@@ -236,7 +228,7 @@ All tests pass → proceed to Steps. Tests fail → back to Phase 3 Step 2 for o
 Run inside the worktree directory when `auto_branch = true`:
 
 1. Append sections from `~/.claude/templates/sdd/implementation-sections.md` to the spec file:
-   - **Implementation Summary**: what was done, key decisions, what was deferred
+   - **Implementation Summary**: what was done, key decisions
    - **Known Concerns**: unresolved findings (reviewer name, severity, description for each)
    - **Auto-Review Results**: test results, criteria coverage, verbatim VERDICT and SUMMARY from each spawned reviewer
    - **Steps for Manual Review**: 3-7 concrete steps. Format: `N. [Action] → [Expected result]`

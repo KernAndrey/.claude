@@ -49,19 +49,17 @@ VERDICT: CLEAN | HAS FINDINGS
 
 FINDINGS:
 - [MUST FIX] test_file.py::test_name — description. Suggested fix: ...
-- [SHOULD FIX] test_file.py::test_name — description. Suggested fix: ...
 - [NIT] test_file.py::test_name — description.
 
 MISSING COVERAGE:
 - AC "acceptance criterion text" — no test found
 - Edge case "description" — not covered
 
-SUMMARY: X findings (Y MUST FIX, Z SHOULD FIX, W NIT), N missing coverage items
+SUMMARY: X findings (Y MUST FIX, Z NIT), N missing coverage items
 ```
 
 ### Severity guide
-- `MUST FIX` — missing test for a critical AC, broken test, false positive
-- `SHOULD FIX` — weak assertion, missing edge case, suboptimal isolation
+- `MUST FIX` — missing test for a critical AC, broken test, false positive, weak assertion, missing edge case, suboptimal isolation
 - `NIT` — naming, organization
 
 ## Communication

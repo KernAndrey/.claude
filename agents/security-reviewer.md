@@ -48,18 +48,16 @@ VERDICT: SECURE | HAS FINDINGS
 FINDINGS:
 - [CRITICAL] file.py:42 — Vulnerability type: SQL injection. Impact: attacker can... Attack scenario: ...
 - [MUST FIX] file.py:88 — Vulnerability type: missing access control. Impact: ...
-- [ADVISORY] file.py:15 — Defense-in-depth suggestion: ...
 
 SUGGESTED SMOKE TESTS (if applicable):
 - Test description → expected behavior
 
-SUMMARY: X findings (Y CRITICAL, Z MUST FIX, W ADVISORY)
+SUMMARY: X findings (Y CRITICAL, Z MUST FIX)
 ```
 
 ### Severity guide
 - `CRITICAL` — exploitable vulnerability. MUST include an attack scenario.
-- `MUST FIX` — security weakness that should be addressed before release.
-- `ADVISORY` — defense-in-depth improvement, not blocking.
+- `MUST FIX` — security weakness or defense-in-depth improvement that must be addressed.
 
 ## Communication
 

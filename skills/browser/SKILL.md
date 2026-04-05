@@ -44,6 +44,15 @@ netsh interface portproxy add v4tov4 listenaddress=100.75.193.93 listenport=9333
 
 Then wait for user to say "ready" and retry step 1.
 
+4. If NOT_CONNECTED but user says everything is set up — **port proxy is likely stale** (common after sleep/wake or Tailscale reconnect). Tell the user to recreate it:
+
+```
+netsh interface portproxy delete v4tov4 listenaddress=100.75.193.93 listenport=9333
+netsh interface portproxy add v4tov4 listenaddress=100.75.193.93 listenport=9333 connectaddress=127.0.0.1 connectport=9333
+```
+
+Then retry step 1. Do NOT suggest restarting IP Helper (iphlpsvc) — it will stop Tailscale.
+
 ## Available commands after connection
 
 All via `~/.claude/skills/chrome-cdp/scripts/cdp-remote.sh`:

@@ -96,47 +96,15 @@ def count_changed_lines(diff):
 # Diff processing
 # ---------------------------------------------------------------------------
 
-def truncate_diff(diff):
-    """Truncate diff to MAX_DIFF_LINES, keeping complete file sections."""
-    lines = diff.split("\n")
-    if len(lines) <= MAX_DIFF_LINES:
-        return diff
-
-    # Split into per-file chunks
-    chunks = []
-    current_chunk = []
-    for line in lines:
-        if line.startswith("diff --git") and current_chunk:
-            chunks.append(current_chunk)
-            current_chunk = []
-        current_chunk.append(line)
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    # Keep chunks that fit, smallest first (review more files)
-    chunks.sort(key=len)
-    kept = []
-    total = 0
-    omitted_files = 0
-    omitted_lines = 0
-    for chunk in chunks:
-        if total + len(chunk) <= MAX_DIFF_LINES:
-            kept.append(chunk)
-            total += len(chunk)
-        else:
-            omitted_files += 1
-            omitted_lines += len(chunk)
-
-    result_lines = []
-    for chunk in kept:
-        result_lines.extend(chunk)
-
-    if omitted_files:
-        result_lines.append(
-            f"\n[TRUNCATED: {omitted_files} file(s), {omitted_lines} lines omitted]"
-        )
-
-    return "\n".join(result_lines)
+def check_diff_size(diff: str) -> str | None:
+    """Return an error message if the diff exceeds MAX_DIFF_LINES, else None."""
+    line_count = len(diff.split("\n"))
+    if line_count <= MAX_DIFF_LINES:
+        return None
+    return (
+        f"Diff is {line_count} lines (limit {MAX_DIFF_LINES}). "
+        "Split this into smaller commits so each one can be fully reviewed."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +245,7 @@ def collect_diff():
     if not diff:
         status = get_git_status()
         diag = f"git diff --cached returned empty.\ngit status:\n{status}"
-        warn(f"No staged changes to review.")
+        warn("No staged changes to review.")
         save_log("SKIP", diag=diag)
         return None
 
@@ -286,9 +254,15 @@ def collect_diff():
         save_log("SKIP", diag=f"only {changed} changed lines (min {MIN_LINES_TO_REVIEW})")
         return None
 
+    too_big = check_diff_size(diff)
+    if too_big:
+        error(too_big)
+        save_log("TOO_BIG", diff=diff, error_msg=too_big)
+        sys.exit(1)
+
     files = get_staged_files()
     is_merge = Path(".git/MERGE_HEAD").is_file()
-    return truncate_diff(diff), files, is_merge
+    return diff, files, is_merge
 
 
 def run_review(diff, files, is_merge):

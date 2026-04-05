@@ -32,6 +32,8 @@ When a test fails, fix the bug in production code, not the assertion. If unsure 
 After modifying .py files, run `ruff check --fix <changed_files>`.
 Then verify with `ruff check <changed_files>`.
 Run all pre-commit hooks on every commit — hooks enforce lint and security checks.
+Every commit is AI-reviewed by a pre-commit hook. The review can BLOCK the commit with specific issues. When blocked: fix the reported issues and commit again. Do not skip the hook (`--no-verify`), do not amend — create a new commit.
+If the diff exceeds 2000 lines the hook rejects it outright — split into smaller commits.
 If ruff reports unfixable errors, fix them manually before proceeding.
 Verify type annotations with `ruff check --select ANN <changed_files>`.
 Missing annotations must be added before proceeding.

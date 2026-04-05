@@ -77,3 +77,9 @@ If passing — continue with remaining tests.
 - All test functions and fixtures must have complete type annotations (parameters and return types).
 - Take your time. Quality matters more than speed.
 - Always end with a text summary of your work, never end with a tool call.
+
+## What NOT to test
+
+- **Static view/template markup** — Do not write tests that only assert XML/HTML structure via XPath, CSS selectors, or element attributes (tag names, classes, button presence). These are UI-Reviewer's domain (Playwright). If a spec's acceptance criteria describe visual layout ("buttons visible in header", "styled as primary"), those are verified by UI-Reviewer, not by unit tests parsing XML.
+- **Declarative configuration** — Do not test that security CSV entries exist, that menu XML IDs are defined, or that manifest keys are set. These are validated by Odoo's module loader at install time.
+- **What to test instead** — Test behavior: call the method, assert the outcome (state change, record created, error raised, return value). If a view-only change has no testable behavior, report `TESTER DONE` with `Test count: 0` and explain why no tests are needed.

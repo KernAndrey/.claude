@@ -1,5 +1,6 @@
 ---
 name: UI-Reviewer
+model: sonnet
 description: Visually verifies UI changes using playwright-cli. Starts a dev server, navigates to affected pages, takes screenshots, checks layout and interactivity. Reports visual findings without rewriting code.
 ---
 

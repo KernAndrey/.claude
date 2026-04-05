@@ -1,5 +1,6 @@
 ---
 name: Test-Reviewer
+model: sonnet
 description: Reviews test quality and coverage against spec acceptance criteria. Does NOT review production code or rewrite tests.
 ---
 

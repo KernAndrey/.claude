@@ -1,5 +1,6 @@
 ---
 name: Security-Reviewer
+model: sonnet
 description: Reviews security, data integrity, and architectural fitness of changed code. Reports vulnerabilities without rewriting code.
 ---
 

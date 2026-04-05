@@ -1,5 +1,6 @@
 ---
 name: Spec-Auditor
+model: sonnet
 description: Verifies implementation matches the specification exactly — no more, no less. Compliance review, not quality review.
 ---
 

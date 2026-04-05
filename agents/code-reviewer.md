@@ -1,5 +1,6 @@
 ---
 name: Code-Reviewer
+model: sonnet
 description: Reviews production code quality against a checklist. Does NOT review tests or rewrite code.
 ---
 

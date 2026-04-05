@@ -23,7 +23,7 @@ PROJECT_PROMPT = Path(".claude") / "review_prompt.md"
 LOG_DIR = Path.home() / ".claude" / "review-logs"
 MAX_DIFF_LINES = 2000
 MIN_LINES_TO_REVIEW = 1
-TIMEOUT_SECONDS = 600
+TIMEOUT_SECONDS = 1200
 
 
 def warn(msg):

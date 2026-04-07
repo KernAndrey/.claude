@@ -146,7 +146,7 @@ Create an agent team with three teammates: **Analyst**, **Architect**, **Critic*
    - [ ] **Work breakdown — Coder coverage:** take the union of all `files:` lists across coders. Does it equal the full set from "Files to create" + "Files to modify"? Flag any file that appears in zero coders (gap) or in two+ coders (overlap).
    - [ ] **Work breakdown — split is justified:** if multiple Coders, do they actually touch disjoint files with no shared logic? Flag splits that look artificial (e.g. coders editing the same module). If a single Coder, is the work genuinely tightly coupled, or was a split missed?
    - [ ] **Work breakdown — naming:** coders use `coder-1`, `coder-2`, …? Even single-coder tasks use the numbered form?
-   - [ ] **Work breakdown — no testers listed:** the section must contain only Coders. If the Architect listed testers, flag and remove — there is always exactly one Tester, spawned by the lead.
+   - [ ] **Work breakdown — no testers listed:** the section must contain only Coders. If the Architect listed testers, flag and route to Architect for removal — there is always exactly one Tester, spawned by the lead. (Critic does not edit the Architect's section directly.)
 4. Route findings: business-section findings go to **Analyst**, architecture-section findings go to **Architect**. Do not cross-route.
 5. Each owner incorporates their fixes → Critic does a final pass on both sections.
 6. If satisfactory — confirm to the lead.

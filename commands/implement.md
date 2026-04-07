@@ -59,7 +59,7 @@ Before spawning, verify the breakdown isn't broken:
 - Are file paths real (or explicitly noted as new)?
 - Does each coder's scope make sense given the file list?
 
-If the breakdown is broken (gaps, overlaps, nonsense scopes): **do not silently fix it**. Stop, report the issue to the user, and ask whether to (a) patch the breakdown manually before continuing, or (b) send the spec back to `tasks/2-spec/` for the Architect to redo. The Critic should have caught this — flag it as a Critic miss too.
+If the breakdown is broken (gaps, overlaps, nonsense scopes): **do not silently fix it**. Stop, report the issue to the user, and ask whether to (a) patch the breakdown manually before continuing, or (b) send the spec back to `tasks/2-spec/` for the Architect to redo. If (b): move the spec file back from `tasks/4-in-progress/` to `tasks/2-spec/`, reset frontmatter `status` from `in-progress` to `awaiting-approval`, remove the worktree if one was created (`wt remove task/{ID}-{slug}`), and shut down any teammates already spawned. The Critic should have caught this — flag it as a Critic miss too.
 
 #### Spawn Coders from the breakdown
 

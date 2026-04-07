@@ -48,34 +48,36 @@ Complete every phase in sequence. All phases are mandatory.
 
 ### Phase 1a: Code
 
-#### Parallelization (optional)
+#### Read the Architect's Work breakdown
 
-Before spawning, analyze the spec for independent work streams — groups of changes that touch **different files** with **no shared logic**. Examples: separate models, independent API endpoints, unrelated UI components.
+The `## Architecture & Implementation Plan → Work breakdown → Coders` subsection of the spec is authoritative. The Architect already decided how many Coders to spawn and which files each one owns. **You do not re-analyze the spec for parallelization** — just spawn what's listed.
 
-If 2+ independent streams exist — spawn parallel Coders (`name: "coder-1"`, `"coder-2"`, etc.). Each gets a scoped subset of the spec:
+#### Sanity check (lead, ~30 seconds)
+
+Before spawning, verify the breakdown isn't broken:
+- Take the union of `files:` lists from all coders. Does it match the full set under "Files to create" + "Files to modify"? Flag gaps and overlaps.
+- Are file paths real (or explicitly noted as new)?
+- Does each coder's scope make sense given the file list?
+
+If the breakdown is broken (gaps, overlaps, nonsense scopes): **do not silently fix it**. Stop, report the issue to the user, and ask whether to (a) patch the breakdown manually before continuing, or (b) send the spec back to `tasks/2-spec/` for the Architect to redo. The Critic should have caught this — flag it as a Critic miss too.
+
+#### Spawn Coders from the breakdown
+
+For each Coder listed in Work breakdown, spawn it as a teammate (`name: "coder-N"`, `team_name: "impl-{ID}"`). Send the task via message:
 
 > Read your instructions: `~/.claude/agents/coder.md`
 > Spec file: `{spec_path}`
 > Working directory: `{worktree_path}`
-> **Your scope:** {describe the subset — which files/modules to implement}
-> **Do not touch:** {list files assigned to other coders}
+> **Your scope** (from spec → Work breakdown → coder-N): {scope text from spec}
+> **Files you own:** {files list from spec}
+> **Do not touch any other files in the spec** — they belong to other coders.
 > Implement your scope. Message me when done with `CODER DONE.` and list of changed files.
 
-If the spec is small or changes are tightly coupled — spawn a single Coder as usual.
-
-#### Single Coder (default)
-
-Spawn **Coder** as a teammate (`name: "coder"`, `team_name: "impl-{ID}"`).
-Send the task via message:
-
-> Read your instructions: `~/.claude/agents/coder.md`
-> Spec file: `{spec_path}`
-> Working directory: `{worktree_path}`
-> Implement the spec. Message me when done with `CODER DONE.` and list of changed files.
+For single-coder tasks (one entry in Work breakdown), the message is the same — just one teammate, scope and file list copied from the spec.
 
 Monitor: if any Coder goes idle without a done signal — send a status check.
 
-**Phase 1a is complete when all Coders have messaged:** `CODER DONE.` with changed files lists.
+**Phase 1a is complete when all Coders from the breakdown have messaged:** `CODER DONE.` with changed files lists.
 
 ---
 
@@ -84,6 +86,9 @@ Monitor: if any Coder goes idle without a done signal — send a status check.
 Say: **"Coders are done. Spawning Tester to write tests. I will coordinate bug fixes between them if needed."**
 
 Start only after Phase 1a is complete.
+
+There is always exactly **one** Tester, regardless of how many Coders ran. Parallel testers are intentionally excluded — they conflict on shared test infrastructure (DBs, fixtures, ports). One Tester sees all the code and writes tests for the full implementation.
+
 Spawn **Tester** as a teammate (`name: "tester"`, `team_name: "impl-{ID}"`).
 Send the task via message:
 
@@ -92,10 +97,10 @@ Send the task via message:
 > Working directory: `{worktree_path}`
 > Coding is done. Changed files: {combined changed files from all coders}
 > Write tests for the implementation. Message me when done with `TESTER DONE.` and test results.
-> If you find a production bug, message me with `PRODUCTION BUG FOUND` and details.
+> If you find a production bug, message me with `PRODUCTION BUG FOUND` and details, including the affected file path so I can route the fix to the right coder.
 
 If Tester reports `PRODUCTION BUG FOUND`:
-- Message the Coder responsible for the affected file (or the single Coder if only one was used).
+- Map the affected file → owning Coder via Work breakdown's `files:` lists. Message that Coder.
 - Wait for Coder's `CODER FIX APPLIED` message.
 - Message Tester to re-run affected tests.
 - Repeat until all bugs resolved.
@@ -189,11 +194,11 @@ If zero `MUST FIX` / `CRITICAL` across all reviewers — skip to Finalization.
 
 #### Step 2: Fix round
 
-Message Coder with all production code fixes:
+Group production fixes by owning Coder (use Work breakdown's `files:` lists to map file → coder). Message each affected Coder only with their fixes:
 > These findings need to be fixed. For each item: severity, source reviewer, file:line, description.
 > After fixing, message me: `CODER FIX ROUND DONE.` Include a note if any API or behavior changed.
 
-If Coder reports API/behavior changes — forward those to Tester.
+If any Coder reports API/behavior changes — forward those to the Tester.
 
 Message Tester with all test fixes (if any):
 > These test findings need to be fixed. For each item: severity, source reviewer, test file, description.
@@ -228,7 +233,7 @@ Say: **"Fix rounds complete. Running gate check, final test suite, then committi
 
 ### Gate check — verify before continuing:
 
-- Phase 1a — Coder sent `CODER DONE`? If NO → message Coder NOW.
+- Phase 1a — **every** Coder from Work breakdown sent `CODER DONE`? If NO → message the missing one(s) NOW.
 - Phase 1b — Tester sent `TESTER DONE` with test count? If NO → message Tester NOW.
 - Phase 2 — Code-Reviewer reported? If NO → message or spawn NOW.
 - Phase 2 — Test-Reviewer reported? If NO → message or spawn NOW.

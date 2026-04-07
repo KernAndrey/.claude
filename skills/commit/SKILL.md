@@ -101,14 +101,15 @@ For each logical commit:
    - Body if the change is non-trivial (separated by blank line)
    - Omit Co-Authored-By and AI attribution
    - **Write in English**
-3. Commit using a HEREDOC to pass the message:
+3. Commit using a HEREDOC to pass the message with `run_in_background: true` (the pre-commit AI review hook can take up to 20 minutes, exceeding Bash timeout):
    ```bash
    git commit -m "$(cat <<'EOF'
    feat: add user authentication flow
    EOF
    )"
    ```
-4. Run `git status` after each commit to verify success.
+4. Wait for the background commit to finish. Read the output file to check the result.
+5. Run `git status` after each commit to verify success.
 
 ## Phase 7: Summary
 
@@ -122,4 +123,5 @@ After all commits are done, show:
 - Run all commit hooks (no `--no-verify`).
 - Create new commits rather than amending, unless the user explicitly asks.
 - Use standard push (no `--force`).
-- If a pre-commit hook fails, fix the issue, re-stage, and create a new commit.
+- If a pre-commit hook fails or the AI review BLOCKs the commit, fix the reported issues, re-stage, and create a new commit.
+- If the diff exceeds 2000 lines, the hook rejects it — split into smaller commits.

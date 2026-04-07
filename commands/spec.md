@@ -116,6 +116,7 @@ Create an agent team with three teammates: **Analyst**, **Architect**, **Critic*
   - Every file under "Files to create" and "Files to modify" must appear in **exactly one** Coder's `files:` list — no overlaps, no gaps. The union of all Coder file lists equals the full file map.
   - Use stable agent names: `coder-1`, `coder-2`, …. For single-coder tasks use `coder-1` (not `coder`) so the format stays uniform.
   - Do not list testers in Work breakdown — there is always a single Tester, spawned by the lead in `/implement`. Parallel testers are intentionally excluded because they conflict on shared test infrastructure.
+  - **Size cap: ~2000 lines of expected diff per Coder.** If you estimate a Coder's scope will produce more than ~2000 lines (rough heuristic: files × typical change size + size of new files), split it further into tightly-cohesive sub-scopes. The cap reflects reviewer attention limits and the AI commit hook's hard rejection threshold — oversized chunks get shallow reviews upstream and stall commits downstream.
 - If `ANALYST DRAFT READY` does not arrive after you finish exploration, ping the Lead. Do not start editing the file before the signal arrives.
 
 ### Teammate: Critic
@@ -145,6 +146,7 @@ Create an agent team with three teammates: **Analyst**, **Architect**, **Critic*
    - [ ] Architecture aligns with the business behavior described by the Analyst — no contradictions between sections.
    - [ ] **Work breakdown — Coder coverage:** take the union of all `files:` lists across coders. Does it equal the full set from "Files to create" + "Files to modify"? Flag any file that appears in zero coders (gap) or in two+ coders (overlap).
    - [ ] **Work breakdown — split is justified:** if multiple Coders, do they actually touch disjoint files with no shared logic? Flag splits that look artificial (e.g. coders editing the same module). If a single Coder, is the work genuinely tightly coupled, or was a split missed?
+   - [ ] **Work breakdown — size cap:** any Coder estimated to produce >2000 lines of diff? If yes, flag for further split — reviewers cannot audit oversized chunks deeply and the AI commit hook will reject them.
    - [ ] **Work breakdown — naming:** coders use `coder-1`, `coder-2`, …? Even single-coder tasks use the numbered form?
    - [ ] **Work breakdown — no testers listed:** the section must contain only Coders. If the Architect listed testers, flag and route to Architect for removal — there is always exactly one Tester, spawned by the lead. (Critic does not edit the Architect's section directly.)
 4. Route findings: business-section findings go to **Analyst**, architecture-section findings go to **Architect**. Do not cross-route.

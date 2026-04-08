@@ -56,6 +56,16 @@ structural decisions and the file map. -->
 architecture. New addon vs extending an existing one, key patterns reused,
 why this approach over alternatives. -->
 
+### AC → Implementation map
+
+<!-- Filled by the Architect. For each AC from the Acceptance Criteria
+section, name the concrete architecture element that fulfills it plus
+a test target. Format:
+  AC-N: <one-line restatement> → <file>: <method/class/section> + <test target>
+Every AC must appear here. AC without a mapping is a planning gap. -->
+
+- AC-1: <restatement> → `path/to/file.ext`: `<element>` + `tests/test_x.py::test_y`
+
 ### Files to create
 
 <!-- List of new files with one-line purpose each. Group by module/addon. -->

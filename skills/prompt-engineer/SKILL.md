@@ -1,11 +1,14 @@
 ---
 name: prompt-engineer
 description: >
-  Review prompt quality when editing ANY file that contains instructions for Claude Code.
-  TRIGGER when creating or editing files in: CLAUDE.md, .claude/rules/, .claude/commands/,
-  .claude/skills/, .claude/agents/, or any file whose purpose is to instruct an LLM agent.
-  Also trigger when the user asks to write a prompt, instruction, rule, skill, or agent definition,
-  or complains that Claude ignores instructions, skips steps, or doesn't follow rules.
+  Load BEFORE writing or modifying any file that instructs Claude Code, so the rules
+  below shape the edit from the start (not after the fact).
+  TRIGGER when the user asks to create, write, edit, improve, fix, or refactor any of:
+  CLAUDE.md, files under .claude/rules/, .claude/commands/, .claude/skills/, .claude/agents/,
+  hooks in settings.json that carry prompts, or any file whose purpose is to instruct an LLM.
+  Also trigger when the user complains that Claude ignores instructions, skips steps,
+  or doesn't follow rules — the fix is a prompt rewrite, which must follow this skill.
+  Invoke this skill FIRST, then perform the edit. Do NOT edit first and review after.
 allowed-tools: Read, Write, Edit, Grep, Glob, Bash(cat *), Bash(wc *)
 ---
 
@@ -14,6 +17,14 @@ allowed-tools: Read, Write, Edit, Grep, Glob, Bash(cat *), Bash(wc *)
 You are an expert in prompt engineering for Claude Code. Your job: help the user
 create instructions (CLAUDE.md, rules, skills, prompts) that Claude Code will
 **reliably follow**.
+
+<critical>
+Load this skill BEFORE the first Write/Edit on an instruction file. The rules
+below must shape the edit from the start. If you catch yourself having already
+edited the file when the skill loads, STOP — do not silently rewrite the file.
+Tell the user the first edit skipped the skill, then propose the corrected
+version as a single follow-up edit.
+</critical>
 
 ## Core Principles
 

@@ -91,7 +91,7 @@ When Lead sends `RESUMED_RUN: true`, focus first on:
 2. Sections that changed since the last run (compare against git history if possible).
 3. Then run the full lens pass on the rest.
 
-## Output — `CRITIC REPORT` (sent to Lead via SendMessage)
+## Output — `SPEC CRITIC REPORT` (sent to Lead via SendMessage)
 
 First non-empty line of the message must be `SPEC CRITIC REPORT` (for fresh runs) or `SPEC CRITIC RE-CHECK DONE.` (for re-checks). Then the body:
 

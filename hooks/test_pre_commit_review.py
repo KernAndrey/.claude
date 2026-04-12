@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from hooks.pre_commit_review import MAX_DIFF_LINES, check_diff_size, run_opencode
+from hooks.pre_commit_review import (
+    MAX_DIFF_LINES,
+    _parse_opencode_json,
+    check_diff_size,
+    run_opencode,
+)
 
 
 def test_under_limit_returns_none() -> None:
@@ -18,9 +23,25 @@ def test_over_limit_returns_message() -> None:
     assert str(MAX_DIFF_LINES) in result
 
 
+def test_parse_opencode_json_extracts_last_text() -> None:
+    raw = (
+        '{"type":"step_start","timestamp":1}\n'
+        '{"type":"text","timestamp":2,"part":{"type":"text","text":"partial"}}\n'
+        '{"type":"text","timestamp":3,"part":{"type":"text","text":"[WARNING] foo\\n\\nOK"}}\n'
+        '{"type":"step_finish","timestamp":4}\n'
+    )
+    assert _parse_opencode_json(raw) == "[WARNING] foo\n\nOK"
+
+
+def test_parse_opencode_json_empty_output() -> None:
+    assert _parse_opencode_json("") == ""
+    assert _parse_opencode_json('{"type":"step_start"}\n') == ""
+
+
 def test_run_opencode_builds_correct_command() -> None:
+    json_output = '{"type":"text","part":{"type":"text","text":"OK"}}\n'
     mock_result = MagicMock()
-    mock_result.stdout = "OK\n"
+    mock_result.stdout = json_output
     mock_result.stderr = ""
     mock_result.returncode = 0
 
@@ -29,18 +50,21 @@ def test_run_opencode_builds_correct_command() -> None:
 
     cmd = mock_run.call_args[0][0]
     assert cmd[0] == "opencode"
+    assert "run" in cmd
+    assert "--pure" in cmd
+    assert "--format" in cmd
+    assert "json" in cmd
     assert "--model" in cmd
     assert "github-copilot/claude-sonnet-4.6" in cmd
-    assert "--dangerously-skip-permissions" in cmd
-    assert "run" in cmd
     assert cmd[-1] == "sys\n\nuser"
     assert stdout == "OK"
     assert rc == 0
 
 
 def test_run_opencode_empty_system_prompt() -> None:
+    json_output = '{"type":"text","part":{"type":"text","text":"OK"}}\n'
     mock_result = MagicMock()
-    mock_result.stdout = "OK"
+    mock_result.stdout = json_output
     mock_result.stderr = ""
     mock_result.returncode = 0
 

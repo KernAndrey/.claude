@@ -159,15 +159,36 @@ def build_user_prompt(diff: str, files: str, is_merge: bool) -> str:
 # Review runners
 # ---------------------------------------------------------------------------
 
+def _parse_opencode_json(raw: str) -> str:
+    """Extract text content from opencode --format json output."""
+    import json
+
+    parts: list[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "text":
+            text = event.get("part", {}).get("text", "")
+            if text:
+                parts.append(text)
+    return parts[-1] if parts else ""
+
+
 def run_opencode(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:
-    """Run OpenCode for review. Returns (stdout, stderr, returncode)."""
+    """Run OpenCode CLI (--pure, no plugins) for review. Returns (stdout, stderr, returncode)."""
     full_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
 
     cmd = [
         "opencode",
-        "--model", "github-copilot/claude-sonnet-4.6",
         "run",
-        "--dangerously-skip-permissions",
+        "--pure",
+        "--model", "github-copilot/claude-sonnet-4.6",
+        "--format", "json",
         full_prompt,
     ]
 
@@ -178,7 +199,8 @@ def run_opencode(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:
         timeout=TIMEOUT_SECONDS,
     )
 
-    return result.stdout.strip(), result.stderr.strip(), result.returncode
+    review = _parse_opencode_json(result.stdout) if result.stdout else ""
+    return review, result.stderr.strip(), result.returncode
 
 
 def run_claude(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:

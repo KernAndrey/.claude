@@ -55,7 +55,7 @@ def test_run_opencode_builds_correct_command() -> None:
     assert "--format" in cmd
     assert "json" in cmd
     assert "--model" in cmd
-    assert "github-copilot/claude-sonnet-4.6" in cmd
+    assert "github-copilot/gpt-5.4" in cmd
     assert cmd[-1] == "sys\n\nuser"
     assert stdout == "OK"
     assert rc == 0

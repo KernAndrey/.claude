@@ -4,9 +4,15 @@ Run SDD reviewers as `opencode run --pure` subprocesses via GitHub Copilot. Stat
 
 ## Launching reviewers (Phase 2)
 
-Launch all reviewers in parallel. Each reviewer writes output to a temp file so the lead can collect results after all finish.
+Launch all reviewers in parallel. Each reviewer writes stdout to a unique temp file; stderr goes to a separate file to avoid corrupting JSON output.
 
 Substitute `{agent-name}` for: `code-reviewer`, `test-reviewer`, `spec-auditor`, `security-reviewer`, and `ui-reviewer` (when frontend files changed).
+
+Create a shared output directory before spawning:
+
+```bash
+REVIEW_DIR=$(mktemp -d /tmp/review-{task-id}-XXXXXX)
+```
 
 For each reviewer, run via `Bash(run_in_background=true)`:
 
@@ -19,7 +25,7 @@ Spec file: {spec_path}
 Working directory: {worktree_path}
 Base branch for diff: {base_branch}
 Run your full audit procedure. Output your report with REVIEWER, VERDICT, DEPTH, FINDINGS, SUMMARY." \
-  > /tmp/review-{agent-name}.json 2>&1
+  > "$REVIEW_DIR/{agent-name}.json" 2> "$REVIEW_DIR/{agent-name}.stderr"
 ```
 
 Wait for all background tasks to complete. Then read each output file and parse.
@@ -28,11 +34,14 @@ Timeout: 10 minutes per reviewer. On timeout or empty output — re-run once. Se
 
 ## Parsing output
 
-Read each `/tmp/review-{agent-name}.json`. Extract review text from JSON events:
+Read each `$REVIEW_DIR/{agent-name}.json`. Extract review text from JSON events, skipping malformed lines:
 
 ```python
 for line in open(output_file):
-    event = json.loads(line)
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        continue
     if event.get("type") == "text":
         parts.append(event["part"]["text"])
 review = "\n".join(parts)
@@ -63,7 +72,7 @@ Run your full audit procedure.
 Previous review found these MUST FIX issues:
 {list of findings with file:line}
 Fixes have been applied. Verify these are resolved and check for regressions." \
-  > /tmp/review-{agent-name}-rereview.json 2>&1
+  > "$REVIEW_DIR/{agent-name}-rereview.json" 2> "$REVIEW_DIR/{agent-name}-rereview.stderr"
 ```
 
 Lead spot-checks fixes directly (Read/Grep affected lines) before spawning. Skip re-review for trivially confirmed fixes.

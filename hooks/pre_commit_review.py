@@ -187,7 +187,7 @@ def run_opencode(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:
         "opencode",
         "run",
         "--pure",
-        "--model", "github-copilot/claude-sonnet-4.6",
+        "--model", "github-copilot/gpt-5.4",
         "--format", "json",
         full_prompt,
     ]

@@ -4,6 +4,16 @@ All agents in this workflow are **teammates** spawned via `TeamCreate` + `Agent`
 
 Begin by saying to the user: **"I will spawn an agent team to implement this spec. I am the lead — I coordinate, I don't code or review."**
 
+## Reviewer mode (required)
+
+`$ARGUMENTS` must include `--reviewers claudecode` or `--reviewers opencode`. If missing — **ask the user before proceeding:**
+
+> Which reviewer mode?
+> - `claudecode` — Claude Code teammates (full coordination, re-review with context, UI review supported)
+> - `opencode` — OpenCode `--pure` via GitHub Copilot (stateless, cheaper, no UI review)
+
+Parse `$ARGUMENTS` to extract both the task identifier and `--reviewers {mode}`. Store `{reviewer_mode}` for Phase 2 and 3.
+
 ## Quality mandate
 
 Thoroughness over speed. This task may run for hours — that is expected and acceptable. Every phase completes fully. Each phase exists for a reason that automated tools (hooks, linters, CI) cannot replace.
@@ -143,40 +153,13 @@ Check the changed files list from Coder. If ANY file matches a frontend pattern 
 
 If all changes are purely backend (`.py`, `.sql`, config `.json`) — skip UI-Reviewer.
 
-#### Spawn reviewers
+#### Reviewer list
 
-Spawn all as teammates and send each their task:
-
-- **Code-Reviewer** (`name: "code-reviewer"`) — production code quality
-- **Test-Reviewer** (`name: "test-reviewer"`) — test quality and coverage
-- **Spec-Auditor** (`name: "spec-auditor"`) — spec compliance
-- **Security-Reviewer** (`name: "security-reviewer"`) — security and architecture
-- **UI-Reviewer** (`name: "ui-reviewer"`) — visual verification *(only if frontend files changed)*
-
-Each code reviewer message:
-
-> Read your instructions: `~/.claude/agents/{agent-name}.md`
-> Spec file: `{spec_path}`
-> Working directory: `{worktree_path}`
-> Base branch for diff: `{base_branch}`
-> Report findings to me using the format from your agent file.
-> **Heartbeat:** every 10 min of work OR 5 items audited, send a one-line `PROGRESS: [just audited] → [auditing next]`. If blocked for more than 5 min, send `BLOCKED: [reason]`. Silent idling is not acceptable — you are watchdogged on 10-min intervals.
-
-UI-Reviewer message (when spawned):
-
-> Read your instructions: `~/.claude/agents/ui-reviewer.md`
-> Spec file: `{spec_path}`
-> Working directory: `{worktree_path}`
-> Base branch for diff: `{base_branch}`
-> Changed files: {combined changed files from all coders}
-> URL hints: {any relevant URLs or pages you can identify from the spec}
-> Report findings to me using the format from your agent file.
-> **Heartbeat:** every 10 min of work OR 5 views audited, send a one-line `PROGRESS: [just audited] → [auditing next]`. If blocked for more than 5 min, send `BLOCKED: [reason]`. Silent idling is not acceptable — you are watchdogged on 10-min intervals.
-
-If UI-Reviewer reports `VERDICT: BLOCKED` (cannot start dev server, browser unavailable):
-- Kill the reviewer and spawn a replacement with a troubleshooting hint (check port, install deps, try alternative start command).
-- Retry up to **3 times**, each with a different hint.
-- After 3 failed attempts: document reason in Known Concerns, add manual UI check to Steps for Manual Review, and continue.
+- **Code-Reviewer** — production code quality
+- **Test-Reviewer** — test quality and coverage
+- **Spec-Auditor** — spec compliance
+- **Security-Reviewer** — security and architecture
+- **UI-Reviewer** — visual verification *(only if frontend files changed)*
 
 Each reviewer will report in this format (defined in their agent file):
 ```
@@ -191,11 +174,17 @@ FINDINGS: ...
 SUMMARY: X findings (Y MUST FIX, Z NIT/CONCERN)
 ```
 
-**Reject reports without a DEPTH block.** The DEPTH counts are how you detect shallow reviews. If a reviewer reports `VERDICT` and `FINDINGS` but omits `DEPTH`, reply `INVALID REPORT: missing DEPTH block. Re-run your audit procedure and re-report.` and do not proceed. Same rule if counts look implausibly low for the diff (e.g. "Methods audited: 2" on a 20-method diff, or "Views audited: 1" on a spec touching 6 views).
+**Reject reports without a DEPTH block.** The DEPTH counts are how you detect shallow reviews. If a reviewer reports `VERDICT` and `FINDINGS` but omits `DEPTH`, re-run that reviewer. Same rule if counts look implausibly low for the diff (e.g. "Methods audited: 2" on a 20-method diff).
 
-Monitor: track which reviewers have reported. If any goes idle without reporting — send a status check.
+---
 
-**Phase 2 is complete when ALL spawned reviewers have reported to the lead with a valid DEPTH block.**
+#### Mode A: `--reviewers claudecode`
+
+Read and follow `~/.claude/guides/claudecode-review-runner.md` — Phase 2 section.
+
+#### Mode B: `--reviewers opencode`
+
+Read and follow `~/.claude/guides/opencode-review-runner.md` — Phase 2 section.
 
 ---
 
@@ -229,15 +218,9 @@ Message Tester with all test fixes (if any):
 
 #### Step 3: Verification
 
-Message existing reviewers who had `MUST FIX` or `CRITICAL` findings:
-> This is a **re-review** after fixes.
->
-> **Primary:** verify each of your previous MUST FIX / CRITICAL items is resolved.
-> **Secondary (mandatory):** fixes may have introduced new issues in the modified files. Run your full audit procedure again on those files. Treat new methods, new error paths, and regressions in previously-clean code as in scope.
->
-> Report `PASS` only if BOTH primary items are resolved AND the secondary pass finds nothing new. Otherwise list all outstanding issues.
-
-If a reviewer is unresponsive after 1 status check — spawn a replacement with the same instructions (primary verification + full secondary audit).
+Follow the re-review procedure from the active reviewer runner guide:
+- **claudecode:** `~/.claude/guides/claudecode-review-runner.md` — Phase 3 Step 3
+- **opencode:** `~/.claude/guides/opencode-review-runner.md` — Phase 3 Step 3
 
 #### Step 4: Fix loop and escalation
 

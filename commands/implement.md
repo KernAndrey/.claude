@@ -10,7 +10,7 @@ Begin by saying to the user: **"I will spawn an agent team to implement this spe
 
 > Which reviewer mode?
 > - `claudecode` — Claude Code teammates (full coordination, re-review with context, UI review supported)
-> - `opencode` — OpenCode `--pure` via GitHub Copilot (stateless, cheaper, no UI review)
+> - `opencode` — OpenCode `--pure` via GitHub Copilot (stateless, cheaper)
 
 Parse `$ARGUMENTS` to extract both the task identifier and `--reviewers {mode}`. Store `{reviewer_mode}` for Phase 2 and 3.
 

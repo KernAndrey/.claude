@@ -162,7 +162,7 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 
 ### 2c. Critic
 
-Spawn `spec-critic`. Send:
+Spawn `spec-critic` teammate. Send:
 
 > Read your instructions: `~/.claude/agents/spec-critic.md`
 > Spec path: `tasks/2-spec/{ID}-{slug}.md`
@@ -175,9 +175,19 @@ Spawn `spec-critic`. Send:
 
 **Message loop:** same shape. Critic rarely escalates; if it does, handle like any other `QUESTION FOR USER`.
 
+#### Optional: GPT-5.4 second critic
+
+If `which opencode` succeeds, launch a second `spec-critic` in parallel with the teammate. Read and follow `~/.claude/guides/opencode-review-runner.md` for the full subprocess lifecycle (launch, parsing, validation, timeout, retry). Use `spec-critic` as the agent and `github-copilot/gpt-5.4` as the model. Pass the same inputs as the teammate critic above (spec path, working directory, Phase 1 context, CLAUDE.md path, `RESUMED_RUN: true` on resume runs).
+
+The GPT-5.4 critic runs non-interactively — it cannot participate in the `QUESTION FOR USER` message loop. Add to its prompt: "Do not emit SPEC CRITIC QUESTION FOR USER. If you encounter ambiguity, record it as a finding instead." The teammate critic handles all interactive escalation.
+
+Wait for both the teammate and the GPT-5.4 critic to complete before proceeding.
+
 ### 2d. Apply findings
 
-After receiving `SPEC CRITIC REPORT`:
+Merge findings from the teammate critic and the GPT-5.4 critic (if launched). This includes `EMERGENT QUESTIONS FOR USER` from either source — both feed into Phase 3. Deduplicate findings that flag the same issue — keep the more specific description. If the GPT-5.4 critic was not launched or failed — proceed with the teammate report only.
+
+After reports are collected:
 
 - **Business findings** (`route: analyst`) → `SendMessage(to: "spec-analyst", ...)` with the specific findings, request fixes. Run the Analyst message loop again until `SPEC ANALYST FIX ROUND DONE.`.
 - **Architecture findings** (`route: architect`) → `SendMessage(to: "spec-architect", ...)`. Run the Architect message loop until `SPEC ARCHITECT FIX ROUND DONE.`.

@@ -13,11 +13,12 @@ Initialize Spec-Driven Development for the current project.
      5-review/
      6-done/
      7-blocked/
+     bugs/
      archive/
        drafts/
    ```
    Add `.gitkeep` to each empty directory.
-3. Create `tasks/.counter` with content `0`.
+3. Create `tasks/.counter` with content `0`. Create `tasks/bugs/.counter` with content `0`.
 4. Create `.tasks.toml` in project root:
    ```toml
    [tasks]
@@ -53,6 +54,7 @@ Initialize Spec-Driven Development for the current project.
    | `/task-done <ID>` | Mark task as done | No |
    | `/task-block <ID> <reason>` | Block task | No |
    | `/decompose <idea>` | Decompose big idea into tasks | No |
+   | `/bug-report [description]` | Interactive bug report from QA | No |
    | `/task-list [filter]` | Show task board | No |
 
    ### Task Lifecycle

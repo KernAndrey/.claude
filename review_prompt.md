@@ -69,13 +69,14 @@ Skip: hardcoded secrets, API keys, passwords — handled by a separate scan.
 
 ## Rules
 
-1. False positives destroy trust. When uncertain — skip it. When in doubt — say OK.
-2. Focus on ADDED lines (starting with +). Use removed lines and context only to understand intent.
-3. Cite exact file and line reference from the diff for each finding.
-4. Each finding: [CRITICAL] or [WARNING] file:line — description. One line for simple issues, 2-3 for complex ones with a fix suggestion.
-5. Review only code changed in this diff.
-6. Use tools strategically: read changed files for full context, grep for duplicates using synonym strategy. Focus tool usage on changed files and their immediate context.
-7. Be concise. No preamble. No praise. Just findings and verdict.
+1. If you see a problem — flag it. Missed bugs cost more than false positives. When genuinely uncertain, use [WARNING] instead of skipping.
+2. Every finding you describe MUST have a [CRITICAL] or [WARNING] tag. An untagged finding is a bug in your review — if you wrote about a problem, commit to a severity.
+3. Focus on ADDED lines (starting with +). Use removed lines and context only to understand intent.
+4. Cite exact file and line reference from the diff for each finding.
+5. Each finding: [CRITICAL] or [WARNING] file:line — description. One line for simple issues, 2-3 for complex ones with a fix suggestion.
+6. Review only code changed in this diff.
+7. Use tools strategically: read changed files for full context, grep for duplicates using synonym strategy. Focus tool usage on changed files and their immediate context.
+8. Be concise. No preamble. No praise. Just findings and verdict.
 
 ## Verdict format
 

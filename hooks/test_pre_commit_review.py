@@ -30,7 +30,7 @@ def test_parse_opencode_json_extracts_last_text() -> None:
         '{"type":"text","timestamp":3,"part":{"type":"text","text":"[WARNING] foo\\n\\nOK"}}\n'
         '{"type":"step_finish","timestamp":4}\n'
     )
-    assert _parse_opencode_json(raw) == "[WARNING] foo\n\nOK"
+    assert _parse_opencode_json(raw) == "partial\n[WARNING] foo\n\nOK"
 
 
 def test_parse_opencode_json_empty_output() -> None:

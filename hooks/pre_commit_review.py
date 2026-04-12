@@ -176,7 +176,7 @@ def _parse_opencode_json(raw: str) -> str:
             text = event.get("part", {}).get("text", "")
             if text:
                 parts.append(text)
-    return parts[-1] if parts else ""
+    return "\n".join(parts) if parts else ""
 
 
 def run_opencode(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:

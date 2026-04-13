@@ -3,6 +3,7 @@ id: "{{ID}}"
 title: "{{TITLE}}"
 type: bug
 severity: "{{SEVERITY}}"
+priority: "{{PRIORITY}}"
 status: open
 created: "{{DATE}}"
 reported_by: "{{REPORTER}}"
@@ -23,10 +24,6 @@ reported_by: "{{REPORTER}}"
 ## Actual Behavior
 
 {{ACTUAL}}
-
-## Screenshots
-
-{{SCREENSHOTS}}
 
 ## Environment
 

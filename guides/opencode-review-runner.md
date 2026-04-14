@@ -19,9 +19,12 @@ mkdir -p .claude/agents-global
 # Exclude from git (user-local symlinks, not committable; worktree-safe path)
 EXCLUDE_FILE="$(git rev-parse --git-path info/exclude)"
 grep -qxF '.claude/agents-global/' "$EXCLUDE_FILE" 2>/dev/null || echo '.claude/agents-global/' >> "$EXCLUDE_FILE"
+grep -qxF '.claude/review_prompt_global.md' "$EXCLUDE_FILE" 2>/dev/null || echo '.claude/review_prompt_global.md' >> "$EXCLUDE_FILE"
 for agent in code-reviewer test-reviewer spec-auditor security-reviewer ui-reviewer spec-critic-arch; do
   [ -f ~/.claude/agents/$agent.md ] && ln -sf ~/.claude/agents/$agent.md .claude/agents-global/$agent.md
 done
+# Global review prompt (project-level .claude/review_prompt.md is already accessible)
+[ -f ~/.claude/review_prompt.md ] && ln -sf ~/.claude/review_prompt.md .claude/review_prompt_global.md
 ```
 
 Create a shared output directory before spawning:
@@ -37,6 +40,9 @@ opencode run --pure \
   --model github-copilot/claude-sonnet-4.6 \
   --format json \
   "Read .claude/agents-global/{agent-name}.md — follow these instructions exactly.
+If .claude/review_prompt.md exists, read it — project-specific review rules (severity overrides, design decisions to treat as intentional).
+If .claude/review_prompt_global.md exists, read it — global review rules.
+Apply both during your review.
 Spec file: {spec_path}
 Working directory: {worktree_path}
 Base branch for diff: {base_branch}
@@ -80,6 +86,9 @@ opencode run --pure \
   --model github-copilot/gpt-5.4 \
   --format json \
   "Read .claude/agents-global/{agent-name}.md — follow these instructions exactly.
+If .claude/review_prompt.md exists, read it — project-specific review rules.
+If .claude/review_prompt_global.md exists, read it — global review rules.
+Apply both during your review.
 Spec file: {spec_path}
 Working directory: {worktree_path}
 Base branch for diff: {base_branch}

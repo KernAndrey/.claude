@@ -23,12 +23,22 @@ Thoroughness over speed. This task may run for hours — that is expected and ac
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
 2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`.
 3. Read the full specification.
-4. Branch and worktree setup:
+4. **Review prompt setup:** reviewers must apply project-specific review rules from `review_prompt.md`. Ensure these files are accessible:
+   - Check if `.claude/review_prompt.md` (project-level) exists. If yes — it will be passed to reviewers.
+   - Check if `~/.claude/review_prompt.md` (global) exists. If yes — symlink it to `.claude/review_prompt_global.md` for opencode access:
+     ```
+     mkdir -p .claude
+     EXCLUDE_FILE="$(git rev-parse --git-path info/exclude)"
+     grep -qxF '.claude/review_prompt_global.md' "$EXCLUDE_FILE" 2>/dev/null || echo '.claude/review_prompt_global.md' >> "$EXCLUDE_FILE"
+     ln -sf ~/.claude/review_prompt.md .claude/review_prompt_global.md
+     ```
+   - Store `{review_prompt_paths}` — list of existing paths (may be both, one, or none). Pass to both runner guides.
+5. Branch and worktree setup:
    - If `auto_branch = true`: fetch latest `dev` branch (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All teammates work inside the worktree directory.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
-5. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
-6. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers will need it.
-7. **Create the team:** `TeamCreate` with `team_name: "impl-{ID}"`. You are the lead.
+6. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
+7. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers will need it.
+8. **Create the team:** `TeamCreate` with `team_name: "impl-{ID}"`. You are the lead.
 
 ## Team & Communication
 

@@ -8,11 +8,11 @@ Launch all reviewers in parallel. Each reviewer writes stdout to a unique temp f
 
 Substitute `{agent-name}` for: `code-reviewer`, `test-reviewer`, `spec-auditor`, `security-reviewer`, `ui-reviewer` (when frontend files changed), and `spec-critic-arch` (during `/spec` runs).
 
-**Path note:** `opencode --pure` rejects paths outside the project directory. For agents under `~/.claude/agents/`, use the project-local symlink `.claude/agents-global/{agent-name}.md` instead. If the symlink doesn't exist, copy the agent file into the project: `cp ~/.claude/agents/{agent-name}.md .claude/agents-global/{agent-name}.md` and reference the local copy in the prompt. Do not inline raw markdown into the shell command — agent files contain backticks and quotes that break shell quoting.
+**Path note:** `opencode --pure` rejects paths outside the project directory. For agents under `~/.claude/agents/`, use the project-local symlink `.claude/agents-global/{agent-name}.md` instead. Symlinks stay in sync with the source automatically — do not copy files (copies become stale snapshots). If the symlink doesn't exist, create it before launching (see setup below).
 
 ### Symlink setup
 
-Ensure symlinks exist before launching. Run once per project (or in `/task-init`):
+Ensure symlinks exist before launching. Run once per project (or in `/task-init`). The symlink setup is idempotent — safe to re-run.
 
 ```bash
 mkdir -p .claude/agents-global

@@ -6,7 +6,7 @@ Run SDD reviewers as `opencode run --pure` subprocesses via GitHub Copilot. Stat
 
 Launch all reviewers in parallel. Each reviewer writes stdout to a unique temp file; stderr goes to a separate file to avoid corrupting JSON output.
 
-Substitute `{agent-name}` for: `code-reviewer`, `test-reviewer`, `spec-auditor`, `security-reviewer`, and `ui-reviewer` (when frontend files changed).
+Substitute `{agent-name}` for: `code-reviewer`, `test-reviewer`, `spec-auditor`, `security-reviewer`, `ui-reviewer` (when frontend files changed), and `spec-critic-arch` (during `/spec` runs).
 
 Create a shared output directory before spawning:
 

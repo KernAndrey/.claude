@@ -16,8 +16,9 @@ Ensure symlinks exist before launching. Run once per clone or worktree. Do not c
 
 ```bash
 mkdir -p .claude/agents-global
-# Exclude from git (user-local symlinks, not committable)
-grep -qxF '.claude/agents-global/' .git/info/exclude 2>/dev/null || echo '.claude/agents-global/' >> .git/info/exclude
+# Exclude from git (user-local symlinks, not committable; worktree-safe path)
+EXCLUDE_FILE="$(git rev-parse --git-path info/exclude)"
+grep -qxF '.claude/agents-global/' "$EXCLUDE_FILE" 2>/dev/null || echo '.claude/agents-global/' >> "$EXCLUDE_FILE"
 for agent in code-reviewer test-reviewer spec-auditor security-reviewer ui-reviewer spec-critic-arch; do
   [ -f ~/.claude/agents/$agent.md ] && ln -sf ~/.claude/agents/$agent.md .claude/agents-global/$agent.md
 done

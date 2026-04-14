@@ -122,7 +122,7 @@ Shared context to pass in every teammate message:
 > Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts). Every numbered decision MUST be reflected in the spec. Codebase observations inform your writing but don't need 1:1 mapping.**
 > User Phase 1 answers: {inline all answers — supplementary context}
 > Project CLAUDE.md: `{path}`
-> Write the business sections. Signal `SPEC ANALYST DONE.` when ready. Escalate ambiguities with `SPEC ANALYST QUESTION FOR USER` and wait for my reply.
+> Write the business sections (including Key Constraints, Assumptions, and one `[SENTINEL]` marker in Behavior). Signal `SPEC ANALYST DONE.` when ready. Escalate ambiguities with `SPEC ANALYST QUESTION FOR USER` and wait for my reply.
 > Heartbeat: every 10 min of work OR 5 file edits send a one-line `PROGRESS: [just finished] → [doing next]`. If blocked for more than 5 min, send `BLOCKED: [reason]`.
 
 **Resume runs, business blockers resolved:** Re-message (team persists, but re-spawn if needed):
@@ -158,41 +158,61 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 
 **Message loop:** same shape as 2a, but with `spec-architect` and the Architect signal names.
 
-### 2c. Critic
+### 2c. Critics (two agents in parallel)
 
-Spawn `spec-critic` teammate. Send:
+Spawn both critics as teammates in the same team. They run in parallel — no dependencies between them.
 
-> Read your instructions: `~/.claude/agents/spec-critic.md`
+#### 2c-i. Architecture Critic
+
+Spawn `spec-critic-arch` (`Agent(name: "spec-critic-arch", team_name: "spec-{ID}")`). Send:
+
+> Read your instructions: `~/.claude/agents/spec-critic-arch.md`
 > Spec path: `tasks/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and verify EVERY numbered decision is correctly reflected in the spec. Any mismatch = CRITICAL finding. Also read `## Codebase Observations` — verify spec's integration points and API claims match the recorded observations.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
 > Project CLAUDE.md: `{path}`
 > {On resume:} `RESUMED_RUN: true`
-> Run your full verification and lens pass. Signal `SPEC CRITIC REPORT` when done.
+> Run your full verification and lens pass (Pass 1 + Lenses A–G). Signal `SPEC ARCH CRITIC REPORT` when done.
 > Heartbeat: as above.
 
-**Message loop:** same shape. Critic rarely escalates; if it does, handle like any other `QUESTION FOR USER`.
+#### 2c-ii. Business Critic
 
-#### Optional: GPT-5.4 second critic
+Spawn `spec-critic-business` (`Agent(name: "spec-critic-business", team_name: "spec-{ID}")`). Send:
 
-If `which opencode` succeeds, launch a second `spec-critic` in parallel with the teammate. Read and follow `~/.claude/guides/opencode-review-runner.md` for the full subprocess lifecycle (launch, parsing, validation, timeout, retry). Use `spec-critic` as the agent and `github-copilot/gpt-5.4` as the model. Pass the same inputs as the teammate critic above (spec path, working directory, Phase 1 context, CLAUDE.md path, draft path with `## Decisions`, `RESUMED_RUN: true` on resume runs).
+> Read your instructions: `~/.claude/agents/spec-critic-business.md`
+> Spec path: `tasks/2-spec/{ID}-{slug}.md`
+> Draft path: `{draft path}` — **read `## Decisions` and verify EVERY numbered decision is correctly reflected in the spec's business sections. Any mismatch = CRITICAL finding.**
+> Working directory: `{project root}`
+> Phase 1 context: {inline user answers and Lead observations}
+> Project CLAUDE.md: `{path}`
+> {On resume:} `RESUMED_RUN: true`
+> Run your full business quality lens pass (Lenses G–R). Signal `SPEC BUSINESS CRITIC REPORT` when done.
+> Heartbeat: as above.
 
-**Important:** opencode in `--pure` mode cannot read files outside the project directory (`~/.claude/agents/` is auto-rejected). Use the symlink `.claude/agents-global/spec-critic.md` instead. If the symlink doesn't exist, inline the agent instructions directly in the prompt.
+**Message loops:** run both in parallel. Both critics rarely escalate; if either does, handle like any other `QUESTION FOR USER`.
 
-The GPT-5.4 critic runs non-interactively — it cannot participate in the `QUESTION FOR USER` message loop. Add to its prompt: "Do not emit SPEC CRITIC QUESTION FOR USER. If you encounter ambiguity, record it as a finding instead." Also add: "Read `## Decisions` in the draft file and verify EVERY numbered decision is reflected in the spec. Any mismatch = CRITICAL finding." The teammate critic handles all interactive escalation.
+#### Optional: GPT-5.4 third critic
 
-Wait for both the teammate and the GPT-5.4 critic to complete before proceeding.
+If `which opencode` succeeds, launch a GPT-5.4 architecture critic in parallel with the two teammates. Read and follow `~/.claude/guides/opencode-review-runner.md` for the full subprocess lifecycle (launch, parsing, validation, timeout, retry). Use `spec-critic-arch` as the agent and `github-copilot/gpt-5.4` as the model. Pass the same inputs as the arch critic above (spec path, working directory, Phase 1 context, CLAUDE.md path, draft path with `## Decisions`, `RESUMED_RUN: true` on resume runs).
+
+**Important:** opencode in `--pure` mode cannot read files outside the project directory (`~/.claude/agents/` is auto-rejected). Use the symlink `.claude/agents-global/spec-critic-arch.md` instead. If the symlink doesn't exist, inline the agent instructions directly in the prompt.
+
+The GPT-5.4 critic runs non-interactively — it cannot participate in the `QUESTION FOR USER` message loop. Add to its prompt: "Do not emit SPEC ARCH CRITIC QUESTION FOR USER. If you encounter ambiguity, record it as a finding instead." Also add: "Read `## Decisions` in the draft file and verify EVERY numbered decision is reflected in the spec. Any mismatch = CRITICAL finding." The teammate critics handle all interactive escalation.
+
+Wait for all critics (both teammates + GPT-5.4 if launched) to complete before proceeding.
 
 ### 2d. Apply findings
 
-Merge findings from the teammate critic and the GPT-5.4 critic (if launched). This includes `EMERGENT QUESTIONS FOR USER` from either source — both feed into Phase 3. Deduplicate findings that flag the same issue — keep the more specific description. If the GPT-5.4 critic was not launched or failed — proceed with the teammate report only.
+Merge findings from all critics (arch critic, business critic, and GPT-5.4 critic if launched). This includes `EMERGENT QUESTIONS FOR USER` from all sources — they all feed into Phase 3. Deduplicate findings that flag the same issue — keep the more specific description. If the GPT-5.4 critic was not launched or failed — proceed with the two teammate reports only.
 
 After reports are collected:
 
 - **Business findings** (`route: analyst`) → `SendMessage(to: "spec-analyst", ...)` with the specific findings, request fixes. Run the Analyst message loop again until `SPEC ANALYST FIX ROUND DONE.`.
 - **Architecture findings** (`route: architect`) → `SendMessage(to: "spec-architect", ...)`. Run the Architect message loop until `SPEC ARCHITECT FIX ROUND DONE.`.
-- **After fixes**: optionally `SendMessage(to: "spec-critic", "RE-CHECK OF: [f-1, f-3]")` and wait for `SPEC CRITIC RE-CHECK DONE.`
+- **After fixes**: optionally re-check with the appropriate critic:
+  - Business findings: `SendMessage(to: "spec-critic-business", "RE-CHECK OF: [f-1, f-3]")` → wait for `SPEC BUSINESS CRITIC RE-CHECK DONE.`
+  - Architecture findings: `SendMessage(to: "spec-critic-arch", "RE-CHECK OF: [f-2, f-4]")` → wait for `SPEC ARCH CRITIC RE-CHECK DONE.`
 - **Maximum 2 fix rounds per teammate.** After two rounds, unresolved business concerns stay in `Edge Cases & Risks`, unresolved architectural concerns stay in `Open architectural questions`. Phase 3 picks them up if they need user input.
 - **Tiny edits** (typo, missing bullet): Lead may Edit the spec file directly instead of round-tripping through a teammate.
 - **`EMERGENT QUESTIONS FOR USER`**: deferred to Phase 3, do not resolve here.
@@ -252,6 +272,9 @@ Use `git add` on specific files only (draft, spec). Run commits with `run_in_bac
 3. Verify the AC → Implementation map covers every AC in Acceptance Criteria.
 4. Verify `## Examples` has entries for non-trivial Behavior rules.
 5. Verify `## Definition of Done` has been populated (items either checked, left unchecked for the human, or marked `N/A — <reason>`).
+6. Verify `## Key Constraints` has 3-7 items, each tracing to Behavior or AC.
+7. Verify `## Assumptions` is populated (not just the template placeholder).
+8. Verify exactly one `[SENTINEL]` marker exists in the Behavior section.
 
 ### If open blockers > 0
 

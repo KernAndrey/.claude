@@ -18,9 +18,9 @@ a Coder (for Architecture Decisions). Every ambiguity must be resolved
 before /task-approve — unresolved questions live in ## Blockers.
 
 Section ownership:
-  Analyst   → Objective, Glossary, Scope, Behavior, Acceptance Criteria,
-              Examples, Edge Cases & Risks, Affected Areas, Testing Strategy,
-              Definition of Done, Dependencies
+  Analyst   → Objective, Key Constraints, Glossary, Scope, Assumptions,
+              Behavior, Acceptance Criteria, Examples, Edge Cases & Risks,
+              Affected Areas, Testing Strategy, Definition of Done, Dependencies
   Architect → Architecture & Implementation Plan (both hard and soft
               subsections), plus depends_on / blocks in frontmatter
   Lead      → Blockers (adds entries when the user defers questions)
@@ -30,6 +30,22 @@ Section ownership:
 ## Objective
 
 <!-- One or two sentences: what and why. Business outcome, not implementation. -->
+
+## Key Constraints
+
+<!-- 5-10 lines maximum. Duplicates of the most critical rules from Behavior
+     and Acceptance Criteria — the ones where a miss causes data loss, security
+     holes, or broken invariants. Phrased as positive requirements.
+
+     Why: LLM attention follows a U-curve (primacy + recency). Constraints
+     buried in the middle of a long Behavior section receive less weight.
+     This block gives them primacy-position reinforcement.
+
+     Populated by Analyst AFTER writing Behavior — it is a synthesis, not
+     a first draft. Every item here MUST have a matching detail in Behavior
+     or AC. -->
+
+1.
 
 ## Glossary
 
@@ -55,6 +71,21 @@ Section ownership:
 
 -
 
+## Assumptions
+
+<!-- Conditions the spec takes for granted but does not verify at runtime.
+     If any assumption is false, the spec's behavior guarantees do not hold.
+
+     Examples: "email credentials remain valid for the duration of a chain",
+     "parse_all_emails() is idempotent", "queue_job service is available",
+     "no concurrent enrollment modifications for the same contact".
+
+     Each assumption is one bullet: the assumption, then why it matters.
+     Reviewers (human or agent) can challenge any assumption — a challenged
+     assumption becomes a Blocker. -->
+
+-
+
 ## Behavior
 
 <!-- Describe what the system should do in plain English: user-facing changes,
@@ -67,13 +98,33 @@ Section ownership:
 
      If a behavior is non-trivial (more than one input/output combination,
      any state transition, any transformation), add a matching entry in
-     ## Examples below. -->
+     ## Examples below.
+
+     FSM tables: when describing entities with states and transitions, include
+     a compact FSM transition table after the prose description:
+
+       | From → To | Trigger | Guard | Side-effect |
+       |-----------|---------|-------|-------------|
+       | active → paused | action_pause | user is enrollee or manager | — |
+
+     Illegal transitions: list explicitly (e.g., "withdrawn → ANY is illegal
+     (terminal state)"). The table complements the prose — both are required.
+
+     Sentinel: Analyst MUST embed one specific, easily-verifiable detail
+     somewhere in this section — a specific constant name, exact error message,
+     or naming convention. Mark it inline as [SENTINEL]. This acts as a canary
+     to verify implementing agents read the full section. Example:
+     "the validation error message MUST be exactly: 'Enrollment requires
+     an active contact — see AC-3' [SENTINEL]" -->
 
 ## Acceptance Criteria
 
 <!-- Every AC must be binary-verifiable: a test can assert it in one expression.
      Format:
-       `Given <literal precondition>, when <literal action>, then <literal observable>`
+       **AC-N** — Short title
+         Given <literal precondition>,
+         when <literal action>,
+         then <literal observable>
 
      Use concrete values: exact field values, exact UI strings, exact counts,
      exact error messages. Never "appropriate", "reasonable", "typical",
@@ -81,15 +132,15 @@ Section ownership:
      decisions. If the precise value isn't known, escalate as a blocker, do not
      invent.
 
-     Example:
-     - [ ] Given an employee with `active=True` and `state='open'`, when the
-           user clicks "Archive" and enters reason "Retired", then
-           `employee.active = False` AND `employee.archive_reason = 'Retired'`
-           AND the audit log records `archived_by = current_user.id`. -->
+     AC number appears exactly once. Two independent scenarios in one AC →
+     **Scenario A** / **Scenario B**.
 
-- [ ]
-- [ ]
-- [ ]
+     Example:
+     **AC-1** — Archive sets reason and audit trail
+       Given an employee with `active=True` and `state='open'`,
+       when the user clicks "Archive" and enters reason "Retired",
+       then `employee.active = False` AND `employee.archive_reason = 'Retired'`
+       AND the audit log records `archived_by = current_user.id`. -->
 
 ## Examples
 
@@ -303,7 +354,7 @@ hint needs no Change Control entry.
 
      ### b-N — <short title>
      - **status**: open | resolved-by-user
-     - **raised-by**: spec-analyst | spec-architect | spec-critic | lead (Phase 1 / Phase 3)
+     - **raised-by**: spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | lead (Phase 1 / Phase 3)
      - **raised-on**: YYYY-MM-DD
      - **expertise-needed**: business | architecture | testing | security | ux | unknown
      - **context**: <what was found, what's ambiguous>

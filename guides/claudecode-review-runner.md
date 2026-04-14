@@ -18,7 +18,7 @@ Each reviewer message:
 > Spec file: `{spec_path}`
 > Working directory: `{worktree_path}`
 > Base branch for diff: `{base_branch}`
-> **Review prompts:** if `.claude/review_prompt.md` exists, read it — it contains project-specific review rules (severity overrides, design decisions to treat as intentional). If `~/.claude/review_prompt.md` exists, read it too — it contains global review rules. Apply both during your review.
+> **Review prompts:** if `.claude/review_prompt.md` exists, read it — it contains project-specific review rules (severity overrides, design decisions to treat as intentional). If `.claude/review_prompt_global.md` exists, read it too — it contains global review rules. Apply both during your review.
 > Report findings to me using the format from your agent file.
 > **Heartbeat:** every 10 min of work OR 5 items audited, send a one-line `PROGRESS: [just audited] → [auditing next]`. If blocked for more than 5 min, send `BLOCKED: [reason]`. Silent idling is not acceptable — you are watchdogged on 10-min intervals.
 

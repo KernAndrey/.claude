@@ -1,10 +1,26 @@
-## Project override: prompt/instruction repository
+<critical>
+CRITICAL severity is reserved exclusively for `.py` files.
+All findings in `.md` files use WARNING severity — no exceptions.
+A WARNING in a `.md` file never justifies a BLOCK verdict.
+</critical>
 
-This project consists primarily of prompts, agent instructions, guides, and configuration — not production application code.
+## Project context
 
-When reviewing `.md` files (prompts, guides, agent instructions):
-- Use WARNING instead of CRITICAL for missing implementation details in orchestration instructions. The Lead (Claude Code) has full tool access and can resolve procedural gaps at runtime.
-- Do not block for: missing timeout/retry specifics, shell variable lifecycle, subprocess orchestration details, or tool availability concerns — these are runtime decisions, not code bugs.
-- CRITICAL is still appropriate for: logical contradictions, incorrect file paths, wrong model names, broken references to nonexistent files, and security issues.
+This repository contains prompts, agent instructions, guides, and configuration — not production application code. The Lead agent (Claude Code) has full tool access and resolves procedural gaps at runtime.
 
-When reviewing `.py` files: apply the full global review rules without modification.
+## Severity rules by file type
+
+### `.py` files — full review rules
+Apply the global review prompt without modification.
+
+### `.md` files — WARNING only
+These are orchestration instructions, not executable code. Use WARNING for all findings, including:
+- Logical contradictions between sections
+- Incorrect file paths or broken references
+- Missing timeout/retry specifics, shell variable lifecycle, subprocess details
+- Tool availability concerns
+
+### Design decisions (treat as intentional, not bugs)
+- `parse_verdict()` uses case-insensitive matching — LLMs may output `ok` or `Ok`
+- Empty/whitespace-only reviewer output → fail-open (tool crash, not a review result)
+- The fail-closed contract (BLOCK on missing verdict) applies only to non-empty responses

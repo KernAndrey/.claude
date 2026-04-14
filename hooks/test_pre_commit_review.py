@@ -4,10 +4,57 @@ from unittest.mock import MagicMock, patch
 
 from hooks.pre_commit_review import (
     MAX_DIFF_LINES,
+    _has_explicit_verdict,
     _parse_opencode_json,
     check_diff_size,
+    parse_verdict,
     run_opencode,
 )
+
+
+# ---------------------------------------------------------------------------
+# parse_verdict / _has_explicit_verdict
+# ---------------------------------------------------------------------------
+
+
+def test_parse_verdict_ok() -> None:
+    assert parse_verdict("some review\n\nOK") == "OK"
+
+
+def test_parse_verdict_block() -> None:
+    assert parse_verdict("[CRITICAL] bug\n\nBLOCK") == "BLOCK"
+
+
+def test_parse_verdict_case_insensitive() -> None:
+    assert parse_verdict("review\nok") == "OK"
+    assert parse_verdict("review\nOk") == "OK"
+    assert parse_verdict("review\nblock") == "BLOCK"
+    assert parse_verdict("review\nBlock") == "BLOCK"
+
+
+def test_parse_verdict_empty_defaults_to_block() -> None:
+    assert parse_verdict("") == "BLOCK"
+    assert parse_verdict("   \n  \n  ") == "BLOCK"
+
+
+def test_parse_verdict_no_verdict_defaults_to_block() -> None:
+    assert parse_verdict("some text without a verdict") == "BLOCK"
+
+
+def test_parse_verdict_ignores_non_last_line() -> None:
+    assert parse_verdict("OK\nextra note after verdict") == "BLOCK"
+
+
+def test_has_explicit_verdict_true() -> None:
+    assert _has_explicit_verdict("review\nOK") is True
+    assert _has_explicit_verdict("review\nBLOCK") is True
+    assert _has_explicit_verdict("review\nok") is True
+
+
+def test_has_explicit_verdict_false() -> None:
+    assert _has_explicit_verdict("") is False
+    assert _has_explicit_verdict("no verdict here") is False
+    assert _has_explicit_verdict("OK\nextra") is False
 
 
 def test_under_limit_returns_none() -> None:

@@ -147,7 +147,9 @@ def build_user_prompt(diff: str, files: str, is_merge: bool) -> str:
         "## Your verdict:\n"
         "Analyze the diff using your tools (Read changed files for full context, "
         "Grep for duplicates with synonym strategy, Glob for test files).\n\n"
-        "Then output your findings followed by your verdict as the LAST line:\n"
+        "Then output your findings followed by your verdict as the LAST non-empty line.\n"
+        "IMPORTANT: If your last non-empty line is not `OK` or `BLOCK` (case-insensitive), "
+        "the commit will be BLOCKED automatically.\n"
         "- If any CRITICAL issue: last line must be `BLOCK`\n"
         "- If only WARNINGs or no issues: last line must be `OK`"
     )
@@ -229,19 +231,30 @@ def run_claude(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:
 
 
 def parse_verdict(review: str) -> str:
-    """Extract verdict from the last non-empty line of review."""
+    """Extract verdict from the last non-empty line of the review.
+
+    Only the final non-empty line is checked — matching the prompt
+    instruction that the verdict MUST be the very last line.
+    Comparison is case-insensitive (LLMs may output ``Ok`` or ``ok``).
+    Defaults to BLOCK (fail-closed) when the last line is not a verdict.
+    """
     if not review:
-        return "OK"
+        return "BLOCK"
     lines = [line.strip() for line in review.split("\n") if line.strip()]
     if not lines:
-        return "OK"
-    last = lines[-1].upper()
-    if last == "BLOCK":
         return "BLOCK"
+    last = lines[-1].upper()
     if last == "OK":
         return "OK"
-    # If verdict is unclear, don't block
-    return "OK"
+    if last == "BLOCK":
+        return "BLOCK"
+    return "BLOCK"
+
+
+def _has_explicit_verdict(review: str) -> bool:
+    """Check if the review ends with an explicit OK or BLOCK line."""
+    lines = [line.strip() for line in review.split("\n") if line.strip()]
+    return bool(lines) and lines[-1].upper() in ("OK", "BLOCK")
 
 
 # ---------------------------------------------------------------------------
@@ -380,13 +393,17 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
         save_log("ERROR", files=files, diff=diff, error_msg=detail)
         return None, "ERROR"
 
-    if not review:
+    if not review or not review.strip():
+        # Tool failure (empty/whitespace-only response) → fail-open.
+        # Distinct from a non-empty review missing a verdict → fail-closed.
         warn(f"{reviewer} returned empty output — allowing commit")
         save_log("EMPTY", files=files, diff=diff, reviewer=reviewer,
                  error_msg=f"empty output. stderr: {reviewer_stderr}")
         return None, "EMPTY"
 
     verdict = parse_verdict(review)
+    if verdict == "BLOCK" and not _has_explicit_verdict(review):
+        warn("Reviewer did not provide a verdict — defaulting to BLOCK")
     info(f"Reviewer: {reviewer}")
     save_log(verdict, files=files, diff=diff, review=review, reviewer=reviewer)
     return review, verdict
@@ -408,7 +425,7 @@ def main() -> None:
             error(f"Review BLOCKED this commit:\n\n{review}")
             sys.exit(1)
 
-        if review.strip() != "OK":
+        if review.strip().upper() != "OK":
             warn(f"Review notes:\n{review}")
         sys.exit(0)
 

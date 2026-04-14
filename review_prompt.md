@@ -80,9 +80,12 @@ Skip: hardcoded secrets, API keys, passwords — handled by a separate scan.
 
 ## Verdict format
 
-After your analysis, the LAST line of your response must be exactly one of:
+YOUR RESPONSE WILL BE AUTOMATICALLY BLOCKED IF THE LAST NON-EMPTY LINE IS NOT `OK` OR `BLOCK` (case-insensitive).
+
+The LAST non-empty line of your response must be one of:
 - `BLOCK` — if there are any CRITICAL findings
 - `OK` — if there are only WARNINGs or no findings
 
+Do NOT put anything after the verdict. The verdict MUST be the last non-empty line.
 WARNINGs are shown to the developer but do not block the commit.
 If you find zero issues, respond with just: OK

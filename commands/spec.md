@@ -17,7 +17,7 @@ Skip this section on resume runs; jump to Phase 1.5.
 This phase is **mandatory** for new runs and cannot be skipped.
 
 1. Read the draft task carefully.
-2. Explore the project codebase: domain structure, existing behavior related to the draft, top-level architecture (modules/addons layout, conventions for similar features), constraints.
+2. Explore the project codebase: domain structure, existing behavior related to the draft, top-level architecture (modules/addons layout, conventions for similar features), constraints. **As you discover relevant facts, append them to the draft file under a `## Codebase Observations` section** — file paths, model names, API signatures, existing patterns, gotchas, performance notes. This section accumulates throughout Phase 1 and becomes the persistent knowledge base for all agents.
 3. Compile a list of clarifying questions. Topics to cover:
    - **Цель**: Какая бизнес-задача решается? Кому и как это поможет?
    - **Границы**: Что явно НЕ входит в задачу? Есть ли смежные фичи, которые трогать не нужно?
@@ -27,7 +27,8 @@ This phase is **mandatory** for new runs and cannot be skipped.
    - **Существующее поведение**: Если драфт меняет существующую функциональность — уточни, что сейчас и что именно должно измениться.
    - **Архитектура и интеграция**: Новый модуль или расширение существующего? Есть ли конвенция для похожих фич? Спрашивай ТОЛЬКО когда ответ не очевиден из кодовой базы.
 4. Ask questions **one at a time** using the defer-aware prompt format below.
-5. After each answer, if it reveals new ambiguities, add follow-up questions to the queue. Continue until no questions remain. Minimum 3 questions total, no upper limit.
+5. **After each answer**, immediately append the decision to the draft file under a `## Decisions` section using `Edit`. Number each decision sequentially. Format: `N. **Short label**: decision text`. This section becomes the authoritative source of user decisions for all agents — inline prompt text is supplementary.
+6. After each answer, if it reveals new ambiguities, add follow-up questions to the queue. Continue until no questions remain. Minimum 3 questions total, no upper limit.
 
 **Rules for this phase:**
 - Questions and options are in Russian.
@@ -107,9 +108,8 @@ When a blocker is later resolved, update the same entry in place:
 Create the team once: `TeamCreate(team_name: "spec-{ID}")`. All three teammates live in this team and stay alive across the phase so you can `SendMessage` follow-ups.
 
 Shared context to pass in every teammate message:
-- Draft path (or existing spec path on resume)
-- User's Phase 1 answers (new runs) or resolved-blocker answers (resume runs)
-- Lead's codebase observations
+- Draft path (or existing spec path on resume) — **instruct agents to read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified facts about the codebase) from the draft file. These two sections are the persistent source of truth — inline prompt context is supplementary.**
+- User's Phase 1 answers (new runs) or resolved-blocker answers (resume runs) — inline as supplementary context
 - Project `CLAUDE.md` path
 
 ### 2a. Analyst
@@ -119,9 +119,8 @@ Shared context to pass in every teammate message:
 > Read your instructions: `~/.claude/agents/spec-analyst.md`
 > Spec output path: `tasks/2-spec/{ID}-{slug}.md`
 > Spec template: `~/.claude/templates/sdd/spec.md`
-> Draft path: `{draft path}`
-> User Phase 1 answers: {inline all answers}
-> Lead's codebase observations: {inline what you learned}
+> Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts). Every numbered decision MUST be reflected in the spec. Codebase observations inform your writing but don't need 1:1 mapping.**
+> User Phase 1 answers: {inline all answers — supplementary context}
 > Project CLAUDE.md: `{path}`
 > Write the business sections. Signal `SPEC ANALYST DONE.` when ready. Escalate ambiguities with `SPEC ANALYST QUESTION FOR USER` and wait for my reply.
 > Heartbeat: every 10 min of work OR 5 file edits send a one-line `PROGRESS: [just finished] → [doing next]`. If blocked for more than 5 min, send `BLOCKED: [reason]`.
@@ -148,9 +147,8 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 
 > Read your instructions: `~/.claude/agents/spec-architect.md`
 > Spec path: `tasks/2-spec/{ID}-{slug}.md` (business sections already populated)
-> Draft path: `{draft path}`
-> User Phase 1 answers: {inline}
-> Lead's codebase observations: {inline}
+> Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts — API signatures, model fields, file paths, patterns, gotchas). Every numbered decision MUST be reflected in the architecture. Codebase observations are your primary reference for integration points.**
+> User Phase 1 answers: {inline — supplementary context}
 > Project root: `{working directory}`
 > Project CLAUDE.md: `{path}`
 > Fill the `## Architecture & Implementation Plan` section in place. Signal `SPEC ARCHITECT DONE.` when ready. Escalate ambiguities with `SPEC ARCHITECT QUESTION FOR USER` and wait.
@@ -166,6 +164,7 @@ Spawn `spec-critic` teammate. Send:
 
 > Read your instructions: `~/.claude/agents/spec-critic.md`
 > Spec path: `tasks/2-spec/{ID}-{slug}.md`
+> Draft path: `{draft path}` — **read `## Decisions` and verify EVERY numbered decision is correctly reflected in the spec. Any mismatch = CRITICAL finding. Also read `## Codebase Observations` — verify spec's integration points and API claims match the recorded observations.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
 > Project CLAUDE.md: `{path}`
@@ -177,9 +176,11 @@ Spawn `spec-critic` teammate. Send:
 
 #### Optional: GPT-5.4 second critic
 
-If `which opencode` succeeds, launch a second `spec-critic` in parallel with the teammate. Read and follow `~/.claude/guides/opencode-review-runner.md` for the full subprocess lifecycle (launch, parsing, validation, timeout, retry). Use `spec-critic` as the agent and `github-copilot/gpt-5.4` as the model. Pass the same inputs as the teammate critic above (spec path, working directory, Phase 1 context, CLAUDE.md path, `RESUMED_RUN: true` on resume runs).
+If `which opencode` succeeds, launch a second `spec-critic` in parallel with the teammate. Read and follow `~/.claude/guides/opencode-review-runner.md` for the full subprocess lifecycle (launch, parsing, validation, timeout, retry). Use `spec-critic` as the agent and `github-copilot/gpt-5.4` as the model. Pass the same inputs as the teammate critic above (spec path, working directory, Phase 1 context, CLAUDE.md path, draft path with `## Decisions`, `RESUMED_RUN: true` on resume runs).
 
-The GPT-5.4 critic runs non-interactively — it cannot participate in the `QUESTION FOR USER` message loop. Add to its prompt: "Do not emit SPEC CRITIC QUESTION FOR USER. If you encounter ambiguity, record it as a finding instead." The teammate critic handles all interactive escalation.
+**Important:** opencode in `--pure` mode cannot read files outside the project directory (`~/.claude/agents/` is auto-rejected). Use the symlink `.claude/agents-global/spec-critic.md` instead. If the symlink doesn't exist, inline the agent instructions directly in the prompt.
+
+The GPT-5.4 critic runs non-interactively — it cannot participate in the `QUESTION FOR USER` message loop. Add to its prompt: "Do not emit SPEC CRITIC QUESTION FOR USER. If you encounter ambiguity, record it as a finding instead." Also add: "Read `## Decisions` in the draft file and verify EVERY numbered decision is reflected in the spec. Any mismatch = CRITICAL finding." The teammate critic handles all interactive escalation.
 
 Wait for both the teammate and the GPT-5.4 critic to complete before proceeding.
 
@@ -231,6 +232,18 @@ Each answer is reflected in the spec immediately:
 ### On defer in Phase 3
 
 Create a new `### b-N` entry in `## Blockers` following the same format. Continue with the next question.
+
+## Progress commits
+
+Commit work-in-progress at these checkpoints to avoid losing progress:
+
+1. **After Phase 1** — draft with `## Decisions` and `## Codebase Observations`. Message: `spec({ID}): Phase 1 decisions and codebase observations`
+2. **After Analyst** — spec with business sections. Message: `spec({ID}): business sections (Analyst)`
+3. **After Architect** — spec with architecture. Message: `spec({ID}): architecture plan (Architect)`
+4. **After fix rounds** — spec with critic fixes. Message: `spec({ID}): apply critic findings`
+5. **After finalization** — final spec + archived draft. Message: `spec({ID}): finalize spec`
+
+Use `git add` on specific files only (draft, spec). Run commits with `run_in_background: true` (pre-commit hook may take time).
 
 ## 4. Finalization
 

@@ -24,3 +24,4 @@ These are orchestration instructions, not executable code. Use WARNING for all f
 - `parse_verdict()` uses case-insensitive matching — LLMs may output `ok` or `Ok`
 - Empty/whitespace-only reviewer output → fail-open (tool crash, not a review result)
 - The fail-closed contract (BLOCK on missing verdict) applies only to non-empty responses
+- Commands like `/spec` and `/implement` create automatic progress commits — this is by design, not a violation of commit rules

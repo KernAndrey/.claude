@@ -72,7 +72,7 @@ Each blocker is a level-3 heading inside the spec's `## Blockers` section. Gener
 ```markdown
 ### b-N — <short title summarizing the question>
 - **status**: open
-- **raised-by**: lead (Phase 1) | lead (Phase 3) | spec-analyst | spec-architect | spec-critic-arch | spec-critic-business
+- **raised-by**: lead (Phase 1 / Phase 3) | spec-analyst | spec-architect | spec-critic-arch | spec-critic-business
 - **raised-on**: {TODAY}
 - **expertise-needed**: business | architecture | testing | security | ux | unknown
 - **context**: <what was found in the code or spec, what's ambiguous, what each option would imply>

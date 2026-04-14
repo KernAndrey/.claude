@@ -8,6 +8,8 @@ Launch all reviewers in parallel. Each reviewer writes stdout to a unique temp f
 
 Substitute `{agent-name}` for: `code-reviewer`, `test-reviewer`, `spec-auditor`, `security-reviewer`, `ui-reviewer` (when frontend files changed), and `spec-critic-arch` (during `/spec` runs).
 
+**Path note:** `opencode --pure` rejects paths outside the project directory. For agents under `~/.claude/agents/`, use the project-local symlink `.claude/agents-global/{agent-name}.md` instead. If the symlink doesn't exist, inline the agent instructions directly in the prompt.
+
 Create a shared output directory before spawning:
 
 ```bash
@@ -20,7 +22,7 @@ For each reviewer, run via `Bash(run_in_background=true)`:
 opencode run --pure \
   --model github-copilot/claude-sonnet-4.6 \
   --format json \
-  "Read ~/.claude/agents/{agent-name}.md — follow these instructions exactly.
+  "Read .claude/agents-global/{agent-name}.md — follow these instructions exactly.
 Spec file: {spec_path}
 Working directory: {worktree_path}
 Base branch for diff: {base_branch}
@@ -63,7 +65,7 @@ Spawn fresh instances with the same command but switch the model. Append context
 opencode run --pure \
   --model github-copilot/gpt-5.4 \
   --format json \
-  "Read ~/.claude/agents/{agent-name}.md — follow these instructions exactly.
+  "Read .claude/agents-global/{agent-name}.md — follow these instructions exactly.
 Spec file: {spec_path}
 Working directory: {worktree_path}
 Base branch for diff: {base_branch}

@@ -23,10 +23,10 @@ Thoroughness over speed. This task may run for hours — that is expected and ac
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
 2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`.
 3. Read the full specification.
-4. **Review prompt setup:** reviewers must apply project-specific review rules from `review_prompt.md`. Run the symlink setup from `~/.claude/guides/opencode-review-runner.md` — it creates `.claude/review_prompt_global.md` (symlink to `~/.claude/review_prompt.md`) and excludes it from git. Both runner guides already reference `.claude/review_prompt.md` (project-level) and `.claude/review_prompt_global.md` (global) in their reviewer launch commands.
-5. Branch and worktree setup:
+4. Branch and worktree setup:
    - If `auto_branch = true`: fetch latest `dev` branch (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All teammates work inside the worktree directory.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
+5. **Review prompt setup** (run inside `{worktree_path}`): reviewers must apply project-specific review rules from `review_prompt.md`. Run the symlink setup from `~/.claude/guides/opencode-review-runner.md` inside the worktree — it creates agent symlinks, `.claude/review_prompt_global.md`, and git exclude entries. Both runner guides reference these paths in their reviewer launch commands.
 6. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
 7. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers will need it.
 8. **Create the team:** `TeamCreate` with `team_name: "impl-{ID}"`. You are the lead.

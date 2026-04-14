@@ -12,7 +12,7 @@ Substitute `{agent-name}` for: `code-reviewer`, `test-reviewer`, `spec-auditor`,
 
 ### Symlink setup
 
-Ensure symlinks exist before launching. Run once per project. The symlink setup is idempotent — safe to re-run.
+Ensure symlinks exist before launching. Run once per clone or worktree (symlinks are local, not tracked by git). The setup is idempotent — safe to re-run.
 
 ```bash
 mkdir -p .claude/agents-global

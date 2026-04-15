@@ -423,6 +423,17 @@ def main() -> None:
 
         if verdict == "BLOCK":
             error(f"Review BLOCKED this commit:\n\n{review}")
+            info(
+                "Trade-off channel: if a finding above is a deliberate "
+                "trade-off, document it inline via "
+                "`# review-note: <specific reason>` on the relevant line "
+                "(commit messages are not visible to the reviewer in "
+                "this hook stage) — then re-commit. The reviewer honors "
+                "specific, named-invariant explanations.\n"
+                "Use sparingly: vague notes (\"intentional\", \"by design\") "
+                "or 3+ in one commit are themselves flagged as CRITICAL. "
+                "This is not a hook-skip substitute."
+            )
             sys.exit(1)
 
         if review.strip().upper() != "OK":

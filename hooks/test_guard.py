@@ -73,6 +73,32 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
         pytest.param(
             "git push origin some-foo", None, id="push-branch-some-foo-allowed",
         ),
+        # Regression: numeric prefix before `-fix` must NOT trigger force-push.
+        pytest.param(
+            "git push origin task/USKO-032-fix-remaining-test-failures",
+            None,
+            id="push-branch-numeric-dash-fix-allowed",
+        ),
+        pytest.param(
+            "git push origin 123-fu-branch",
+            None,
+            id="push-branch-numeric-dash-fu-allowed",
+        ),
+        pytest.param(
+            "git push origin task/USKO-01-feature",
+            None,
+            id="push-branch-numeric-dash-feature-allowed",
+        ),
+        pytest.param(
+            "git push origin release/2025-fast-hotfix",
+            None,
+            id="push-branch-numeric-dash-fast-allowed",
+        ),
+        pytest.param(
+            "git push origin v1.2-fun",
+            None,
+            id="push-branch-dotted-dash-fun-allowed",
+        ),
         # ---------- git-branch-force-delete ----------
         pytest.param(
             "git branch -D feature", "git-branch-force-delete", id="branch-D",
@@ -113,6 +139,19 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
             "git branch -dv fix-draft",
             None,
             id="branch-dv-fix-draft-allowed",
+        ),
+        # Regression: numeric prefix before a `-dfx`-like embedded token must
+        # NOT trigger force-delete — the short-flag alternative requires a
+        # whitespace/SOL boundary before the leading dash.
+        pytest.param(
+            "git branch -d task/USKO-032-dfx-feature",
+            None,
+            id="branch-d-numeric-dash-dfx-allowed",
+        ),
+        pytest.param(
+            "git branch -d release/2025-fdx-hotfix",
+            None,
+            id="branch-d-numeric-dash-fdx-allowed",
         ),
         pytest.param("git branch", None, id="branch-list-allowed"),
         pytest.param(
@@ -163,6 +202,18 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
             id="commit-gpgsign-false",
         ),
         pytest.param("git commit -m x", None, id="plain-commit-gpg-allowed"),
+        # Regression: `-config` embedded in a commit message/arg after a
+        # numeric prefix must NOT trigger the `-c commit.gpgsign=false` rule.
+        pytest.param(
+            "git commit -m 'USKO-01-config work'",
+            None,
+            id="commit-numeric-dash-config-message-allowed",
+        ),
+        pytest.param(
+            "git log task/USKO-01-config",
+            None,
+            id="log-numeric-dash-config-branch-allowed",
+        ),
         # ---------- git-config-global ----------
         pytest.param(
             "git config --global user.email foo",
@@ -214,6 +265,18 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
         ),
         pytest.param(
             "git clean -n config-files", None, id="clean-pathspec-config-allowed",
+        ),
+        # Regression: pathspec starting with a numeric-prefixed token that
+        # contains `-fix` must NOT trigger force-clean.
+        pytest.param(
+            "git clean -n task/USKO-032-fix-remaining-test-failures",
+            None,
+            id="clean-pathspec-numeric-dash-fix-allowed",
+        ),
+        pytest.param(
+            "git clean -n release/2025-fast-hotfix",
+            None,
+            id="clean-pathspec-numeric-dash-fast-allowed",
         ),
         # ---------- git-checkout-discard ----------
         pytest.param(

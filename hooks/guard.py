@@ -45,12 +45,13 @@ RULES: list[Rule] = [
     Rule(
         name="git-force-push",
         # Catches: --force, --force-with-lease, and any short-flag cluster
-        # containing `f` (-f, -fv, -vf, -fu, -fdv, ...). The negative
-        # lookbehind on `(?<![a-zA-Z])` requires the leading `-` to start a
-        # flag (not be embedded in a branch name like `feature-fix`).
+        # containing `f` (-f, -fv, -vf, -fu, -fdv, ...). The `(?<![^\s])`
+        # lookbehind requires the leading `-` to be at the start of a token
+        # (preceded by whitespace or start-of-string) — not embedded in a
+        # branch name like `task/USKO-032-fix-...` or `feature-fix`.
         pattern=re.compile(
             r"\bgit\s+push\b[\s\S]*"
-            r"(?:--force(?:-with-lease)?\b|(?<![a-zA-Z])-[a-zA-Z]*f[a-zA-Z]*\b)"
+            r"(?:--force(?:-with-lease)?\b|(?<![^\s])-[a-zA-Z]*f[a-zA-Z]*\b)"
         ),
         reason=(
             "Force push (including --force-with-lease) rewrites shared history "
@@ -65,16 +66,17 @@ RULES: list[Rule] = [
         #   --delete --force / --force -d            (long-form combos)
         #   -df / -fd / -dfv / -vfd / -Df / ...      (any short-flag cluster
         #                                             containing both d|D and f)
-        # The (?<![a-zA-Z]) lookbehind on the short-flag alternative ensures
-        # the leading `-` starts a flag (not embedded in a branch name like
-        # `fix-draft` or `add-pdf-export`).
+        # The (?<![^\s]) lookbehind on the short-flag alternative ensures
+        # the leading `-` is at token start (preceded by whitespace or SOL),
+        # not embedded in a branch name like `USKO-032-dfx-feature` or
+        # `fix-draft` or `add-pdf-export`.
         pattern=re.compile(
             r"\bgit\s+branch\b[\s\S]*"
             r"(?:"
             r"-D\b"
             r"|--delete\b[\s\S]*--force\b"
             r"|--force\b[\s\S]*-d\b"
-            r"|(?<![a-zA-Z])-(?=[a-zA-Z]*[dD])(?=[a-zA-Z]*f)[a-zA-Z]+\b"
+            r"|(?<![^\s])-(?=[a-zA-Z]*[dD])(?=[a-zA-Z]*f)[a-zA-Z]+\b"
             r")"
         ),
         reason=(
@@ -98,10 +100,11 @@ RULES: list[Rule] = [
     Rule(
         name="git-no-gpg-sign",
         # Lookbehind on the `-c` alternative prevents matching dashes
-        # embedded in branch/file names like `feature-c` or `auto-config`.
+        # embedded in branch/file names like `feature-c`, `USKO-01-config`,
+        # or `auto-config`.
         pattern=re.compile(
             r"\bgit\b[\s\S]*"
-            r"(?:--no-gpg-sign\b|(?<![a-zA-Z])-c\s+commit\.gpgsign\s*=\s*false\b)"
+            r"(?:--no-gpg-sign\b|(?<![^\s])-c\s+commit\.gpgsign\s*=\s*false\b)"
         ),
         reason=(
             "Skipping GPG signing is forbidden by the Claude Code system prompt. "
@@ -140,10 +143,11 @@ RULES: list[Rule] = [
     Rule(
         name="git-clean-force",
         # Lookbehind prevents matching dashes embedded in pathspec arguments
-        # like `git clean -n some-file` (the `-file` would otherwise match).
+        # like `git clean -n some-file` or `USKO-032-fix` (`-file`/`-fix`
+        # would otherwise match).
         pattern=re.compile(
             r"\bgit\s+clean\b[\s\S]*"
-            r"(?:(?<![a-zA-Z])-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)"
+            r"(?:(?<![^\s])-[a-zA-Z]*f[a-zA-Z]*\b|--force\b)"
         ),
         reason=(
             "`git clean -f` deletes untracked files irreversibly. "

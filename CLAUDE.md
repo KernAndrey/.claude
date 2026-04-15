@@ -39,6 +39,10 @@ If ruff reports unfixable errors, fix them manually before proceeding.
 Verify type annotations with `ruff check --select ANN <changed_files>`.
 Missing annotations must be added before proceeding.
 
+### After every commit — review WARNINGs
+
+After each successful commit, list every `[WARNING]` from the review and assign one decision per item: **Fix now**, **Fix in follow-up `<task-id>`** (only when out of scope), or **Accept because `<concrete reason>`**. Default to fixing when no specific reason to accept exists.
+
 ## Agent Teams
 Use agent teams when 3+ files span different domains (models, views, tests).
 Single-file changes and quick fixes run faster without team coordination.

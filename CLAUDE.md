@@ -43,6 +43,10 @@ Missing annotations must be added before proceeding.
 
 After each successful commit, list every `[WARNING]` from the review and assign one decision per item: **Fix now**, **Fix in follow-up `<task-id>`** (only when out of scope), or **Accept because `<concrete reason>`**. Default to fixing when no specific reason to accept exists.
 
+### Bug fix discipline
+
+Every bug fix lands with a regression test in the same commit. The test must fail before the fix and pass after. Untested fixes regress.
+
 ## Agent Teams
 Use agent teams when 3+ files span different domains (models, views, tests).
 Single-file changes and quick fixes run faster without team coordination.

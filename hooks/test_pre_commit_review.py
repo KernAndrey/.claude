@@ -523,3 +523,111 @@ def test_aggregate_lens_outputs_distinguishes_router_skip_from_failure() -> None
     assert "Skipped by router: no applicable files" in aggregated
     # Real failure IS framed as unavailable.
     assert "Lens unavailable: opencode timeout" in aggregated
+
+
+# ---------------------------------------------------------------------------
+# _arbitrate_single_call_review — single-call + arbiter integration
+# ---------------------------------------------------------------------------
+
+
+_SINGLE_CALL_REVIEW_WITH_CRITICAL_AND_WARNING = (
+    "### Section 1 — File audit and tool-use log\n"
+    "- foo.py — REVIEWED\n"
+    "### Section 2 — Coverage matrix and findings\n"
+    "- [CRITICAL] foo.py:10 — `eval(x)` — RCE.\n"
+    "- [WARNING] foo.py:12 — minor style nit.\n"
+    "Summary: 1 CRITICAL, 1 WARNING across 1 files."
+)
+
+
+def _mock_arbiter(upheld_ids: set[str]) -> dict:
+    return {
+        "status": "ok",
+        "upheld_ids": upheld_ids,
+        "raw": "(arbiter rationales)",
+        "error": "",
+    }
+
+
+def test_arbitrate_returns_raw_review_when_arbiter_overturns_all() -> None:
+    """Regression test: when arbiter overturns every CRITICAL the verdict
+    becomes OK and the function MUST return the raw reviewer output (not
+    the synthesized arbiter display). Otherwise main()'s
+    `_WARNING_TAG_RE.search(review)` never sees the [WARNING] lines —
+    they get summarized into a count and lost."""
+    from hooks.pre_commit_review import _arbitrate_single_call_review
+
+    with patch("hooks.pre_commit_review.run_arbiter",
+               return_value=_mock_arbiter(upheld_ids=set())), \
+         patch("hooks.pre_commit_review.save_log"):
+        display, verdict = _arbitrate_single_call_review(
+            review=_SINGLE_CALL_REVIEW_WITH_CRITICAL_AND_WARNING,
+            reviewer="opencode",
+            diff="diff --git a/foo.py b/foo.py\n+eval(x)\n",
+            files="foo.py",
+        )
+
+    assert verdict == "OK"
+    # The raw [WARNING] line must be present so main() surfaces it.
+    assert "[WARNING] foo.py:12" in display
+    # And we must NOT have replaced it with the synthesized header.
+    assert "Upheld findings (blocking)" not in display
+
+
+def test_arbitrate_returns_synthesized_display_on_block() -> None:
+    """When arbiter UPHOLDs at least one critical the verdict is BLOCK
+    and the function returns the synthesized display so the developer
+    sees upheld + overturned context in stderr."""
+    from hooks.pre_commit_review import _arbitrate_single_call_review
+
+    with patch("hooks.pre_commit_review.run_arbiter",
+               return_value=_mock_arbiter(upheld_ids={"F1"})), \
+         patch("hooks.pre_commit_review.save_log"):
+        display, verdict = _arbitrate_single_call_review(
+            review=_SINGLE_CALL_REVIEW_WITH_CRITICAL_AND_WARNING,
+            reviewer="opencode",
+            diff="diff --git a/foo.py b/foo.py\n+eval(x)\n",
+            files="foo.py",
+        )
+
+    assert verdict == "BLOCK"
+    assert "Upheld findings (blocking)" in display
+    assert "[F1] [CRITICAL] foo.py:10" in display
+
+
+def test_arbitrate_skips_arbiter_when_zero_criticals() -> None:
+    """No criticals → no arbiter call → raw review returned with OK."""
+    from hooks.pre_commit_review import _arbitrate_single_call_review
+
+    review = (
+        "### Section 1 — File audit\n"
+        "- foo.py — REVIEWED\n"
+        "### Section 2 — Findings\n"
+        "- [WARNING] foo.py:1 — style.\n"
+        "Summary: 0 CRITICAL, 1 WARNING across 1 files."
+    )
+    with patch("hooks.pre_commit_review.run_arbiter") as mock_arbiter, \
+         patch("hooks.pre_commit_review.save_log"):
+        display, verdict = _arbitrate_single_call_review(
+            review=review, reviewer="opencode", diff="", files="foo.py",
+        )
+
+    assert verdict == "OK"
+    assert display == review
+    mock_arbiter.assert_not_called()
+
+
+def test_arbitrate_blocks_malformed_review_without_calling_arbiter() -> None:
+    """Malformed (no Summary terminator) → fail-closed BLOCK, no arbiter."""
+    from hooks.pre_commit_review import _arbitrate_single_call_review
+
+    malformed = "- [CRITICAL] foo.py:1 — bug (no summary terminator)"
+    with patch("hooks.pre_commit_review.run_arbiter") as mock_arbiter, \
+         patch("hooks.pre_commit_review.save_log"):
+        display, verdict = _arbitrate_single_call_review(
+            review=malformed, reviewer="opencode", diff="", files="foo.py",
+        )
+
+    assert verdict == "BLOCK"
+    assert display == malformed
+    mock_arbiter.assert_not_called()

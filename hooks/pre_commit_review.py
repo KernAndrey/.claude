@@ -14,6 +14,7 @@ Skip with: git commit --no-verify
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -144,14 +145,14 @@ def build_user_prompt(diff: str, files: str, is_merge: bool) -> str:
     parts.append(f"## Changed files:\n{files}")
     parts.append(f"## Diff to review:\n```diff\n{diff}\n```")
     parts.append(
-        "## Your verdict:\n"
-        "Analyze the diff using your tools (Read changed files for full context, "
-        "Grep for duplicates with synonym strategy, Glob for test files).\n\n"
-        "Then output your findings followed by your verdict as the LAST non-empty line.\n"
-        "IMPORTANT: If your last non-empty line is not `OK` or `BLOCK` (case-insensitive), "
-        "the commit will be BLOCKED automatically.\n"
-        "- If any CRITICAL issue: last line must be `BLOCK`\n"
-        "- If only WARNINGs or no issues: last line must be `OK`"
+        "## Your task:\n"
+        "Produce the three-section inventory exactly as described in the "
+        "system prompt (file audit, seven area sweeps, summary line).\n\n"
+        "Do NOT output `OK` or `BLOCK`. The calling hook reads `[CRITICAL]` "
+        "tags from your findings and decides the verdict mechanically — "
+        "your job is the complete inventory, not the decision.\n\n"
+        "Use your tools: `Read` changed files for full context, `Grep` for "
+        "duplicates and call sites, `Glob` for test files."
     )
 
     return "\n\n".join(parts)
@@ -230,31 +231,72 @@ def run_claude(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
-def parse_verdict(review: str) -> str:
-    """Extract verdict from the last non-empty line of the review.
+_CRITICAL_LINE_RE = re.compile(
+    r"^[ \t]*[-*•]?[ \t]*\[CRITICAL\]", re.MULTILINE | re.IGNORECASE
+)
+_WARNING_TAG_RE = re.compile(r"\[WARNING\]", re.IGNORECASE)
+_SUMMARY_LINE_RE = re.compile(r"^[ \t]*Summary:\s", re.IGNORECASE)
+_SECTION_1_MARKER = re.compile(r"(?im)^#{1,6}\s*Section\s*1\b")
+_SECTION_2_MARKER = re.compile(r"(?im)^#{1,6}\s*Section\s*2\b")
 
-    Only the final non-empty line is checked — matching the prompt
-    instruction that the verdict MUST be the very last line.
-    Comparison is case-insensitive (LLMs may output ``Ok`` or ``ok``).
-    Defaults to BLOCK (fail-closed) when the last line is not a verdict.
+
+def count_criticals(review: str) -> int:
+    """Count [CRITICAL] finding lines in the reviewer output.
+
+    Matches only at line start, allowing an optional bullet marker
+    (``-``, ``*``, ``•``) and surrounding whitespace. ``[CRITICAL]``
+    appearing inside prose or a quoted diff hunk mid-line does not
+    inflate the count.
     """
     if not review:
-        return "BLOCK"
-    lines = [line.strip() for line in review.split("\n") if line.strip()]
+        return 0
+    return len(_CRITICAL_LINE_RE.findall(review))
+
+
+def is_well_formed(review: str) -> bool:
+    """True if the review ran to completion in the documented format.
+
+    The contract (review_prompt.md) requires three sections in order:
+    Section 1 (file audit + tool-use log), Section 2 (coverage matrix
+    + findings), Section 3 (``Summary: ...`` terminator). All three
+    must be present and the Summary line must be the very last
+    non-empty line — trailing content means the reviewer wrote past
+    its stop signal.
+
+    Any failure here means the critical count cannot be trusted and
+    the hook fails closed.
+    """
+    if not review:
+        return False
+    if not _SECTION_1_MARKER.search(review):
+        return False
+    if not _SECTION_2_MARKER.search(review):
+        return False
+    lines = [line for line in review.splitlines() if line.strip()]
     if not lines:
-        return "BLOCK"
-    last = lines[-1].upper()
-    if last == "OK":
-        return "OK"
-    if last == "BLOCK":
-        return "BLOCK"
-    return "BLOCK"
+        return False
+    return _SUMMARY_LINE_RE.match(lines[-1]) is not None
 
 
-def _has_explicit_verdict(review: str) -> bool:
-    """Check if the review ends with an explicit OK or BLOCK line."""
-    lines = [line.strip() for line in review.split("\n") if line.strip()]
-    return bool(lines) and lines[-1].upper() in ("OK", "BLOCK")
+def parse_verdict(review: str) -> str:
+    """Decide the commit verdict from the review body.
+
+    Policy:
+    - empty or whitespace-only → BLOCK (fail-closed on tool failure).
+    - non-empty but malformed (no ``Summary:`` line) → BLOCK. Without
+      the terminator we cannot trust that the sweeps ran.
+    - well-formed + any [CRITICAL] line → BLOCK.
+    - well-formed + zero [CRITICAL] lines → OK.
+
+    The reviewer no longer writes an OK/BLOCK line itself; the decision
+    is mechanical so the model cannot short-circuit the review by
+    deciding early.
+    """
+    if not review or not review.strip():
+        return "BLOCK"
+    if not is_well_formed(review):
+        return "BLOCK"
+    return "BLOCK" if count_criticals(review) > 0 else "OK"
 
 
 # ---------------------------------------------------------------------------
@@ -402,9 +444,9 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
         return None, "EMPTY"
 
     verdict = parse_verdict(review)
-    if verdict == "BLOCK" and not _has_explicit_verdict(review):
-        warn("Reviewer did not provide a verdict — defaulting to BLOCK")
-    info(f"Reviewer: {reviewer}")
+    if verdict == "BLOCK" and not is_well_formed(review):
+        warn("Reviewer output missing `Summary:` terminator — treating as malformed (fail-closed BLOCK)")
+    info(f"Reviewer: {reviewer} — {count_criticals(review)} CRITICAL finding(s)")
     save_log(verdict, files=files, diff=diff, review=review, reviewer=reviewer)
     return review, verdict
 
@@ -436,8 +478,8 @@ def main() -> None:
             )
             sys.exit(1)
 
-        if review.strip().upper() != "OK":
-            warn(f"Review notes:\n{review}")
+        if _WARNING_TAG_RE.search(review):
+            warn(f"Review notes (non-blocking warnings):\n{review}")
         sys.exit(0)
 
     except Exception as exc:

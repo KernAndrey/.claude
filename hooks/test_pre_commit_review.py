@@ -9,6 +9,7 @@ from hooks.pre_commit_review import (
     _aggregate_lens_outputs,
     _parse_opencode_json,
     _render_fanout_output,
+    applicable_lenses,
     assign_finding_ids,
     check_diff_size,
     count_added_lines,
@@ -450,3 +451,75 @@ def test_render_fanout_output_no_findings_shows_none() -> None:
     )
     assert "_(none)_" in rendered
     assert "Summary: 0 UPHELD, 0 OVERTURN" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Lens router — applicable_lenses
+# ---------------------------------------------------------------------------
+
+
+def test_applicable_lenses_docs_only_runs_security_and_duplication() -> None:
+    """Spec/doc diff: only Security + Duplication remain (they always run)."""
+    files = "docs/architecture.md\ntasks/EC-013.md\nREADME.md"
+    assert applicable_lenses(files) == ["security", "duplication"]
+
+
+def test_applicable_lenses_python_file_runs_everything() -> None:
+    files = "src/foo.py\nsrc/bar.py"
+    assert applicable_lenses(files) == list(LENS_NAMES)
+
+
+def test_applicable_lenses_typescript_skips_types() -> None:
+    """TS diff: Types stays Python-only → skipped. Everything else runs."""
+    files = "web/src/foo.ts\nweb/src/bar.tsx"
+    result = applicable_lenses(files)
+    assert "types" not in result
+    assert set(result) == set(LENS_NAMES) - {"types"}
+
+
+def test_applicable_lenses_mixed_python_and_js_runs_all() -> None:
+    files = "hooks/foo.py\nweb/src/foo.ts\nweb/src/bar.jsx"
+    assert set(applicable_lenses(files)) == set(LENS_NAMES)
+
+
+def test_applicable_lenses_config_only_runs_security_and_duplication() -> None:
+    """TOML/YAML/JSON: no executable code → minimal lens set."""
+    files = "pyproject.toml\npackage.json\n.github/workflows/ci.yml"
+    assert applicable_lenses(files) == ["security", "duplication"]
+
+
+def test_applicable_lenses_empty_string() -> None:
+    """Empty file list: Security + Duplication still run (defensive)."""
+    assert applicable_lenses("") == ["security", "duplication"]
+
+
+def test_applicable_lenses_shell_script_runs_code_lenses() -> None:
+    files = "scripts/deploy.sh"
+    result = applicable_lenses(files)
+    assert "types" not in result  # shell is not Python
+    assert set(result) == set(LENS_NAMES) - {"types"}
+
+
+def test_applicable_lenses_preserves_lens_names_order() -> None:
+    files = "src/foo.py"
+    result = applicable_lenses(files)
+    assert result == list(LENS_NAMES)  # exact order preserved
+
+
+def test_aggregate_lens_outputs_distinguishes_router_skip_from_failure() -> None:
+    per_lens = [
+        {"name": "security", "status": "ok",
+         "review": "No findings in this lens.\nSummary: 0 C, 0 W",
+         "reviewer": "opencode", "error": ""},
+        {"name": "types", "status": "skipped_by_router",
+         "review": "", "reviewer": None,
+         "error": "no applicable files for this lens"},
+        {"name": "performance", "status": "timeout",
+         "review": "", "reviewer": "opencode",
+         "error": "opencode timeout"},
+    ]
+    aggregated = _aggregate_lens_outputs(per_lens)
+    # Router skip is NOT framed as unavailable.
+    assert "Skipped by router: no applicable files" in aggregated
+    # Real failure IS framed as unavailable.
+    assert "Lens unavailable: opencode timeout" in aggregated

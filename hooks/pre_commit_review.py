@@ -50,6 +50,21 @@ LENS_NAMES = (
     "types",
 )
 
+# Extensions that carry executable logic. Used by the lens router to skip
+# lenses that have nothing to examine on a docs/config/spec-only diff.
+CODE_EXTS: frozenset[str] = frozenset({
+    # Python
+    ".py",
+    # JS/TS family (comprehensive)
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
+    # Other typed / compiled languages
+    ".go", ".rs", ".java", ".kt", ".swift",
+    ".rb", ".php", ".cs",
+    # Shell
+    ".sh", ".bash",
+})
+PY_EXTS: frozenset[str] = frozenset({".py"})
+
 
 def warn(msg: str) -> None:
     print(f"\033[33m⚠️  [code-review] {msg}\033[0m", file=sys.stderr)
@@ -338,6 +353,47 @@ def parse_verdict(review: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fan-out — lens router
+# ---------------------------------------------------------------------------
+
+def _iter_files(files: str) -> list[str]:
+    """Split the staged-files string into non-empty path entries."""
+    return [f.strip() for f in files.split("\n") if f.strip()]
+
+
+def _any_file_matches(files: str, exts: frozenset[str]) -> bool:
+    """True if any changed file has an extension in ``exts``."""
+    for f in _iter_files(files):
+        for ext in exts:
+            if f.endswith(ext):
+                return True
+    return False
+
+
+# Map lens → predicate that answers "is there anything in this diff this
+# lens could plausibly flag?". Security and Duplication always run — both
+# can find defects in prose (secrets, architectural duplication in spec
+# files). The remaining five require executable code.
+#
+# Safety-first rule: when in doubt, run the lens. Missing a real finding
+# is worse than wasting one parallel LLM call.
+LENS_APPLICABILITY: dict[str, callable] = {
+    "security":    lambda files: True,
+    "duplication": lambda files: True,
+    "tests":       lambda files: _any_file_matches(files, CODE_EXTS),
+    "types":       lambda files: _any_file_matches(files, PY_EXTS),
+    "performance": lambda files: _any_file_matches(files, CODE_EXTS),
+    "rootcause":   lambda files: _any_file_matches(files, CODE_EXTS),
+    "complexity":  lambda files: _any_file_matches(files, CODE_EXTS),
+}
+
+
+def applicable_lenses(files: str) -> list[str]:
+    """Return lenses worth running for this file set, in LENS_NAMES order."""
+    return [name for name in LENS_NAMES if LENS_APPLICABILITY[name](files)]
+
+
+# ---------------------------------------------------------------------------
 # Fan-out
 # ---------------------------------------------------------------------------
 
@@ -401,10 +457,12 @@ def _aggregate_lens_outputs(per_lens: list[dict]) -> str:
     parts: list[str] = []
     for d in per_lens:
         header = f"## Lens: {d['name']}"
-        if d["status"] != "ok":
-            parts.append(f"{header}\n\n_Lens unavailable: {d['error']}_")
-        else:
+        if d["status"] == "ok":
             parts.append(f"{header}\n\n{d['review']}")
+        elif d["status"] == "skipped_by_router":
+            parts.append(f"{header}\n\n_Skipped by router: {d['error']}_")
+        else:
+            parts.append(f"{header}\n\n_Lens unavailable: {d['error']}_")
     total_c = sum(count_criticals(d.get("review", "")) for d in per_lens if d["status"] == "ok")
     total_w = sum(
         len(_WARNING_TAG_RE.findall(d.get("review", "")))
@@ -416,30 +474,60 @@ def _aggregate_lens_outputs(per_lens: list[dict]) -> str:
 
 
 def run_fanout(diff: str, files: str, is_merge: bool) -> tuple[str, list[dict]]:
-    """Run all 7 lenses in parallel. Returns (aggregated_text, per_lens)."""
-    info(f"Fan-out: launching {len(LENS_NAMES)} lens review(s) in parallel...")
-    per_lens: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(LENS_NAMES)) as ex:
-        futures = {
-            ex.submit(run_single_lens, name, diff, files, is_merge): name
-            for name in LENS_NAMES
+    """Run applicable lenses in parallel. Returns (aggregated_text, per_lens).
+
+    The lens router (``LENS_APPLICABILITY``) skips lenses that have
+    nothing in the diff to look at (e.g. Types for non-Python diffs).
+    Skipped lenses are recorded in ``per_lens`` with status
+    ``skipped_by_router`` so the log shows exactly which lenses ran and
+    which were pruned.
+    """
+    applicable = applicable_lenses(files)
+    skipped = [n for n in LENS_NAMES if n not in applicable]
+
+    per_lens: list[dict] = [
+        {
+            "name": name,
+            "status": "skipped_by_router",
+            "review": "",
+            "reviewer": None,
+            "error": "no applicable files for this lens",
         }
-        for fut in concurrent.futures.as_completed(futures):
-            name = futures[fut]
-            try:
-                per_lens.append(fut.result())
-            except Exception as exc:
-                per_lens.append({
-                    "name": name,
-                    "status": "error",
-                    "review": "",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "reviewer": None,
-                })
+        for name in skipped
+    ]
+
+    if skipped:
+        info(
+            f"Fan-out: skipping {len(skipped)} lens(es) "
+            f"({', '.join(skipped)}) — no applicable files."
+        )
+    info(f"Fan-out: launching {len(applicable)} lens review(s) in parallel...")
+
+    if applicable:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(applicable)) as ex:
+            futures = {
+                ex.submit(run_single_lens, name, diff, files, is_merge): name
+                for name in applicable
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                name = futures[fut]
+                try:
+                    per_lens.append(fut.result())
+                except Exception as exc:
+                    per_lens.append({
+                        "name": name,
+                        "status": "error",
+                        "review": "",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "reviewer": None,
+                    })
 
     per_lens.sort(key=lambda d: LENS_NAMES.index(d["name"]))
     ok_count = sum(1 for d in per_lens if d["status"] == "ok")
-    info(f"Fan-out complete: {ok_count}/{len(LENS_NAMES)} lens(es) returned findings.")
+    info(
+        f"Fan-out complete: {ok_count}/{len(applicable)} lens(es) returned "
+        f"findings ({len(skipped)} skipped by router)."
+    )
 
     aggregated = _aggregate_lens_outputs(per_lens)
     return aggregated, per_lens

@@ -3,11 +3,18 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 from hooks.pre_commit_review import (
+    FANOUT_THRESHOLD,
+    LENS_NAMES,
     MAX_DIFF_LINES,
+    _aggregate_lens_outputs,
     _parse_opencode_json,
+    _render_fanout_output,
+    assign_finding_ids,
     check_diff_size,
+    count_added_lines,
     count_criticals,
     is_well_formed,
+    parse_arbiter_verdict,
     parse_verdict,
     run_opencode,
 )
@@ -236,3 +243,210 @@ def test_run_opencode_empty_system_prompt() -> None:
 
     cmd = mock_run.call_args[0][0]
     assert cmd[-1] == "user only"
+
+
+# ---------------------------------------------------------------------------
+# count_added_lines / FANOUT_THRESHOLD
+# ---------------------------------------------------------------------------
+
+
+def test_count_added_lines_skips_file_header() -> None:
+    diff = (
+        "diff --git a/foo b/foo\n"
+        "+++ b/foo\n"  # file header, should be skipped
+        "+added-1\n"
+        "+added-2\n"
+        "-removed\n"
+        " context\n"
+    )
+    assert count_added_lines(diff) == 2
+
+
+def test_count_added_lines_zero_on_no_added() -> None:
+    diff = "diff --git a/foo b/foo\n-removed\n context\n"
+    assert count_added_lines(diff) == 0
+
+
+def test_fanout_threshold_sane_default() -> None:
+    """Sanity check — threshold is the documented 150 added-line boundary."""
+    assert FANOUT_THRESHOLD == 150
+    assert set(LENS_NAMES) == {
+        "security", "tests", "duplication", "performance",
+        "rootcause", "complexity", "types",
+    }
+
+
+# ---------------------------------------------------------------------------
+# assign_finding_ids
+# ---------------------------------------------------------------------------
+
+
+def test_assign_finding_ids_injects_stable_ids() -> None:
+    review = (
+        "- [CRITICAL] a.py:1 — foo\n"
+        "- [CRITICAL] b.py:2 — bar\n"
+        "[CRITICAL] c.py:3 — baz"
+    )
+    tagged, findings = assign_finding_ids(review)
+    assert [f["id"] for f in findings] == ["F1", "F2", "F3"]
+    assert "[F1]" in tagged and "[F2]" in tagged and "[F3]" in tagged
+    # Original severity tag is preserved after id injection.
+    assert tagged.count("[CRITICAL]") == 3
+
+
+def test_assign_finding_ids_ignores_warnings() -> None:
+    review = "- [WARNING] a.py:1 — minor\n- [CRITICAL] b.py:2 — real"
+    tagged, findings = assign_finding_ids(review)
+    assert len(findings) == 1
+    assert findings[0]["id"] == "F1"
+    assert "[F1] [CRITICAL]" in tagged
+    # Warning line unchanged — arbiter does not evaluate warnings.
+    assert "[F1] [WARNING]" not in tagged
+
+
+def test_assign_finding_ids_empty_review() -> None:
+    tagged, findings = assign_finding_ids("no findings here")
+    assert findings == []
+    assert tagged == "no findings here"
+
+
+# ---------------------------------------------------------------------------
+# parse_arbiter_verdict
+# ---------------------------------------------------------------------------
+
+
+def test_parse_arbiter_verdict_basic_split() -> None:
+    raw = (
+        "[UPHELD] F1 — cites a real line with real consequence.\n"
+        "[OVERTURN] F2 — purely theoretical trigger.\n"
+        "[UPHELD] F3 — SQL injection in newly-added query.\n"
+        "Summary: 2 UPHELD, 1 OVERTURN."
+    )
+    upheld = parse_arbiter_verdict(raw, ["F1", "F2", "F3"])
+    assert upheld == {"F1", "F3"}
+
+
+def test_parse_arbiter_verdict_fail_open_on_missing_summary() -> None:
+    """Arbiter output without the Summary terminator is malformed.
+    Every finding must be upheld (fail-open) to avoid silently dropping
+    valid findings."""
+    raw = "[OVERTURN] F1 — trash\n[OVERTURN] F2 — noise"  # no Summary
+    upheld = parse_arbiter_verdict(raw, ["F1", "F2"])
+    assert upheld == {"F1", "F2"}
+
+
+def test_parse_arbiter_verdict_missing_id_is_upheld() -> None:
+    """If the arbiter forgot a finding's verdict line, fail-open for that id."""
+    raw = "[OVERTURN] F1 — noise.\nSummary: 0 UPHELD, 1 OVERTURN."
+    upheld = parse_arbiter_verdict(raw, ["F1", "F2"])
+    assert upheld == {"F2"}  # F1 overturned explicitly, F2 missing → upheld
+
+
+def test_parse_arbiter_verdict_empty_raw_is_all_upheld() -> None:
+    assert parse_arbiter_verdict("", ["F1"]) == {"F1"}
+    assert parse_arbiter_verdict("", []) == set()
+
+
+def test_parse_arbiter_verdict_case_insensitive_tags() -> None:
+    raw = (
+        "[upheld] F1 — real.\n"
+        "[Overturn] F2 — theoretical.\n"
+        "Summary: 1 UPHELD, 1 OVERTURN."
+    )
+    assert parse_arbiter_verdict(raw, ["F1", "F2"]) == {"F1"}
+
+
+# ---------------------------------------------------------------------------
+# _aggregate_lens_outputs
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_lens_outputs_appends_global_summary() -> None:
+    per_lens = [
+        {
+            "name": "security",
+            "status": "ok",
+            "review": "No findings in this lens.",
+            "reviewer": "opencode",
+            "error": "",
+        },
+        {
+            "name": "tests",
+            "status": "ok",
+            "review": "- [CRITICAL] foo.py:1 — missing test\n- [WARNING] bar.py:5 — flaky",
+            "reviewer": "opencode",
+            "error": "",
+        },
+    ]
+    aggregated = _aggregate_lens_outputs(per_lens)
+    assert "## Lens: security" in aggregated
+    assert "## Lens: tests" in aggregated
+    assert "Summary: 1 CRITICAL, 1 WARNING across 2 lenses." in aggregated
+
+
+def test_aggregate_lens_outputs_marks_unavailable_lenses() -> None:
+    per_lens = [
+        {
+            "name": "security",
+            "status": "timeout",
+            "review": "",
+            "reviewer": "opencode",
+            "error": "opencode timeout",
+        },
+        {
+            "name": "tests",
+            "status": "ok",
+            "review": "No findings in this lens.",
+            "reviewer": "opencode",
+            "error": "",
+        },
+    ]
+    aggregated = _aggregate_lens_outputs(per_lens)
+    assert "Lens unavailable: opencode timeout" in aggregated
+    # Unavailable lens contributes zero findings to the total.
+    assert "Summary: 0 CRITICAL, 0 WARNING across 2 lenses." in aggregated
+
+
+# ---------------------------------------------------------------------------
+# _render_fanout_output
+# ---------------------------------------------------------------------------
+
+
+def test_render_fanout_output_splits_upheld_and_overturned() -> None:
+    per_lens = [
+        {"name": "security", "status": "ok", "review": "none", "reviewer": "opencode", "error": ""}
+    ]
+    findings = [
+        {"id": "F1", "line": "- [F1] [CRITICAL] a.py:1 — real"},
+        {"id": "F2", "line": "- [F2] [CRITICAL] b.py:2 — theoretical"},
+    ]
+    arbiter = {
+        "status": "ok",
+        "upheld_ids": {"F1"},
+        "raw": (
+            "[UPHELD] F1 — real trigger and consequence.\n"
+            "[OVERTURN] F2 — purely hypothetical.\n"
+            "Summary: 1 UPHELD, 1 OVERTURN."
+        ),
+        "error": "",
+    }
+    rendered = _render_fanout_output(per_lens, findings, {"F1"}, arbiter)
+    assert "Upheld findings (blocking)" in rendered
+    assert "[F1] [CRITICAL] a.py:1" in rendered
+    assert "Overturned findings (advisory" in rendered
+    assert "[F2] [CRITICAL] b.py:2" in rendered
+    # The arbiter rationale for F2 appears under the overturned block.
+    assert "purely hypothetical" in rendered
+    assert "Summary: 1 UPHELD, 1 OVERTURN" in rendered
+
+
+def test_render_fanout_output_no_findings_shows_none() -> None:
+    rendered = _render_fanout_output(
+        [{"name": "security", "status": "ok", "review": "none",
+          "reviewer": "opencode", "error": ""}],
+        findings=[],
+        upheld_ids=set(),
+        arbiter={"status": "skipped", "upheld_ids": set(), "raw": "", "error": ""},
+    )
+    assert "_(none)_" in rendered
+    assert "Summary: 0 UPHELD, 0 OVERTURN" in rendered

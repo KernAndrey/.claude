@@ -2,18 +2,24 @@
 """
 Git pre-commit code review gate.
 
-Called by ~/.claude/git-hooks/pre-commit. Sends staged diff to a Claude Code
-session for review.
+Called by ~/.claude/git-hooks/pre-commit. Modes:
+
+- Small diff (added lines < FANOUT_THRESHOLD): single-call reviewer.
+- Large diff (added lines >= FANOUT_THRESHOLD): 7 parallel lens calls
+  (security / tests / duplication / performance / rootcause /
+  complexity / types), aggregated, then passed through a Claude Opus
+  arbiter that UPHOLDs or OVERTURNs each [CRITICAL] finding.
 
 Exit codes:
     0 — commit allowed (review passed or skipped)
-    1 — commit BLOCKED (critical issues found)
+    1 — commit BLOCKED (critical issues upheld)
 
 Skip with: git commit --no-verify
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import re
 import subprocess
 import sys
@@ -23,24 +29,37 @@ from pathlib import Path
 # --- Configuration ---
 GLOBAL_PROMPT = Path.home() / ".claude" / "review_prompt.md"
 PROJECT_PROMPT = Path(".claude") / "review_prompt.md"
+LENS_DIR = Path.home() / ".claude" / "review_prompts"
+ARBITER_PROMPT_PATH = LENS_DIR / "arbiter.md"
 LOG_DIR = Path.home() / ".claude" / "review-logs"
+
 MAX_DIFF_LINES = 2000
 MIN_LINES_TO_REVIEW = 1
+FANOUT_THRESHOLD = 150  # added-line count above which we fan-out
 TIMEOUT_SECONDS = 1200
+ARBITER_MODEL = "opus"
+ARBITER_TIMEOUT_SECONDS = 900
+
+LENS_NAMES = (
+    "security",
+    "tests",
+    "duplication",
+    "performance",
+    "rootcause",
+    "complexity",
+    "types",
+)
 
 
 def warn(msg: str) -> None:
-    """Print warning to stderr."""
     print(f"\033[33m⚠️  [code-review] {msg}\033[0m", file=sys.stderr)
 
 
 def error(msg: str) -> None:
-    """Print error to stderr."""
     print(f"\033[31m❌ [code-review] {msg}\033[0m", file=sys.stderr)
 
 
 def info(msg: str) -> None:
-    """Print info to stderr."""
     print(f"\033[36mℹ️  [code-review] {msg}\033[0m", file=sys.stderr)
 
 
@@ -68,7 +87,6 @@ def get_staged_diff() -> tuple[str, str]:
 
 
 def get_staged_files() -> str:
-    """Get list of staged file names."""
     result = subprocess.run(
         ["git", "diff", "--cached", "--name-only"],
         capture_output=True, text=True,
@@ -77,7 +95,6 @@ def get_staged_files() -> str:
 
 
 def get_git_status() -> str:
-    """Get git status for diagnostics."""
     result = subprocess.run(
         ["git", "status", "--porcelain"],
         capture_output=True, text=True,
@@ -92,6 +109,19 @@ def count_changed_lines(diff: str) -> int:
         for line in diff.split("\n")
         if (line.startswith("+") and not line.startswith("+++"))
         or (line.startswith("-") and not line.startswith("---"))
+    )
+
+
+def count_added_lines(diff: str) -> int:
+    """Count only added ('+') lines, excluding '+++' file headers.
+
+    This is the size signal used to route to single-call vs fan-out
+    review: only new code needs LLM attention.
+    """
+    return sum(
+        1
+        for line in diff.split("\n")
+        if line.startswith("+") and not line.startswith("+++")
     )
 
 
@@ -111,13 +141,12 @@ def check_diff_size(diff: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Prompt building
+# Prompt building — single-call path
 # ---------------------------------------------------------------------------
 
 def build_system_prompt() -> str:
-    """Assemble system prompt from review_prompt.md files."""
+    """Assemble system prompt from review_prompt.md files (single-call mode)."""
     parts = []
-
     global_prompt = read_file(GLOBAL_PROMPT)
     if not global_prompt:
         return ""
@@ -147,7 +176,8 @@ def build_user_prompt(diff: str, files: str, is_merge: bool) -> str:
     parts.append(
         "## Your task:\n"
         "Produce the three-section inventory exactly as described in the "
-        "system prompt (file audit, seven area sweeps, summary line).\n\n"
+        "system prompt (file audit, seven area sweeps / lens findings, "
+        "summary line).\n\n"
         "Do NOT output `OK` or `BLOCK`. The calling hook reads `[CRITICAL]` "
         "tags from your findings and decides the verdict mechanically — "
         "your job is the complete inventory, not the decision.\n\n"
@@ -156,6 +186,19 @@ def build_user_prompt(diff: str, files: str, is_merge: bool) -> str:
     )
 
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Prompt building — fan-out path
+# ---------------------------------------------------------------------------
+
+def build_lens_system_prompt(lens_name: str) -> str:
+    """Assemble lens prompt = common preamble + lens-specific body."""
+    common = read_file(LENS_DIR / "lens_common.md")
+    specific = read_file(LENS_DIR / f"lens_{lens_name}.md")
+    if not common or not specific:
+        return ""
+    return f"{common}\n\n---\n\n{specific}"
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +225,12 @@ def _parse_opencode_json(raw: str) -> str:
     return "\n".join(parts) if parts else ""
 
 
-def run_opencode(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:
-    """Run OpenCode CLI (--pure, no plugins) for review. Returns (stdout, stderr, returncode)."""
+def run_opencode(
+    system_prompt: str,
+    user_prompt: str,
+    timeout: int = TIMEOUT_SECONDS,
+) -> tuple[str, str, int]:
+    """Run OpenCode CLI (--pure, no plugins). Returns (stdout, stderr, rc)."""
     full_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
 
     cmd = [
@@ -199,19 +246,24 @@ def run_opencode(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:
         cmd,
         capture_output=True,
         text=True,
-        timeout=TIMEOUT_SECONDS,
+        timeout=timeout,
     )
 
     review = _parse_opencode_json(result.stdout) if result.stdout else ""
     return review, result.stderr.strip(), result.returncode
 
 
-def run_claude(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:
-    """Run Claude Code for review. Returns (stdout, stderr, returncode)."""
+def run_claude(
+    system_prompt: str,
+    user_prompt: str,
+    model: str = "sonnet",
+    timeout: int = TIMEOUT_SECONDS,
+) -> tuple[str, str, int]:
+    """Run Claude Code CLI. Returns (stdout, stderr, rc)."""
     cmd = [
         "claude",
         "-p",
-        "--model", "sonnet",
+        "--model", model,
         "--no-session-persistence",
         "--tools", "Read,Grep,Glob",
         "--output-format", "text",
@@ -225,14 +277,19 @@ def run_claude(system_prompt: str, user_prompt: str) -> tuple[str, str, int]:
         input=user_prompt,
         capture_output=True,
         text=True,
-        timeout=TIMEOUT_SECONDS,
+        timeout=timeout,
     )
 
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
+# ---------------------------------------------------------------------------
+# Parsing — reviewer output
+# ---------------------------------------------------------------------------
+
 _CRITICAL_LINE_RE = re.compile(
-    r"^[ \t]*[-*•]?[ \t]*\[CRITICAL\]", re.MULTILINE | re.IGNORECASE
+    r"^[ \t]*[-*•]?[ \t]*(?:\[F\d+\]\s*)?\[CRITICAL\]",
+    re.MULTILINE | re.IGNORECASE,
 )
 _WARNING_TAG_RE = re.compile(r"\[WARNING\]", re.IGNORECASE)
 _SUMMARY_LINE_RE = re.compile(r"^[ \t]*Summary:\s", re.IGNORECASE)
@@ -241,12 +298,10 @@ _SECTION_2_MARKER = re.compile(r"(?im)^#{1,6}\s*Section\s*2\b")
 
 
 def count_criticals(review: str) -> int:
-    """Count [CRITICAL] finding lines in the reviewer output.
+    """Count [CRITICAL] finding lines in reviewer output.
 
-    Matches only at line start, allowing an optional bullet marker
-    (``-``, ``*``, ``•``) and surrounding whitespace. ``[CRITICAL]``
-    appearing inside prose or a quoted diff hunk mid-line does not
-    inflate the count.
+    Matches only at line start (optional bullet + optional `[Fn]` id
+    tag). Mid-line mentions in prose or diff quotes do not count.
     """
     if not review:
         return 0
@@ -254,17 +309,12 @@ def count_criticals(review: str) -> int:
 
 
 def is_well_formed(review: str) -> bool:
-    """True if the review ran to completion in the documented format.
+    """True if a single-call review ran to completion in the documented format.
 
-    The contract (review_prompt.md) requires three sections in order:
-    Section 1 (file audit + tool-use log), Section 2 (coverage matrix
-    + findings), Section 3 (``Summary: ...`` terminator). All three
-    must be present and the Summary line must be the very last
-    non-empty line — trailing content means the reviewer wrote past
-    its stop signal.
-
-    Any failure here means the critical count cannot be trusted and
-    the hook fails closed.
+    The contract (review_prompt.md) requires Section 1, Section 2, and
+    the ``Summary:`` terminator as the final non-empty line. This
+    check is used ONLY for the single-call path — the fan-out path
+    synthesises its own aggregate summary.
     """
     if not review:
         return False
@@ -279,19 +329,7 @@ def is_well_formed(review: str) -> bool:
 
 
 def parse_verdict(review: str) -> str:
-    """Decide the commit verdict from the review body.
-
-    Policy:
-    - empty or whitespace-only → BLOCK (fail-closed on tool failure).
-    - non-empty but malformed (no ``Summary:`` line) → BLOCK. Without
-      the terminator we cannot trust that the sweeps ran.
-    - well-formed + any [CRITICAL] line → BLOCK.
-    - well-formed + zero [CRITICAL] lines → OK.
-
-    The reviewer no longer writes an OK/BLOCK line itself; the decision
-    is mechanical so the model cannot short-circuit the review by
-    deciding early.
-    """
+    """Single-call verdict: empty/malformed -> BLOCK; any [CRITICAL] -> BLOCK."""
     if not review or not review.strip():
         return "BLOCK"
     if not is_well_formed(review):
@@ -300,8 +338,321 @@ def parse_verdict(review: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fan-out
+# ---------------------------------------------------------------------------
+
+def run_single_lens(
+    lens_name: str,
+    diff: str,
+    files: str,
+    is_merge: bool,
+) -> dict:
+    """Run one lens. Returns dict with name/status/review/error/reviewer."""
+    system_prompt = build_lens_system_prompt(lens_name)
+    if not system_prompt:
+        return {
+            "name": lens_name,
+            "status": "error",
+            "review": "",
+            "error": f"lens_{lens_name}.md or lens_common.md missing",
+            "reviewer": None,
+        }
+
+    user_prompt = build_user_prompt(diff, files, is_merge)
+
+    review: str = ""
+    stderr: str = ""
+    rc: int = -1
+    reviewer: str = "opencode"
+
+    try:
+        review, stderr, rc = run_opencode(system_prompt, user_prompt)
+    except subprocess.TimeoutExpired:
+        return {"name": lens_name, "status": "timeout",
+                "review": "", "error": "opencode timeout", "reviewer": "opencode"}
+    except (FileNotFoundError, OSError) as exc:
+        stderr = str(exc)
+        rc = -1
+
+    if rc != 0 or not review or not review.strip():
+        # fallback to Claude Code
+        try:
+            review, stderr, rc = run_claude(system_prompt, user_prompt)
+            reviewer = "claude"
+        except subprocess.TimeoutExpired:
+            return {"name": lens_name, "status": "timeout",
+                    "review": "", "error": "claude fallback timeout",
+                    "reviewer": "claude"}
+        except (FileNotFoundError, OSError) as exc:
+            return {"name": lens_name, "status": "error",
+                    "review": "", "error": f"both runners unavailable: {exc}",
+                    "reviewer": None}
+        if rc != 0 or not review or not review.strip():
+            return {"name": lens_name, "status": "error",
+                    "review": review, "error": f"rc={rc} stderr={stderr}",
+                    "reviewer": reviewer}
+
+    return {"name": lens_name, "status": "ok", "review": review,
+            "error": "", "reviewer": reviewer}
+
+
+def _aggregate_lens_outputs(per_lens: list[dict]) -> str:
+    """Concatenate lens outputs. Appends a global Summary line."""
+    parts: list[str] = []
+    for d in per_lens:
+        header = f"## Lens: {d['name']}"
+        if d["status"] != "ok":
+            parts.append(f"{header}\n\n_Lens unavailable: {d['error']}_")
+        else:
+            parts.append(f"{header}\n\n{d['review']}")
+    total_c = sum(count_criticals(d.get("review", "")) for d in per_lens if d["status"] == "ok")
+    total_w = sum(
+        len(_WARNING_TAG_RE.findall(d.get("review", "")))
+        for d in per_lens
+        if d["status"] == "ok"
+    )
+    parts.append(f"Summary: {total_c} CRITICAL, {total_w} WARNING across {len(per_lens)} lenses.")
+    return "\n\n".join(parts)
+
+
+def run_fanout(diff: str, files: str, is_merge: bool) -> tuple[str, list[dict]]:
+    """Run all 7 lenses in parallel. Returns (aggregated_text, per_lens)."""
+    info(f"Fan-out: launching {len(LENS_NAMES)} lens review(s) in parallel...")
+    per_lens: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(LENS_NAMES)) as ex:
+        futures = {
+            ex.submit(run_single_lens, name, diff, files, is_merge): name
+            for name in LENS_NAMES
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            name = futures[fut]
+            try:
+                per_lens.append(fut.result())
+            except Exception as exc:
+                per_lens.append({
+                    "name": name,
+                    "status": "error",
+                    "review": "",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "reviewer": None,
+                })
+
+    per_lens.sort(key=lambda d: LENS_NAMES.index(d["name"]))
+    ok_count = sum(1 for d in per_lens if d["status"] == "ok")
+    info(f"Fan-out complete: {ok_count}/{len(LENS_NAMES)} lens(es) returned findings.")
+
+    aggregated = _aggregate_lens_outputs(per_lens)
+    return aggregated, per_lens
+
+
+# ---------------------------------------------------------------------------
+# Arbiter
+# ---------------------------------------------------------------------------
+
+_ARBITER_VERDICT_RE = re.compile(
+    r"^\s*\[(UPHELD|OVERTURN)\]\s*(F\d+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+_ARBITER_SUMMARY_RE = re.compile(
+    r"^\s*Summary:\s*\d+\s+UPHELD",
+    re.MULTILINE | re.IGNORECASE,
+)
+_FINDING_ID_INJECT_RE = re.compile(
+    r"^([ \t]*[-*•]?[ \t]*)(\[CRITICAL\])",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def assign_finding_ids(review_text: str) -> tuple[str, list[dict]]:
+    """Inject stable IDs (F1, F2, ...) into every [CRITICAL] line.
+
+    Returns (tagged_text, findings). findings: list of
+    ``{"id": "F1", "line": "<full finding line, stripped>"}``.
+    """
+    counter = [0]
+
+    def _replace(m: re.Match) -> str:
+        counter[0] += 1
+        return f"{m.group(1)}[F{counter[0]}] {m.group(2)}"
+
+    tagged = _FINDING_ID_INJECT_RE.sub(_replace, review_text)
+
+    findings: list[dict] = []
+    line_re = re.compile(
+        r"^[ \t]*[-*•]?[ \t]*\[(F\d+)\]\s*\[CRITICAL\].*$",
+        re.IGNORECASE,
+    )
+    for line in tagged.splitlines():
+        m = line_re.match(line)
+        if m:
+            findings.append({"id": m.group(1), "line": line.strip()})
+    return tagged, findings
+
+
+def parse_arbiter_verdict(arbiter_raw: str, all_finding_ids: list[str]) -> set[str]:
+    """Extract UPHELD finding IDs from arbiter output.
+
+    Fail-open: if the arbiter output is malformed (no Summary line),
+    every finding is treated as UPHELD. The arbiter exists to *reduce*
+    the blocking set; a parser bug must never expand it by silently
+    dropping valid findings.
+    """
+    if not arbiter_raw or not _ARBITER_SUMMARY_RE.search(arbiter_raw):
+        return set(all_finding_ids)
+
+    seen: dict[str, str] = {}
+    for m in _ARBITER_VERDICT_RE.finditer(arbiter_raw):
+        verdict = m.group(1).upper()
+        fid = m.group(2)
+        seen[fid] = verdict
+
+    upheld: set[str] = set()
+    for fid in all_finding_ids:
+        # Missing verdict line → fail-open (count as UPHELD).
+        if seen.get(fid, "UPHELD") == "UPHELD":
+            upheld.add(fid)
+    return upheld
+
+
+def run_arbiter(
+    diff: str,
+    findings: list[dict],
+) -> dict:
+    """Run the Claude Opus arbiter over findings.
+
+    Returns {status, upheld_ids, raw, error}. Fail-open on any error:
+    upheld_ids will equal the full set of input finding IDs.
+    """
+    all_ids = [f["id"] for f in findings]
+    if not findings:
+        return {"status": "skipped", "upheld_ids": set(),
+                "raw": "", "error": "no criticals to arbitrate"}
+
+    system_prompt = read_file(ARBITER_PROMPT_PATH)
+    if not system_prompt:
+        warn(f"Arbiter prompt {ARBITER_PROMPT_PATH} missing — upholding all findings")
+        return {"status": "unavailable", "upheld_ids": set(all_ids),
+                "raw": "", "error": f"{ARBITER_PROMPT_PATH} not found"}
+
+    user_prompt = (
+        "## Full staged diff\n\n"
+        "```diff\n" + diff + "\n```\n\n"
+        "## Findings to arbitrate (in order):\n\n"
+        + "\n".join(f["line"] for f in findings)
+        + "\n\n"
+        "Output one `[UPHELD]` or `[OVERTURN]` line per finding above, "
+        "in the same order, then the `Summary:` line. No other content."
+    )
+
+    info(
+        f"Arbiter: analyzing {len(findings)} finding(s) with Claude "
+        f"{ARBITER_MODEL} (may take 30-120s)..."
+    )
+    try:
+        raw, stderr, rc = run_claude(
+            system_prompt, user_prompt,
+            model=ARBITER_MODEL, timeout=ARBITER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        warn(f"Arbiter timed out after {ARBITER_TIMEOUT_SECONDS}s — upholding all findings")
+        return {"status": "unavailable", "upheld_ids": set(all_ids),
+                "raw": "", "error": "timeout"}
+    except (FileNotFoundError, OSError) as exc:
+        warn(f"Arbiter unreachable ({exc}) — upholding all findings")
+        return {"status": "unavailable", "upheld_ids": set(all_ids),
+                "raw": "", "error": f"unreachable: {exc}"}
+
+    if rc != 0 or not raw or not raw.strip():
+        warn(f"Arbiter failed (rc={rc}) — upholding all findings")
+        return {"status": "unavailable", "upheld_ids": set(all_ids),
+                "raw": raw, "error": f"rc={rc} stderr={stderr}"}
+
+    upheld = parse_arbiter_verdict(raw, all_ids)
+    overturned = len(all_ids) - len(upheld)
+    info(f"Arbiter: {len(upheld)} UPHELD, {overturned} OVERTURN.")
+    return {"status": "ok", "upheld_ids": upheld, "raw": raw, "error": ""}
+
+
+def _render_fanout_output(
+    per_lens: list[dict],
+    findings: list[dict],
+    upheld_ids: set[str],
+    arbiter: dict,
+) -> str:
+    """Compact, developer-facing summary shown on BLOCK / logged on OK."""
+    upheld = [f for f in findings if f["id"] in upheld_ids]
+    overturned = [f for f in findings if f["id"] not in upheld_ids]
+    warning_count = sum(
+        len(_WARNING_TAG_RE.findall(d.get("review", "")))
+        for d in per_lens if d["status"] == "ok"
+    )
+    unavailable = [d["name"] for d in per_lens if d["status"] != "ok"]
+
+    sections: list[str] = []
+    sections.append("## Fan-out review summary\n")
+    if upheld:
+        sections.append("### Upheld findings (blocking)")
+        sections.extend(f"- {f['line']}" for f in upheld)
+    else:
+        sections.append("### Upheld findings (blocking)\n_(none)_")
+
+    if overturned:
+        # parse arbiter rationales if present
+        rationales: dict[str, str] = {}
+        for m in re.finditer(
+            r"^\s*\[(?:UPHELD|OVERTURN)\]\s*(F\d+)\s*[—-]?\s*(.*)$",
+            arbiter.get("raw", ""),
+            re.MULTILINE | re.IGNORECASE,
+        ):
+            rationales[m.group(1)] = m.group(2).strip()
+        sections.append("\n### Overturned findings (advisory — not blocking)")
+        for f in overturned:
+            reason = rationales.get(f["id"], "")
+            sections.append(f"- {f['line']}")
+            if reason:
+                sections.append(f"    arbiter: {reason}")
+
+    if warning_count:
+        sections.append(f"\n### Warnings: {warning_count} (see log for detail)")
+    if unavailable:
+        sections.append(f"\n### Lenses unavailable: {', '.join(unavailable)}")
+
+    sections.append(
+        f"\nSummary: {len(upheld)} UPHELD, {len(overturned)} OVERTURN, "
+        f"{warning_count} WARNING across {len(per_lens)} lenses."
+    )
+    return "\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+
+def _format_per_lens(per_lens: list[dict]) -> str:
+    parts: list[str] = ["## Per-lens detail\n"]
+    for d in per_lens:
+        reviewer_suffix = f" ({d['reviewer']})" if d.get("reviewer") else ""
+        parts.append(f"### Lens: {d['name']} — {d['status']}{reviewer_suffix}\n")
+        if d.get("error"):
+            parts.append(f"_Error:_ {d['error']}\n")
+        if d.get("review"):
+            parts.append(f"```\n{d['review']}\n```\n")
+    return "\n".join(parts) + "\n"
+
+
+def _format_arbiter(arbiter: dict) -> str:
+    parts: list[str] = [
+        f"## Arbiter ({ARBITER_MODEL}) — status: {arbiter.get('status', 'n/a')}\n"
+    ]
+    if arbiter.get("error"):
+        parts.append(f"_Error:_ {arbiter['error']}\n")
+    upheld = arbiter.get("upheld_ids") or set()
+    if upheld:
+        parts.append(f"_Upheld IDs:_ {', '.join(sorted(upheld))}\n")
+    if arbiter.get("raw"):
+        parts.append(f"```\n{arbiter['raw']}\n```\n")
+    return "\n".join(parts) + "\n"
+
 
 def save_log(
     verdict: str,
@@ -311,6 +662,8 @@ def save_log(
     error_msg: str | None = None,
     diag: str | None = None,
     reviewer: str | None = None,
+    per_lens: list[dict] | None = None,
+    arbiter: dict | None = None,
 ) -> None:
     """Save review to a log file for debugging."""
     try:
@@ -319,23 +672,30 @@ def save_log(
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         log_path = LOG_DIR / f"{timestamp}_{project}_{verdict}.md"
 
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write(f"# Review: {project} @ {timestamp}\n\n")
-            f.write(f"**Verdict:** {verdict}\n")
-            if reviewer:
-                f.write(f"**Reviewer:** {reviewer}\n")
-            if files:
-                f.write(f"**Files:**\n{files}\n\n")
-            if diff:
-                f.write(f"## Diff stats\n{len(diff.splitlines())} lines in diff\n\n")
-            if error_msg:
-                f.write(f"## Error\n```\n{error_msg}\n```\n\n")
-            if diag:
-                f.write(f"## Diagnostics\n```\n{diag}\n```\n\n")
-            if review:
-                f.write(f"## Review output\n```\n{review}\n```\n\n")
-            if diff:
-                f.write(f"## Full diff\n```diff\n{diff}\n```\n")
+        sections: list[str] = [
+            f"# Review: {project} @ {timestamp}\n",
+            f"**Verdict:** {verdict}",
+        ]
+        if reviewer:
+            sections.append(f"**Reviewer:** {reviewer}")
+        if files:
+            sections.append(f"**Files:**\n{files}\n")
+        if diff:
+            sections.append(f"## Diff stats\n{len(diff.splitlines())} lines in diff\n")
+        if error_msg:
+            sections.append(f"## Error\n```\n{error_msg}\n```\n")
+        if diag:
+            sections.append(f"## Diagnostics\n```\n{diag}\n```\n")
+        if review:
+            sections.append(f"## Review output\n```\n{review}\n```\n")
+        if per_lens:
+            sections.append(_format_per_lens(per_lens))
+        if arbiter:
+            sections.append(_format_arbiter(arbiter))
+        if diff:
+            sections.append(f"## Full diff\n```diff\n{diff}\n```")
+
+        log_path.write_text("\n".join(sections) + "\n", encoding="utf-8")
     except OSError:
         pass
 
@@ -376,28 +736,22 @@ def collect_diff() -> tuple[str, str, bool] | None:
     return diff, files, is_merge
 
 
-def _call_reviewer(
+def _call_single_reviewer(
     system_prompt: str,
     user_prompt: str,
 ) -> tuple[str, str, str, int]:
-    """Try OpenCode first, fall back to Claude Code.
-
-    Returns (review, stderr, reviewer_name, returncode).
-    Raises subprocess.TimeoutExpired or FileNotFoundError when both fail.
-    """
+    """Try OpenCode first, fall back to Claude Code. (Single-call path only.)"""
     reviewer: str | None = None
     review: str = ""
     reviewer_stderr: str = ""
     returncode: int = -1
 
-    # Primary: OpenCode
     try:
         review, reviewer_stderr, returncode = run_opencode(system_prompt, user_prompt)
         reviewer = "opencode"
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
         warn(f"OpenCode unavailable ({exc}), falling back to Claude Code")
 
-    # Fallback: Claude Code
     if reviewer is None or returncode != 0 or not review:
         if reviewer == "opencode":
             warn(f"OpenCode failed (rc={returncode}), falling back to Claude Code")
@@ -407,8 +761,12 @@ def _call_reviewer(
     return review, reviewer_stderr, reviewer, returncode
 
 
-def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
-    """Execute the review. Returns (review_text, verdict)."""
+def _run_single_call(
+    diff: str,
+    files: str,
+    is_merge: bool,
+) -> tuple[str | None, str]:
+    """Legacy single-call reviewer path for small diffs."""
     system_prompt = build_system_prompt()
     if not system_prompt:
         warn("No review_prompt.md found, skipping review")
@@ -416,10 +774,11 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
         return None, "SKIP"
 
     user_prompt = build_user_prompt(diff, files, is_merge)
-    info(f"Reviewing {len(files.splitlines())} file(s)...")
 
     try:
-        review, reviewer_stderr, reviewer, returncode = _call_reviewer(system_prompt, user_prompt)
+        review, reviewer_stderr, reviewer, returncode = _call_single_reviewer(
+            system_prompt, user_prompt,
+        )
     except subprocess.TimeoutExpired:
         warn(f"Review timed out after {TIMEOUT_SECONDS}s — allowing commit")
         save_log("TIMEOUT", files=files, diff=diff, error_msg="timed out")
@@ -436,8 +795,6 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
         return None, "ERROR"
 
     if not review or not review.strip():
-        # Tool failure (empty/whitespace-only response) → fail-open.
-        # Distinct from a non-empty review missing a verdict → fail-closed.
         warn(f"{reviewer} returned empty output — allowing commit")
         save_log("EMPTY", files=files, diff=diff, reviewer=reviewer,
                  error_msg=f"empty output. stderr: {reviewer_stderr}")
@@ -449,6 +806,55 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
     info(f"Reviewer: {reviewer} — {count_criticals(review)} CRITICAL finding(s)")
     save_log(verdict, files=files, diff=diff, review=review, reviewer=reviewer)
     return review, verdict
+
+
+def _run_fanout_with_arbiter(
+    diff: str,
+    files: str,
+    is_merge: bool,
+) -> tuple[str | None, str]:
+    """Fan-out reviewer → aggregator → arbiter pipeline for large diffs."""
+    aggregated, per_lens = run_fanout(diff, files, is_merge)
+
+    ok_lenses = [d for d in per_lens if d["status"] == "ok"]
+    if not ok_lenses:
+        warn("All fan-out lenses failed — allowing commit")
+        save_log("EMPTY", files=files, diff=diff,
+                 reviewer="fan-out", per_lens=per_lens,
+                 error_msg="all lenses unavailable")
+        return None, "EMPTY"
+
+    tagged_aggregated, findings = assign_finding_ids(aggregated)
+
+    if not findings:
+        display = tagged_aggregated
+        save_log("OK", files=files, diff=diff, review=display,
+                 reviewer="fan-out", per_lens=per_lens)
+        return display, "OK"
+
+    arbiter = run_arbiter(diff, findings)
+    upheld_ids = arbiter["upheld_ids"]
+    display = _render_fanout_output(per_lens, findings, upheld_ids, arbiter)
+    verdict = "BLOCK" if upheld_ids else "OK"
+
+    save_log(verdict, files=files, diff=diff, review=display,
+             reviewer="fan-out+arbiter",
+             per_lens=per_lens, arbiter=arbiter)
+    return display, verdict
+
+
+def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
+    """Execute the review. Routes between single-call and fan-out+arbiter."""
+    added = count_added_lines(diff)
+    use_fanout = added >= FANOUT_THRESHOLD
+    info(
+        f"Reviewing {len(files.splitlines())} file(s), +{added} added line(s), "
+        f"mode={'fan-out+arbiter' if use_fanout else 'single-call'}"
+    )
+
+    if use_fanout:
+        return _run_fanout_with_arbiter(diff, files, is_merge)
+    return _run_single_call(diff, files, is_merge)
 
 
 def main() -> None:

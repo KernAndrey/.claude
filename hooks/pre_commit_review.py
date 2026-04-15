@@ -661,23 +661,24 @@ def run_arbiter(
     return {"status": "ok", "upheld_ids": upheld, "raw": raw, "error": ""}
 
 
-def _render_fanout_output(
-    per_lens: list[dict],
+def _render_with_arbiter(
     findings: list[dict],
     upheld_ids: set[str],
     arbiter: dict,
+    warning_count: int,
+    denominator_label: str,
+    unavailable_label: str = "",
 ) -> str:
-    """Compact, developer-facing summary shown on BLOCK / logged on OK."""
+    """Developer-facing summary for any review path that produced findings.
+
+    ``denominator_label`` describes the producer side ("7 lenses",
+    "1 reviewer"). ``unavailable_label`` is an optional comma-separated
+    list of failed/skipped producers (used by fan-out only).
+    """
     upheld = [f for f in findings if f["id"] in upheld_ids]
     overturned = [f for f in findings if f["id"] not in upheld_ids]
-    warning_count = sum(
-        len(_WARNING_TAG_RE.findall(d.get("review", "")))
-        for d in per_lens if d["status"] == "ok"
-    )
-    unavailable = [d["name"] for d in per_lens if d["status"] != "ok"]
 
-    sections: list[str] = []
-    sections.append("## Fan-out review summary\n")
+    sections: list[str] = ["## Review summary\n"]
     if upheld:
         sections.append("### Upheld findings (blocking)")
         sections.extend(f"- {f['line']}" for f in upheld)
@@ -685,7 +686,6 @@ def _render_fanout_output(
         sections.append("### Upheld findings (blocking)\n_(none)_")
 
     if overturned:
-        # parse arbiter rationales if present
         rationales: dict[str, str] = {}
         for m in re.finditer(
             r"^\s*\[(?:UPHELD|OVERTURN)\]\s*(F\d+)\s*[—-]?\s*(.*)$",
@@ -702,14 +702,34 @@ def _render_fanout_output(
 
     if warning_count:
         sections.append(f"\n### Warnings: {warning_count} (see log for detail)")
-    if unavailable:
-        sections.append(f"\n### Lenses unavailable: {', '.join(unavailable)}")
+    if unavailable_label:
+        sections.append(f"\n### Producers unavailable: {unavailable_label}")
 
     sections.append(
         f"\nSummary: {len(upheld)} UPHELD, {len(overturned)} OVERTURN, "
-        f"{warning_count} WARNING across {len(per_lens)} lenses."
+        f"{warning_count} WARNING across {denominator_label}."
     )
     return "\n".join(sections)
+
+
+def _render_fanout_output(
+    per_lens: list[dict],
+    findings: list[dict],
+    upheld_ids: set[str],
+    arbiter: dict,
+) -> str:
+    """Compact summary for fan-out path. Wraps _render_with_arbiter."""
+    warning_count = sum(
+        len(_WARNING_TAG_RE.findall(d.get("review", "")))
+        for d in per_lens if d["status"] == "ok"
+    )
+    unavailable = [d["name"] for d in per_lens if d["status"] != "ok"]
+    return _render_with_arbiter(
+        findings, upheld_ids, arbiter,
+        warning_count=warning_count,
+        denominator_label=f"{len(per_lens)} lenses",
+        unavailable_label=", ".join(unavailable),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -888,12 +908,51 @@ def _run_single_call(
                  error_msg=f"empty output. stderr: {reviewer_stderr}")
         return None, "EMPTY"
 
-    verdict = parse_verdict(review)
-    if verdict == "BLOCK" and not is_well_formed(review):
+    return _arbitrate_single_call_review(review, reviewer, diff, files)
+
+
+def _arbitrate_single_call_review(
+    review: str,
+    reviewer: str,
+    diff: str,
+    files: str,
+) -> tuple[str | None, str]:
+    """Apply well-formed/critical/arbiter logic to a single-call review.
+
+    Mirrors the fan-out arbiter step so small diffs also benefit from
+    Opus calibration when the primary reviewer flags CRITICALs.
+    """
+    if not is_well_formed(review):
         warn("Reviewer output missing `Summary:` terminator — treating as malformed (fail-closed BLOCK)")
-    info(f"Reviewer: {reviewer} — {count_criticals(review)} CRITICAL finding(s)")
-    save_log(verdict, files=files, diff=diff, review=review, reviewer=reviewer)
-    return review, verdict
+        info(f"Reviewer: {reviewer} — malformed output")
+        save_log("BLOCK", files=files, diff=diff, review=review, reviewer=reviewer)
+        return review, "BLOCK"
+
+    critical_count = count_criticals(review)
+    info(f"Reviewer: {reviewer} — {critical_count} CRITICAL finding(s)")
+
+    if critical_count == 0:
+        save_log("OK", files=files, diff=diff, review=review, reviewer=reviewer)
+        return review, "OK"
+
+    tagged_review, findings = assign_finding_ids(review)
+    arbiter = run_arbiter(diff, findings)
+    upheld_ids = arbiter["upheld_ids"]
+    warning_count = len(_WARNING_TAG_RE.findall(review))
+    display = _render_with_arbiter(
+        findings, upheld_ids, arbiter,
+        warning_count=warning_count,
+        denominator_label=f"1 reviewer ({reviewer})",
+    )
+    verdict = "BLOCK" if upheld_ids else "OK"
+    save_log(verdict, files=files, diff=diff, review=display,
+             reviewer=f"{reviewer}+arbiter", arbiter=arbiter,
+             diag=f"original review (pre-arbiter):\n{tagged_review}")
+    # On BLOCK return the synthesized display so the developer sees the
+    # arbiter context. On OK return the raw review so main() can surface
+    # [WARNING] lines via _WARNING_TAG_RE — the synthesized display only
+    # carries a warning count, not the lines themselves.
+    return (display if verdict == "BLOCK" else review), verdict
 
 
 def _run_fanout_with_arbiter(

@@ -67,11 +67,12 @@
     "ralph-loop@claude-plugins-official": true
   },
   "effortLevel": "high",
-  "voiceEnabled": true,
   "voice": {
     "enabled": true,
     "mode": "hold"
   },
   "skipDangerousModePermissionPrompt": true,
-  "teammateMode": "tmux"
+  "voiceEnabled": true,
+  "teammateMode": "tmux",
+  "skipAutoPermissionPrompt": true
 }

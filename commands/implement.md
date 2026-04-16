@@ -26,7 +26,7 @@ Thoroughness over speed. This task may run for hours — that is expected and ac
 4. Branch and worktree setup:
    - If `auto_branch = true`: fetch latest `dev` branch (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All teammates work inside the worktree directory.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
-5. **Review prompt setup** (run inside `{worktree_path}`): reviewers must apply project-specific review rules from `review_prompt.md`. Run the symlink setup from `~/.claude/guides/opencode-review-runner.md` inside the worktree — it creates agent symlinks (for opencode mode), `.claude/review_prompt_global.md` (used by both modes), and git exclude entries.
+5. **Review prompt setup** (run inside `{worktree_path}`): if the project has `.claude/review_prompt.md`, reviewers will apply it as project-specific rules (severity overrides, design decisions to treat as intentional). In opencode mode, run the symlink setup from `~/.claude/review/guides/opencode-runner.md` inside the worktree to create agent symlinks under `.claude/agents-global/` (required because `opencode --pure` rejects paths outside the project).
 6. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
 7. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers will need it.
 8. **Create the team:** `TeamCreate` with `team_name: "impl-{ID}"`. You are the lead.
@@ -181,11 +181,11 @@ SUMMARY: X findings (Y MUST FIX, Z NIT/CONCERN)
 
 #### Mode A: `--reviewers claudecode`
 
-Read and follow `~/.claude/guides/claudecode-review-runner.md` — Phase 2 section.
+Read and follow `~/.claude/review/guides/claudecode-runner.md` — Phase 2 section.
 
 #### Mode B: `--reviewers opencode`
 
-Read and follow `~/.claude/guides/opencode-review-runner.md` — Phase 2 section.
+Read and follow `~/.claude/review/guides/opencode-runner.md` — Phase 2 section.
 
 ---
 
@@ -220,8 +220,8 @@ Message Tester with all test fixes (if any):
 #### Step 3: Verification
 
 Follow the re-review procedure from the active reviewer runner guide:
-- **claudecode:** `~/.claude/guides/claudecode-review-runner.md` — Phase 3 Step 3
-- **opencode:** `~/.claude/guides/opencode-review-runner.md` — Phase 3 Step 3
+- **claudecode:** `~/.claude/review/guides/claudecode-runner.md` — Phase 3 Step 3
+- **opencode:** `~/.claude/review/guides/opencode-runner.md` — Phase 3 Step 3
 
 #### Step 4: Fix loop and escalation
 

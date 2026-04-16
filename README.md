@@ -8,9 +8,12 @@ Global configuration for Claude Code sessions across all projects.
 - `settings.json` — Hook configuration, environment variables, plugins
 - `agents/` — Agent definitions for SDD (Spec-Driven Development) teams
 - `commands/` — Slash commands for SDD workflow
-- `hooks/` — PostToolUse and pre-commit hook scripts
-- `git-hooks/` — Git hooks (pre-commit chain)
-- `review_prompt.md` — Pre-commit AI code review prompt
+- `hooks/` — PostToolUse hook scripts (lint, guard)
+- `git-hooks/` — Git hooks (pre-commit chain wrapper)
+- `review/` — Pre-commit AI code review (3 lenses: bugs, architecture, tests)
+  - `prompts/` — lens prompts, arbiter, single-call `combined.md`
+  - `hook.py` — review entry point
+  - `guides/` — SDD review runner guides
 - `templates/` — SDD spec and draft templates
 - `skills/` — On-demand instruction sets
 
@@ -28,13 +31,14 @@ All Python code must include complete type annotations:
 Enforced at multiple levels:
 
 1. **CLAUDE.md** — Instructs Claude to always write annotated code
-2. **PostToolUse hook** (`hooks/lint.py`) — Runs `ruff --select ANN` on every file edit
-3. **Pre-commit review** (`review_prompt.md`) — AI reviewer flags missing annotations as CRITICAL
-4. **Agent definitions** — Coder, Tester, Code-Reviewer, and Test-Reviewer agents all have explicit annotation rules
+2. **PostToolUse hook** (`hooks/lint.py`) — Runs `ruff --select ANN` on every file edit (catches missing annotations at write-time)
+3. **Agent definitions** — Coder, Tester, Code-Reviewer, and Test-Reviewer agents all have explicit annotation rules
+
+(The pre-commit AI review intentionally does not duplicate linter scope — ruff's ANN rules cover type annotations before review runs.)
 
 ### Linting
 
 All Python files are checked with `ruff` on every edit (PostToolUse hook). Pre-commit hook chains:
 
 1. Project-local linters (if configured)
-2. AI-powered code review via Claude (`pre_commit_review.py`)
+2. AI-powered code review via `review/hook.py`

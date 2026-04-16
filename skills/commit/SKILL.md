@@ -63,16 +63,74 @@ Ask the user how to proceed. Suggest:
 
 Proceed only after explicit user approval for each detected secret.
 
+## Phase 3.5: Test Coverage Gate
+
+The AI reviewer (`tests` lens) enforces 100% coverage of new public
+branches. A commit with new behavior and no matching test is blocked.
+This phase catches the gap before the review runs, saving a round
+trip.
+
+**Automatic classification — pick one path.**
+
+### Path A: tests not required — pass silently
+
+Skip this phase with no questions and no console output when any of
+the following is true:
+- No files of production code in staged changes (only `.md`, config,
+  CI, migrations, `.json`, lockfiles).
+- Only renames with identical signatures and bodies.
+- Only edits inside test files.
+- Only private `_prefixed` helpers with no new public entry point in
+  the diff.
+
+### Path B: tests required, tests present — pass silently
+
+If the diff contains any of the following production-code signals:
+- New public (not `_prefixed`) `def` / `class`.
+- New branch (`if` / `elif` / `else` / `match` arm) with business
+  logic.
+- New `raise` or new exception type.
+- Changed public function signature that alters behavior.
+
+Then verify a matching test exists in the same staged set:
+- `Glob` for test files across common conventions:
+  `tests/**`, `test_*.py`, `*_test.py`, `*.test.ts`, `*.test.tsx`,
+  `*.test.js`, `*_test.go`, `*Spec.*`, `*_spec.rb`.
+- Confirm the staged diff adds / modifies a test that exercises the
+  new unit.
+
+Match present for every new-behavior unit → continue to Phase 4 with
+no output.
+
+### Path C: tests required, tests missing — BLOCK
+
+Do not ask; do not propose options; do not negotiate. Print and halt:
+
+> ❌ Commit blocked — test coverage required:
+> - `path/to/mod.py::new_fn` (new public function, no matching test)
+> - `path/to/mod.py:142` (new `elif ctx.role == "admin"` branch, no assertion)
+>
+> Add tests in the same commit. 100% coverage is enforced; tests cannot be deferred. The AI reviewer (`tests` lens) will block this commit anyway — catching it here saves a round trip.
+
+The only legal escape is an inline comment on or immediately above
+the new unit:
+```python
+# review-note: covered by tests/integration/test_foo.py::test_bar
+```
+Where the referenced test path actually exists AND contains an
+assertion on the new behavior. Verify with `Read` before honoring.
+Unverifiable references do not unblock the commit.
+
 ## Phase 4: Analyze and Split
 
 Review all changes and group them into logical commits. A logical commit is a cohesive set of changes that represents one idea:
 
-- A bug fix + its tests
+- A bug fix + regression test (both required in one commit)
 - A new feature + its tests (model + view + template + test)
-- A refactoring + updated tests
-- A config change
+- A refactoring + updated tests (if behavior changes)
+- A config / CI / infrastructure change (tests optional, justify in body)
+- Standalone `test:` commits (see exceptions below)
 - Documentation updates (only if the user explicitly requested it)
-- Standalone test improvements (refactoring existing tests, adding coverage for old code)
 
 ### Splitting rules
 
@@ -80,8 +138,11 @@ Review all changes and group them into logical commits. A logical commit is a co
 - If there are 2+ distinct changes — propose a split to the user with a short summary of each commit.
 - Wait for the user to confirm or adjust the split before proceeding.
 - Each commit contains one logical change — unrelated changes in one commit make bisect and revert impossible.
-- Keep code and its tests in the same commit — splitting feat and test commits breaks bisect and revert.
-- Only create standalone test commits for: test refactoring, adding coverage for previously untested existing code, or test infrastructure changes.
+- Keep production code and its tests in the same commit. Splitting into "all code" + "all tests" is forbidden: the first commit hits the `tests` lens with no coverage and gets blocked.
+- If a change exceeds 2000 lines (the hook rejects it wholesale), split by **vertical slice**: each commit = a portion of the feature + its tests.
+  - ✅ Commit 1: `feat(auth): user model + model tests` / Commit 2: `feat(auth): login endpoint + endpoint tests` / Commit 3: `feat(auth): middleware + middleware tests`
+  - ❌ Commit 1: all production code / Commit 2: all tests
+- Valid standalone `test:` commits: test refactoring, adding coverage for previously untested existing code, migrating to a new test framework or fixtures.
 
 ## Phase 5: Lint Check
 
@@ -125,3 +186,5 @@ After all commits are done, show:
 - Use standard push (no `--force`).
 - If a pre-commit hook fails or the AI review BLOCKs the commit, fix the reported issues, re-stage, and create a new commit.
 - If the diff exceeds 2000 lines, the hook rejects it — split into smaller commits.
+- The AI reviewer `tests` lens blocks any commit with new public behavior and no matching test. Phase 3.5 catches this early — keep code and tests in the same commit.
+- When splitting a large feature, slice by **vertical** (each slice = code + its tests), never by layer (all code → all tests).

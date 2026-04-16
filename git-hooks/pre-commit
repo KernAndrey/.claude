@@ -18,8 +18,29 @@ if [ -f "$LOCAL_HOOK" ] && [ -x "$LOCAL_HOOK" ]; then
     "$LOCAL_HOOK"
 fi
 
-# --- Step 2: Run code review (on already-linted code) ---
-REVIEW_SCRIPT="$HOME/.claude/hooks/pre_commit_review.py"
+# --- Step 2: Export commit message draft for the reviewer ---
+# git writes COMMIT_EDITMSG into the WORKTREE-specific git-dir (not
+# git-common-dir) before pre-commit for both `-m` and editor flows.
+# The mtime check (≤10s) avoids leaking a stale message from the
+# previous commit.
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)"
+COMMIT_MSG_FILE="$GIT_DIR/COMMIT_EDITMSG"
+if [ -f "$COMMIT_MSG_FILE" ]; then
+    # review-note: mtime freshness gate — the message file persists on disk
+    # after the previous commit, so without this guard we would leak stale
+    # content into CLAUDE_COMMIT_MSG. 0.17 min ≈ 10s covers the git write
+    # that happens immediately before pre-commit runs.
+    if [ "$(find "$COMMIT_MSG_FILE" -mmin -0.17 2>/dev/null)" ]; then
+        # review-note: shell plumbing below the Python-tested CLAUDE_COMMIT_MSG
+        # contract (see review/test_hook.py::test_build_user_prompt_includes_commit_message_*).
+        # Strip git's helper comments (#) and blank lines before export.
+        CLAUDE_COMMIT_MSG="$(grep -v '^#' "$COMMIT_MSG_FILE" | sed '/^$/d' || true)"
+        export CLAUDE_COMMIT_MSG
+    fi
+fi
+
+# --- Step 3: Run code review (on already-linted code) ---
+REVIEW_SCRIPT="$HOME/.claude/review/hook.py"
 if [ -f "$REVIEW_SCRIPT" ]; then
     python3 -B "$REVIEW_SCRIPT"
 fi

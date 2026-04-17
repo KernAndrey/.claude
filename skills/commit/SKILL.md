@@ -153,24 +153,42 @@ If any `.py` files are in the changeset:
 
 ## Phase 6: Commit
 
-For each logical commit:
+For each logical commit, run these steps **in order, per commit** (not once for the whole phase):
 
-1. Stage specific files: `git add <file1> <file2>` — blanket staging (`-A`, `.`) risks including secrets and binaries.
-2. Write a commit message following **conventional commits** format:
+1. **Stage specific files**: `git add <file1> <file2>` — blanket staging (`-A`, `.`) risks including secrets and binaries.
+2. **Stash-guard the unstaged tail** — critical to avoid pre-commit index corruption (see Phase 8):
+   ```bash
+   git stash push -u -k -m "commit-skill-wip-$(date +%s)"
+   ```
+   - `-u` covers untracked files; `-k` keeps staged files in the working tree so hooks see real content.
+   - If output is `No local changes to save`, remember **stashed=false** and skip step 6. Otherwise **stashed=true**.
+3. **Verify the working tree is clean of unstaged content**: run `git status`. The only section present must be `Changes to be committed:`. If `Changes not staged for commit:` or `Untracked files:` is still there — halt and investigate (something unusual, e.g. a submodule, .gitignore edge case). Do not proceed.
+4. **Write a commit message** following **conventional commits** format:
    - `feat:`, `fix:`, `chore:`, `refactor:`, `docs:`, `test:`, `style:`, `perf:`, `ci:`
    - Short subject line (max 72 chars), imperative mood
    - Body if the change is non-trivial (separated by blank line)
    - Omit Co-Authored-By and AI attribution
    - **Write in English**
-3. Commit using a HEREDOC to pass the message with `run_in_background: true` (the pre-commit AI review hook can take up to 20 minutes, exceeding Bash timeout):
+5. **Commit** using a HEREDOC with `run_in_background: true` (the pre-commit AI review hook can take up to 20 minutes, exceeding Bash timeout):
    ```bash
    git commit -m "$(cat <<'EOF'
    feat: add user authentication flow
    EOF
    )"
    ```
-4. Wait for the background commit to finish. Read the output file to check the result.
-5. Run `git status` after each commit to verify success.
+6. **Wait** for the background commit to finish. Read the output to check the result.
+7. **Restore the stashed tail** if stashed=true (do this whether the commit succeeded or failed — the user's WIP must not be lost):
+   ```bash
+   git stash pop
+   ```
+   If `git stash pop` reports a conflict — halt. Show the user `git status` and `git stash list`, do not start the next commit. The stash ref stays in the list so the user can resolve manually.
+8. **Verify**: `git status` to confirm the commit landed and the WIP was restored.
+
+Repeat steps 1–8 for each subsequent logical commit.
+
+### Why the stash-guard exists
+
+The pre-commit framework has a bug where, when unstaged changes are present at commit time, it generates a binary patch, resets the working tree to HEAD, runs hooks (which can reformat staged files via `ruff-format`), then restores the patch with `git apply --index`. The `--index` flag writes blob hashes from the patch header into `.git/index` without ensuring those blobs are written to `.git/objects/`. Result: the index references missing blobs, and subsequent commits fail with `invalid object … Error building trees`. Keeping the working tree clean of unstaged content at commit time prevents pre-commit from entering its stash/restore path, which is the only way to avoid this corruption reliably.
 
 ## Phase 7: Summary
 
@@ -178,6 +196,20 @@ After all commits are done, show:
 - List of commits created (hash + message)
 - Remaining uncommitted changes (if any)
 - Push only when the user explicitly requests it.
+
+## Phase 8: Troubleshooting — index corruption
+
+If `git commit` reports `invalid object <sha> … Error building trees`, or `git fsck` lists `missing blob` entries, the index has been poisoned by the pre-commit stash/restore bug (see Phase 6 rationale). Recover:
+
+```bash
+git reset                          # reset index to HEAD; working tree untouched, files safe
+git fsck --no-dangling             # expect empty output — index is clean
+rm -f ~/.cache/pre-commit/patch*   # drop stale pre-commit patches; it regenerates as needed
+```
+
+Then re-stage the intended files and run Phase 6 again. The stash-guard there prevents recurrence.
+
+If `git fsck` still reports missing blobs after `git reset`, stop and report to the user — the object DB itself is damaged and needs manual intervention.
 
 ## Reminders
 
@@ -188,3 +220,4 @@ After all commits are done, show:
 - If the diff exceeds 2000 lines, the hook rejects it — split into smaller commits.
 - The AI reviewer `tests` lens blocks any commit with new public behavior and no matching test. Phase 3.5 catches this early — keep code and tests in the same commit.
 - When splitting a large feature, slice by **vertical** (each slice = code + its tests), never by layer (all code → all tests).
+- Before `git commit` the working tree must contain only staged changes. The skill stashes the unstaged tail in Phase 6 — do not skip that step: it is the workaround for a pre-commit framework bug where `git apply --index` writes blob hashes to the index without writing the blobs themselves.

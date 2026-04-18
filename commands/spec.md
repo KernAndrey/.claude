@@ -151,6 +151,7 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 > User Phase 1 answers: {inline — supplementary context}
 > Project root: `{working directory}`
 > Project CLAUDE.md: `{path}`
+> Before writing the Architecture section, produce the three "Deep codebase exploration" artifacts (analogous features ≥2, vendor/base classes read, integration call-sites) from your instructions file, and attach them under "Exploration evidence" in your `SPEC ARCHITECT DONE.` message. Treat vendor code inside the repo as part of the project.
 > Fill the `## Architecture & Implementation Plan` section in place. Signal `SPEC ARCHITECT DONE.` when ready. Escalate ambiguities with `SPEC ARCHITECT QUESTION FOR USER` and wait.
 > Heartbeat: as above.
 

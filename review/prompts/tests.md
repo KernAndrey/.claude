@@ -40,17 +40,6 @@ ceremony, not coverage — skip and move on.
 - Renaming variables / adding type hints / adding docstrings.
 - Adding a `@api.depends` decorator to a previously-bare compute
   method when the compute body is unchanged.
-- Converting `for rec in self: rec.write({...})` with the same value
-  dict to `self.write({...})`. The outer transaction already
-  guarantees all-or-nothing semantics — if any record's constraint
-  raises mid-loop, everything rolls back in both versions. "Mixed-
-  validity batch rollback" tests for this conversion document the
-  behavior but don't catch a regression either version can't satisfy.
-  Exception: flag as new behavior ONLY if the loop body does
-  something beyond the write — explicit `self.env.cr.commit()`,
-  external API calls, `message_post` with per-record side effects,
-  per-record compute helpers like `_calculate_X()` / `_trigger_Y()`.
-  Those cases ARE semantically different and need a test.
 
 <bad_pattern>
 ❌ BAD CALL: flag "missing test for `check_call_ids.is_overdue` dep"
@@ -61,18 +50,6 @@ ceremony, not coverage — skip and move on.
    accidental removal but not real bugs, and they dilute the
    behavioral-test surface. Keep the coverage bar at "can a
    regression bypass existing behavioral tests?"
-
-❌ BAD CALL: demand a "mixed-validity batch rollback" test when a
-   diff converts `for rec: rec.write({'state': 'sent'})` to
-   `self.write({'state': 'sent'})`. Both versions roll back on
-   constraint failure via the outer transaction — behavior is
-   identical from the user's perspective (one click, N records,
-   all-or-nothing).
-✅ CORRECT: note the conversion, verify the loop body is empty
-   besides the `write`, skip. If the loop body had per-record
-   side effects (external calls, `_calculate_next_X()` helpers),
-   the author should not have batched it at all — flag that as
-   a bug, not as a missing test.
 </bad_pattern>
 
 ### What you must do

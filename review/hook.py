@@ -377,10 +377,10 @@ _CRITICAL_LINE_RE = re.compile(
     r"^[ \t]*[-*•]?[ \t]*(?:\[F\d+\]\s*)?\[CRITICAL\]",
     re.MULTILINE | re.IGNORECASE,
 )
-_WARNING_TAG_RE = re.compile(r"\[WARNING\]", re.IGNORECASE)
 # Anchored to line start with optional bullet + optional `[Fn]` id — mirrors
 # `_CRITICAL_LINE_RE` so prose or quoted diff lines that merely mention the
-# `[WARNING]` tag are ignored.
+# `[WARNING]` tag are ignored. Single source of truth for every warning
+# count / gate / surface path in this module.
 _WARNING_LINE_RE = re.compile(
     r"^[ \t]*[-*•]?[ \t]*(?:\[F\d+\]\s*)?\[WARNING\][^\n]*$",
     re.IGNORECASE | re.MULTILINE,
@@ -396,9 +396,8 @@ def extract_warning_lines(review: str) -> list[str]:
     `_CRITICAL_LINE_RE`.
 
     Continuation lines in multi-line warnings are not captured — the
-    tagged line alone is returned. This matches the existing
-    `_WARNING_TAG_RE` counting behavior; a multi-line capture would
-    need to be coordinated across reviewer output formats.
+    tagged line alone is returned. A multi-line capture would need to
+    be coordinated across reviewer output formats.
     """
     return [m.group(0).strip() for m in _WARNING_LINE_RE.finditer(review)]
 
@@ -595,7 +594,7 @@ def _aggregate_lens_outputs(per_lens: list[dict]) -> str:
         else:
             parts.append(f"{header}\n\n_Lens unavailable: {d['error']}_")
     total_c = sum(count_criticals(d.get("review", "")) for d in per_lens if d["status"] == "ok")
-    total_w = sum(len(_WARNING_TAG_RE.findall(d.get("review", ""))) for d in per_lens if d["status"] == "ok")
+    total_w = sum(len(extract_warning_lines(d.get("review", ""))) for d in per_lens if d["status"] == "ok")
     parts.append(f"Summary: {total_c} CRITICAL, {total_w} WARNING across {len(per_lens)} lenses.")
     return "\n\n".join(parts)
 
@@ -1083,10 +1082,10 @@ def _arbitrate_single_call_review(
         arbiter=arbiter,
         diag=f"original review (pre-arbiter):\n{tagged_review}",
     )
-    # On BLOCK return the synthesized display so the developer sees the
-    # arbiter context. On OK return the raw review so main() can surface
-    # [WARNING] lines via _WARNING_TAG_RE — the synthesized display only
-    # carries a warning count, not the lines themselves.
+    # On BLOCK the synthesized display already inlines warning lines via
+    # extract_warning_lines(); on OK return the raw review so main()'s
+    # banner gate (also extract_warning_lines-based) prints the full
+    # reviewer text rather than just counts.
     return (display if verdict == "BLOCK" else review), verdict
 
 
@@ -1190,7 +1189,7 @@ def main() -> None:
             )
             sys.exit(1)
 
-        if _WARNING_TAG_RE.search(review):
+        if extract_warning_lines(review):
             warn(f"Review notes (non-blocking warnings):\n{review}")
         sys.exit(0)
 

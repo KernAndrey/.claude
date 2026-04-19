@@ -841,3 +841,81 @@ def test_extract_warning_lines_accepts_finding_id_prefix() -> None:
     — those must still be captured (mirrors `_CRITICAL_LINE_RE`)."""
     review = "- [F3] [WARNING] foo.py:4 — tagged finding\nSummary: 0 CRITICAL, 1 WARNING across 1 files."
     assert extract_warning_lines(review) == ["- [F3] [WARNING] foo.py:4 — tagged finding"]
+
+
+# ---------------------------------------------------------------------------
+# Warning detection is a single source of truth — every count/gate path
+# must go through extract_warning_lines (no loose substring matches).
+# ---------------------------------------------------------------------------
+
+
+def _invoke_main_on_ok(review_text: str) -> str:
+    """Run hook.main() with a forced OK verdict, return captured stderr.
+
+    Used to exercise the OK-path banner gate that surfaces non-blocking
+    warnings to the developer.
+    """
+    import io
+    import sys
+
+    from hook import main as hook_main
+
+    buf = io.StringIO()
+    with (
+        patch("hook.collect_diff", return_value=("diff-body", "foo.py", False)),
+        patch("hook.run_review", return_value=(review_text, "OK")),
+        patch.object(sys, "stderr", buf),
+    ):
+        try:
+            hook_main()
+        except SystemExit as exc:
+            assert exc.code == 0, f"OK must exit 0, got {exc.code}"
+        else:
+            raise AssertionError("main() should have called sys.exit(0) on OK")
+
+    return buf.getvalue()
+
+
+def test_main_ok_banner_fires_on_real_warning_finding() -> None:
+    review = (
+        "### Section 2 — Findings\n- [WARNING] foo.py:1 — real warning\nSummary: 0 CRITICAL, 1 WARNING across 1 files."
+    )
+    stderr = _invoke_main_on_ok(review)
+    assert "Review notes (non-blocking warnings)" in stderr
+
+
+def test_main_ok_banner_skips_prose_mention_of_warning_tag() -> None:
+    """Regression: prose or reviewer commentary that merely contains the
+    string `[WARNING]` must NOT trigger the non-blocking banner, because
+    the anchored warning regex is now the single source of truth."""
+    review = (
+        "### Section 2 — Findings\n"
+        "The arbiter treats [WARNING] lines as advisory per the prompt.\n"
+        "No findings in this lens.\n"
+        "Summary: 0 CRITICAL, 0 WARNING across 1 files."
+    )
+    stderr = _invoke_main_on_ok(review)
+    assert "Review notes (non-blocking warnings)" not in stderr
+
+
+def test_aggregate_lens_outputs_warning_count_uses_anchored_regex() -> None:
+    """`_aggregate_lens_outputs` must count only finding-shaped warnings,
+    not mid-line mentions, so the aggregate Summary line is consistent
+    with what gets surfaced by `extract_warning_lines()`."""
+    per_lens = [
+        {
+            "name": "bugs",
+            "status": "ok",
+            "review": (
+                "### Section 2 — Bugs findings\n"
+                "- [WARNING] real.py:1 — actual finding\n"
+                "The arbiter treats [WARNING] lines as advisory.\n"
+                "Summary: 0 CRITICAL, 1 WARNING across 1 files."
+            ),
+            "reviewer": "opencode",
+            "error": "",
+        },
+    ]
+    aggregated = _aggregate_lens_outputs(per_lens)
+    # Exactly 1 warning counted, not 2.
+    assert "1 WARNING" in aggregated.splitlines()[-1]

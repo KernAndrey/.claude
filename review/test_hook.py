@@ -14,9 +14,11 @@ from hook import (
     assign_finding_ids,
     build_user_prompt,
     check_diff_size,
-    count_added_lines,
+    count_added_production_lines,
     count_criticals,
     extract_warning_lines,
+    is_production_code,
+    is_test_file,
     is_well_formed,
     parse_arbiter_verdict,
     parse_verdict,
@@ -223,18 +225,136 @@ def test_run_opencode_empty_system_prompt() -> None:
 
 
 # ---------------------------------------------------------------------------
-# count_added_lines / FANOUT_THRESHOLD / LENS_NAMES
+# is_test_file / is_production_code / count_added_production_lines
 # ---------------------------------------------------------------------------
 
 
-def test_count_added_lines_skips_file_header() -> None:
-    diff = "diff --git a/foo b/foo\n+++ b/foo\n+added-1\n+added-2\n-removed\n context\n"
-    assert count_added_lines(diff) == 2
+def test_is_test_file_by_basename() -> None:
+    assert is_test_file("test_foo.py")
+    assert is_test_file("src/app/test_handler.py")
+    assert is_test_file("pkg/foo_test.go")
+    assert is_test_file("src/bar.test.ts")
+    assert is_test_file("src/bar.test.tsx")
+    assert is_test_file("src/baz.spec.js")
+    assert is_test_file("com/Foo/BarTest.java")
+    assert is_test_file("Module/FooTests.cs")
 
 
-def test_count_added_lines_zero_on_no_added() -> None:
-    diff = "diff --git a/foo b/foo\n-removed\n context\n"
-    assert count_added_lines(diff) == 0
+def test_is_test_file_by_path_segment() -> None:
+    assert is_test_file("tests/unit/foo.py")
+    assert is_test_file("test/foo.ts")
+    assert is_test_file("src/__tests__/Button.tsx")
+    assert is_test_file("spec/fixtures/data.py")
+    assert is_test_file("pkg/testing/helpers.go")
+
+
+def test_is_test_file_negative() -> None:
+    assert not is_test_file("src/foo.py")
+    assert not is_test_file("lib/main.ts")
+    assert not is_test_file("pkg/server.go")
+    assert not is_test_file("README.md")
+    # "test" must be a path segment, not a substring of a regular name.
+    assert not is_test_file("src/latest/foo.py")
+    assert not is_test_file("src/contest/bar.py")
+
+
+def test_is_production_code_positive() -> None:
+    assert is_production_code("src/app.py")
+    assert is_production_code("lib/main.ts")
+    assert is_production_code("pkg/server.go")
+
+
+def test_is_production_code_excludes_tests() -> None:
+    assert not is_production_code("tests/test_foo.py")
+    assert not is_production_code("pkg/foo_test.go")
+    assert not is_production_code("src/__tests__/Button.tsx")
+    assert not is_production_code("src/bar.spec.ts")
+
+
+def test_is_production_code_excludes_non_code() -> None:
+    assert not is_production_code("README.md")
+    assert not is_production_code("config.yml")
+    assert not is_production_code("data/fixture.json")
+    assert not is_production_code("Dockerfile")
+
+
+def test_count_added_production_lines_counts_only_prod() -> None:
+    diff = (
+        "diff --git a/src/lib.py b/src/lib.py\n"
+        "--- a/src/lib.py\n"
+        "+++ b/src/lib.py\n"
+        "@@ -1,1 +1,3 @@\n"
+        " ctx\n"
+        "+def new_fn():\n"
+        "+    return 1\n"
+        "diff --git a/tests/test_lib.py b/tests/test_lib.py\n"
+        "--- a/tests/test_lib.py\n"
+        "+++ b/tests/test_lib.py\n"
+        "@@ -1,1 +1,3 @@\n"
+        "+def test_new():\n"
+        "+    assert 1 == 1\n"
+        "+    # pad\n"
+        "diff --git a/README.md b/README.md\n"
+        "--- a/README.md\n"
+        "+++ b/README.md\n"
+        "@@ -1,1 +1,2 @@\n"
+        "+new docs line\n"
+    )
+    assert count_added_production_lines(diff) == 2
+
+
+def test_count_added_production_lines_skips_file_headers() -> None:
+    diff = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n+added-1\n+added-2\n-removed\n context\n"
+    assert count_added_production_lines(diff) == 2
+
+
+def test_count_added_production_lines_handles_rename() -> None:
+    diff = (
+        "diff --git a/old.py b/new.py\n"
+        "similarity index 80%\n"
+        "rename from old.py\n"
+        "rename to new.py\n"
+        "--- a/old.py\n"
+        "+++ b/new.py\n"
+        "+x = 1\n"
+        "+y = 2\n"
+    )
+    assert count_added_production_lines(diff) == 2
+
+
+def test_count_added_production_lines_binary_file_does_not_leak() -> None:
+    diff = (
+        "diff --git a/first.py b/first.py\n"
+        "--- a/first.py\n"
+        "+++ b/first.py\n"
+        "+prod_line = 1\n"
+        "diff --git a/image.png b/image.png\n"
+        "Binary files a/image.png and b/image.png differ\n"
+        "diff --git a/tests/test_x.py b/tests/test_x.py\n"
+        "--- a/tests/test_x.py\n"
+        "+++ b/tests/test_x.py\n"
+        "+assert True\n"
+    )
+    # first.py → 1 prod line; image.png resets state; test_x.py excluded.
+    assert count_added_production_lines(diff) == 1
+
+
+def test_count_added_production_lines_dev_null_deletion() -> None:
+    diff = (
+        "diff --git a/old.py b/old.py\n"
+        "deleted file mode 100644\n"
+        "--- a/old.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        "-removed\n"
+        "-removed\n"
+    )
+    assert count_added_production_lines(diff) == 0
+
+
+def test_count_added_production_lines_zero_on_no_added() -> None:
+    diff = "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n-removed\n context\n"
+    assert count_added_production_lines(diff) == 0
 
 
 def test_fanout_threshold_sane_default() -> None:
@@ -573,6 +693,59 @@ def test_run_review_runs_fanout_on_large_code_diff() -> None:
 
     mock_fanout.assert_called_once()
     mock_single.assert_not_called()
+
+
+def test_run_review_stays_single_call_on_tests_heavy_diff() -> None:
+    """Large tests-only diff with tiny prod change → single-call path.
+
+    Before this change the raw + count would push the commit to
+    fan-out; after it, only added production-code lines gate the
+    decision, so a test-fixture-heavy commit with <150 prod lines
+    stays on the cheap path.
+    """
+    test_added = [f"+    assert_{i} = True" for i in range(FANOUT_THRESHOLD + 50)]
+    prod_added = ["+def tiny():", "+    return 1"]
+    diff = (
+        "diff --git a/tests/test_big.py b/tests/test_big.py\n"
+        "--- a/tests/test_big.py\n"
+        "+++ b/tests/test_big.py\n" + "\n".join(test_added) + "\n"
+        "diff --git a/src/lib.py b/src/lib.py\n"
+        "--- a/src/lib.py\n"
+        "+++ b/src/lib.py\n" + "\n".join(prod_added) + "\n"
+    )
+    files = "tests/test_big.py\nsrc/lib.py"
+    with (
+        patch("hook._run_single_call", return_value=(None, "OK")) as mock_single,
+        patch("hook._run_fanout_with_arbiter") as mock_fanout,
+    ):
+        run_review(diff, files, is_merge=False)
+
+    mock_single.assert_called_once()
+    mock_fanout.assert_not_called()
+
+
+def test_run_review_stays_single_call_on_config_heavy_diff() -> None:
+    """Large config-only diff → single-call path.
+
+    Config/data churn (e.g. vendored yaml, lockfiles) does not
+    count toward FANOUT_THRESHOLD any more; the diff still reaches
+    the ``bugs`` lens but through the cheap single-call path.
+    """
+    config_added = [f"+  key_{i}: value" for i in range(FANOUT_THRESHOLD + 20)]
+    diff = (
+        "diff --git a/deploy/config.yml b/deploy/config.yml\n"
+        "--- a/deploy/config.yml\n"
+        "+++ b/deploy/config.yml\n" + "\n".join(config_added) + "\n"
+    )
+    files = "deploy/config.yml"
+    with (
+        patch("hook._run_single_call", return_value=(None, "OK")) as mock_single,
+        patch("hook._run_fanout_with_arbiter") as mock_fanout,
+    ):
+        run_review(diff, files, is_merge=False)
+
+    mock_single.assert_called_once()
+    mock_fanout.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

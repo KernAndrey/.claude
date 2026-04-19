@@ -180,13 +180,38 @@ def count_changed_lines(diff: str) -> int:
     )
 
 
-def count_added_lines(diff: str) -> int:
-    """Count only added ('+') lines, excluding '+++' file headers.
+_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git ")
+_PLUS_FILE_HEADER_RE = re.compile(r"^\+\+\+ (?:b/)?(.+)$")
 
-    This is the size signal used to route to single-call vs fan-out
-    review: only new code needs LLM attention.
+
+def count_added_production_lines(diff: str) -> int:
+    """Count added ('+') lines that live in production-code files.
+
+    Walks the unified-diff text and tracks the current file via the
+    ``+++ b/<path>`` header. A ``diff --git`` line resets state so
+    binary-file blocks (no ``+++`` header) don't leak classification
+    from the previous file. Lines starting with ``+++`` are headers
+    and never counted.
+
+    Production-code classification matches :func:`is_production_code` —
+    code extensions from ``CODE_EXTS``, excluding test files. Tests,
+    docs, config, and data changes do not drive the fan-out routing
+    decision because they don't benefit from 3-lens review.
     """
-    return sum(1 for line in diff.split("\n") if line.startswith("+") and not line.startswith("+++"))
+    count = 0
+    current_is_prod = False
+    for line in diff.split("\n"):
+        if _DIFF_GIT_HEADER_RE.match(line):
+            current_is_prod = False
+            continue
+        m = _PLUS_FILE_HEADER_RE.match(line)
+        if m:
+            path = m.group(1).strip()
+            current_is_prod = path != "/dev/null" and is_production_code(path)
+            continue
+        if line.startswith("+") and current_is_prod:
+            count += 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +509,43 @@ def _has_code_or_config(files: str) -> bool:
         or _any_file_matches(files, CONFIG_EXTS)
         or _any_filename_matches(files, CONFIG_FILENAMES)
     )
+
+
+# Test-file heuristics — path shapes that carry test code, not production logic.
+_TEST_BASENAME_RE = re.compile(
+    r"""
+    ^test_.+\.(py|rb)$                                   # Python/Ruby: test_foo.py
+    | .+_test\.(py|go|rb)$                                # Go/Python/Ruby: foo_test.go
+    | .+\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|vue|svelte)$ # JS/TS: foo.test.ts, foo.spec.tsx
+    | ^.+Test\.(java|kt|cs|swift)$                        # JVM/CLR/Swift: FooTest.java
+    | ^.+Tests\.(cs|swift)$                               # .NET/Swift: FooTests.cs
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+_TEST_PATH_SEGMENTS: frozenset[str] = frozenset({"tests", "test", "__tests__", "spec", "specs", "testing"})
+
+
+def is_test_file(path: str) -> bool:
+    """True if the path looks like a test file by basename or directory."""
+    p = Path(path)
+    if _TEST_BASENAME_RE.match(p.name):
+        return True
+    return any(seg in _TEST_PATH_SEGMENTS for seg in p.parts[:-1])
+
+
+def is_production_code(path: str) -> bool:
+    """True if the path is executable code and NOT a test file.
+
+    Scope: fan-out SIZING only — used by
+    ``count_added_production_lines`` to gate ``FANOUT_THRESHOLD``.
+    Not reused by ``_has_code`` / ``applicable_lenses`` by design:
+    those answer "should the tests/architecture lens run at all?",
+    and a tests-only commit must still trigger the tests lens.
+    Sizing and lens applicability are different questions.
+    """
+    if is_test_file(path):
+        return False
+    return any(path.endswith(ext) for ext in CODE_EXTS)
 
 
 # Map lens → predicate that answers "is there anything in this diff this
@@ -1138,10 +1200,10 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
         )
         return None, "SKIP"
 
-    added = count_added_lines(diff)
+    added = count_added_production_lines(diff)
     use_fanout = added >= FANOUT_THRESHOLD
     info(
-        f"Reviewing {len(files.splitlines())} file(s), +{added} added line(s), "
+        f"Reviewing {len(files.splitlines())} file(s), +{added} added prod line(s), "
         f"mode={'fan-out+arbiter' if use_fanout else 'single-call'}"
     )
 

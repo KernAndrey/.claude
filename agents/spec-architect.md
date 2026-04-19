@@ -108,7 +108,7 @@ The Work breakdown tells `/implement` how to parallelize Coders. Every spec has 
 - Every file under "Files to create" and "Files to modify" must appear in **exactly one** Coder's files: list — no overlaps, no gaps. The union of all Coder file lists equals the full file map.
 - Stable names: `coder-1`, `coder-2`, … (single-coder tasks use `coder-1`, not `coder`).
 - Do not list Tester — there is always a single Tester spawned by the `/implement` lead. Parallel testers conflict on shared test infrastructure.
-- **Size cap: ~2000 lines of expected diff per Coder.** If your estimate exceeds the cap (rough heuristic: files × typical change size + size of new files), split further into tightly-cohesive sub-scopes. The cap reflects reviewer attention limits and the commit-review hook's hard rejection threshold.
+- **Size cap: ~3000 lines of expected diff per Coder.** If your estimate exceeds the cap (rough heuristic: files × typical change size + size of new files), split further into tightly-cohesive sub-scopes. The cap reflects reviewer attention limits and the commit-review hook's hard rejection threshold.
 
 ## Before signalling DONE
 

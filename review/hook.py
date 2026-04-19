@@ -41,7 +41,7 @@ LENS_DIR = PROMPTS_DIR
 ARBITER_PROMPT_PATH = LENS_DIR / "arbiter.md"
 LOG_DIR = REVIEW_ROOT / "logs"
 
-MAX_DIFF_LINES = 2000
+MAX_DIFF_LINES = 3000
 MIN_LINES_TO_REVIEW = 1
 FANOUT_THRESHOLD = 150  # added-line count above which we fan-out
 TIMEOUT_SECONDS = 1200
@@ -1234,7 +1234,7 @@ def main() -> None:
                 "NOT minimize to just-barely-pass — each hook iteration "
                 'costs ~20 min and reviewer tokens, and "sneaking '
                 "through\" wastes the user's budget. If the combined "
-                "fix would exceed the 2000-line diff limit, split into "
+                "fix would exceed the 3000-line diff limit, split into "
                 "sequential commits — but each commit still lands its "
                 "slice completely, no halfway work."
             )

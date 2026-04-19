@@ -139,7 +139,7 @@ Review all changes and group them into logical commits. A logical commit is a co
 - Wait for the user to confirm or adjust the split before proceeding.
 - Each commit contains one logical change — unrelated changes in one commit make bisect and revert impossible.
 - Keep production code and its tests in the same commit. Splitting into "all code" + "all tests" is forbidden: the first commit hits the `tests` lens with no coverage and gets blocked.
-- If a change exceeds 2000 lines (the hook rejects it wholesale), split by **vertical slice**: each commit = a portion of the feature + its tests.
+- If a change exceeds 3000 lines (the hook rejects it wholesale), split by **vertical slice**: each commit = a portion of the feature + its tests.
   - ✅ Commit 1: `feat(auth): user model + model tests` / Commit 2: `feat(auth): login endpoint + endpoint tests` / Commit 3: `feat(auth): middleware + middleware tests`
   - ❌ Commit 1: all production code / Commit 2: all tests
 - Valid standalone `test:` commits: test refactoring, adding coverage for previously untested existing code, migrating to a new test framework or fixtures.
@@ -217,7 +217,7 @@ If `git fsck` still reports missing blobs after `git reset`, stop and report to 
 - Create new commits rather than amending, unless the user explicitly asks.
 - Use standard push (no `--force`).
 - If a pre-commit hook fails or the AI review BLOCKs the commit, fix the reported issues, re-stage, and create a new commit.
-- If the diff exceeds 2000 lines, the hook rejects it — split into smaller commits.
+- If the diff exceeds 3000 lines, the hook rejects it — split into smaller commits.
 - The AI reviewer `tests` lens blocks any commit with new public behavior and no matching test. Phase 3.5 catches this early — keep code and tests in the same commit.
 - When splitting a large feature, slice by **vertical** (each slice = code + its tests), never by layer (all code → all tests).
 - Before `git commit` the working tree must contain only staged changes. The skill stashes the unstaged tail in Phase 6 — do not skip that step: it is the workaround for a pre-commit framework bug where `git apply --index` writes blob hashes to the index without writing the blobs themselves.

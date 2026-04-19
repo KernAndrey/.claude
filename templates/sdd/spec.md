@@ -279,7 +279,7 @@ Section ownership:
        - Stable names: coder-1, coder-2, … (single-coder tasks use coder-1).
        - Split only when work streams touch different files with no shared
          logic. Tightly coupled work stays with a single Coder.
-       - Size cap: ~2000 lines of expected diff per Coder. Split further if
+       - Size cap: ~3000 lines of expected diff per Coder. Split further if
          estimate exceeds the cap.
        - Do not list Tester — there is always a single Tester spawned by
          the /implement lead. -->

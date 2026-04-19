@@ -34,7 +34,7 @@ Then verify with `ruff check <changed_files>`.
 Before every commit, run the project's test suite — full suite or the subset relevant to changed files — and commit only after tests pass. Skip only when the change touches nothing tests cover (pure docs, CLAUDE.md, unrelated config). Do not delegate regression detection to the review hook or CI — they are backstops, not primary checks.
 Run all pre-commit hooks on every commit — hooks enforce lint and security checks.
 Every commit is AI-reviewed by a pre-commit hook. The review can BLOCK the commit with specific issues. When blocked: fix the reported issues and commit again. Do not skip the hook (`--no-verify`), do not amend — create a new commit.
-If the diff exceeds 2000 lines the hook rejects it outright — split into smaller commits.
+If the diff exceeds 3000 lines the hook rejects it outright — split into smaller commits.
 The review hook can take up to 20 minutes — always run `git commit` with `run_in_background: true` to avoid timeout.
 If ruff reports unfixable errors, fix them manually before proceeding.
 Verify type annotations with `ruff check --select ANN <changed_files>`.

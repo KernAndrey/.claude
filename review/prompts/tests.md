@@ -40,6 +40,16 @@ ceremony, not coverage — skip and move on.
 - Renaming variables / adding type hints / adding docstrings.
 - Adding a `@api.depends` decorator to a previously-bare compute
   method when the compute body is unchanged.
+- Unconditional literal assignments (`"subtitle": "Tracking"`). No
+  branching → only a manual rename can regress it. Metadata, not
+  behavior.
+- Defensive branches guarded by a declared model-layer invariant
+  (`required=True`, `@api.constrains`, NOT NULL). The guarded arm is
+  unreachable. Cite the invariant `file:line`, verify with `Read`,
+  then surface via architecture lens, not tests.
+- Sibling absence under one guard. `if X:` suppressing N fields is
+  one behavioral unit — emit one finding on the guard, not N on
+  each leaf.
 
 <bad_pattern>
 ❌ BAD CALL: flag "missing test for `check_call_ids.is_overdue` dep"
@@ -50,6 +60,15 @@ ceremony, not coverage — skip and move on.
    accidental removal but not real bugs, and they dilute the
    behavioral-test surface. Keep the coverage bar at "can a
    regression bypass existing behavioral tests?"
+</bad_pattern>
+
+<bad_pattern>
+❌ BAD CALL: flag `if customer_name:` uncovered when `customer` is
+   `required=True` (cite `models/shipment.py:206`) and `customer.name`
+   is `required=True`. The guarded arm is dead on the public path.
+✅ CORRECT: skip. Emit architecture-lens finding to delete the branch.
+   Pinning a test on dead code only triggers architecture to ask for
+   its removal on the next pass.
 </bad_pattern>
 
 ### What you must do
@@ -84,7 +103,12 @@ Return `clean` without a finding only in these cases:
 - The change is declarative-only (see "What does NOT count as new
   behavior" above). Metadata keyword arguments, `@api.depends` path
   expansion, `_()` translation wrappers, class-level declarative
-  attributes — none require a same-diff test.
+  attributes, unconditional literals, sibling absence under one
+  guard — none require a same-diff test.
+- The branch is guarded by a declared model-layer invariant
+  (`required=True`, `@api.constrains`, NOT NULL). Cite the invariant
+  `file:line`, verify with `Read`. Report as architecture-lens
+  finding, not tests.
 - The file is a test file. Tests do not test tests.
 - The unit is a private `_prefixed` helper with no new public entry
   point in the diff. Coverage is indirect through the public caller —

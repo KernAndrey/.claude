@@ -16,6 +16,7 @@ from hook import (
     check_diff_size,
     count_added_lines,
     count_criticals,
+    extract_warning_lines,
     is_well_formed,
     parse_arbiter_verdict,
     parse_verdict,
@@ -425,6 +426,39 @@ def test_render_fanout_output_no_findings_shows_none() -> None:
     assert "Summary: 0 UPHELD, 0 OVERTURN" in rendered
 
 
+def test_render_fanout_output_inlines_warning_lines_from_lenses() -> None:
+    """Regression: warnings from lens reviews must appear verbatim in the
+    BLOCK-path display so the fix-in-one-pass directive can reference
+    them without pointing to an external log file."""
+    per_lens = [
+        {
+            "name": "architecture",
+            "status": "ok",
+            "review": (
+                "### Section 2 — Architecture findings\n"
+                "- [WARNING] `foo.py:10` — `def frob()` — duplicates helper in bar.py\n"
+                "- [WARNING] `foo.py:22` — `class X` — circular import risk\n"
+                "Summary: 0 CRITICAL, 2 WARNING across 1 files."
+            ),
+            "reviewer": "opencode",
+            "error": "",
+        },
+    ]
+    findings = [{"id": "F1", "line": "- [F1] [CRITICAL] foo.py:5 — bug"}]
+    arbiter = {
+        "status": "ok",
+        "upheld_ids": {"F1"},
+        "raw": "[UPHELD] F1 — confirmed.\nSummary: 1 UPHELD, 0 OVERTURN.",
+        "error": "",
+    }
+    rendered = _render_fanout_output(per_lens, findings, {"F1"}, arbiter)
+
+    assert "duplicates helper in bar.py" in rendered
+    assert "circular import risk" in rendered
+    assert "Warnings: 2" in rendered
+    assert "2 WARNING" in rendered  # summary line still accurate
+
+
 # ---------------------------------------------------------------------------
 # Lens router — applicable_lenses
 # ---------------------------------------------------------------------------
@@ -628,6 +662,39 @@ def test_arbitrate_returns_synthesized_display_on_block() -> None:
     assert "[F1] [CRITICAL] foo.py:10" in display
 
 
+def test_arbitrate_block_display_inlines_warning_lines() -> None:
+    """Regression: the single-call BLOCK display must render each
+    `[WARNING]` line verbatim (not just the count), so the fix-in-one-
+    pass directive's "address every [WARNING] above" is actually
+    actionable without opening the log file."""
+    from hook import _arbitrate_single_call_review
+
+    review = (
+        "### Section 1 — File audit\n"
+        "- foo.py — REVIEWED\n"
+        "### Section 2 — Findings\n"
+        "- [CRITICAL] foo.py:10 — `eval(x)` — RCE.\n"
+        "- [WARNING] foo.py:12 — `helper()` — duplicated in bar.py.\n"
+        "- [WARNING] foo.py:30 — stale comment.\n"
+        "Summary: 1 CRITICAL, 2 WARNING across 1 files."
+    )
+    with patch("hook.run_arbiter", return_value=_mock_arbiter(upheld_ids={"F1"})), patch("hook.save_log"):
+        display, verdict = _arbitrate_single_call_review(
+            review=review,
+            reviewer="opencode",
+            diff="diff --git a/foo.py b/foo.py\n+eval(x)\n",
+            files="foo.py",
+        )
+
+    assert verdict == "BLOCK"
+    assert "duplicated in bar.py" in display
+    assert "stale comment" in display
+    assert "Warnings: 2" in display
+    assert "2 WARNING" in display  # summary line accurate
+    # Old "(see log for detail)" placeholder must not appear
+    assert "(see log for detail)" not in display
+
+
 def test_arbitrate_skips_arbiter_when_zero_criticals() -> None:
     """No criticals → no arbiter call → raw review returned with OK."""
     from hook import _arbitrate_single_call_review
@@ -727,3 +794,30 @@ def test_main_block_renders_review_summary() -> None:
 
     assert "Review BLOCKED this commit" in stderr
     assert "foo.py:7" in stderr
+
+
+# ---------------------------------------------------------------------------
+# extract_warning_lines — surface [WARNING] detail to stderr, not just count
+# ---------------------------------------------------------------------------
+
+
+def test_extract_warning_lines_returns_full_line_text() -> None:
+    review = (
+        "- [CRITICAL] a.py:1 — bug\n"
+        "- [WARNING] b.py:2 — `foo` — duplicated helper\n"
+        "  - [WARNING] c.py:9 — stale TODO\n"
+        "Summary: 1 CRITICAL, 2 WARNING across 1 files."
+    )
+    lines = extract_warning_lines(review)
+    assert len(lines) == 2
+    assert any("b.py:2" in ln and "duplicated helper" in ln for ln in lines)
+    assert any("c.py:9" in ln and "stale TODO" in ln for ln in lines)
+
+
+def test_extract_warning_lines_empty_when_none() -> None:
+    assert extract_warning_lines("") == []
+    assert extract_warning_lines("- [CRITICAL] only\nSummary: 1 CRITICAL.") == []
+
+
+def test_extract_warning_lines_case_insensitive() -> None:
+    assert extract_warning_lines("- [warning] lower-case tag") == ["- [warning] lower-case tag"]

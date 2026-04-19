@@ -378,6 +378,18 @@ _CRITICAL_LINE_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 _WARNING_TAG_RE = re.compile(r"\[WARNING\]", re.IGNORECASE)
+_WARNING_LINE_RE = re.compile(r"^[^\n]*\[WARNING\][^\n]*$", re.IGNORECASE | re.MULTILINE)
+
+
+def extract_warning_lines(review: str) -> list[str]:
+    """Return every line containing a `[WARNING]` tag, stripped.
+
+    Used to surface warnings in BLOCK-path output so the developer can
+    act on them without opening the log file.
+    """
+    return [m.group(0).strip() for m in _WARNING_LINE_RE.finditer(review)]
+
+
 _SUMMARY_LINE_RE = re.compile(r"^[ \t]*Summary:\s", re.IGNORECASE)
 _SECTION_1_MARKER = re.compile(r"(?im)^#{1,6}\s*Section\s*1\b")
 _SECTION_2_MARKER = re.compile(r"(?im)^#{1,6}\s*Section\s*2\b")
@@ -759,7 +771,7 @@ def _render_with_arbiter(
     findings: list[dict],
     upheld_ids: set[str],
     arbiter: dict,
-    warning_count: int,
+    warning_lines: list[str],
     denominator_label: str,
     unavailable_label: str = "",
 ) -> str:
@@ -768,9 +780,13 @@ def _render_with_arbiter(
     ``denominator_label`` describes the producer side ("7 lenses",
     "1 reviewer"). ``unavailable_label`` is an optional comma-separated
     list of failed/skipped producers (used by fan-out only).
+    ``warning_lines`` are the raw `[WARNING]` finding lines from the
+    reviewer output; they are rendered verbatim so the developer can
+    act on every warning without opening the log file.
     """
     upheld = [f for f in findings if f["id"] in upheld_ids]
     overturned = [f for f in findings if f["id"] not in upheld_ids]
+    warning_count = len(warning_lines)
 
     sections: list[str] = ["## Review summary\n"]
     if upheld:
@@ -794,8 +810,9 @@ def _render_with_arbiter(
             if reason:
                 sections.append(f"    arbiter: {reason}")
 
-    if warning_count:
-        sections.append(f"\n### Warnings: {warning_count} (see log for detail)")
+    if warning_lines:
+        sections.append(f"\n### Warnings: {warning_count} (advisory — fix-in-one-pass per BLOCK directive)")
+        sections.extend(warning_lines)
     if unavailable_label:
         sections.append(f"\n### Producers unavailable: {unavailable_label}")
 
@@ -813,13 +830,16 @@ def _render_fanout_output(
     arbiter: dict,
 ) -> str:
     """Compact summary for fan-out path. Wraps _render_with_arbiter."""
-    warning_count = sum(len(_WARNING_TAG_RE.findall(d.get("review", ""))) for d in per_lens if d["status"] == "ok")
+    warning_lines: list[str] = []
+    for d in per_lens:
+        if d["status"] == "ok":
+            warning_lines.extend(extract_warning_lines(d.get("review", "")))
     unavailable = [d["name"] for d in per_lens if d["status"] != "ok"]
     return _render_with_arbiter(
         findings,
         upheld_ids,
         arbiter,
-        warning_count=warning_count,
+        warning_lines=warning_lines,
         denominator_label=f"{len(per_lens)} lenses",
         unavailable_label=", ".join(unavailable),
     )
@@ -1033,12 +1053,11 @@ def _arbitrate_single_call_review(
     tagged_review, findings = assign_finding_ids(review)
     arbiter = run_arbiter(diff, findings)
     upheld_ids = arbiter["upheld_ids"]
-    warning_count = len(_WARNING_TAG_RE.findall(review))
     display = _render_with_arbiter(
         findings,
         upheld_ids,
         arbiter,
-        warning_count=warning_count,
+        warning_lines=extract_warning_lines(review),
         denominator_label=f"1 reviewer ({reviewer})",
     )
     verdict = "BLOCK" if upheld_ids else "OK"

@@ -821,3 +821,23 @@ def test_extract_warning_lines_empty_when_none() -> None:
 
 def test_extract_warning_lines_case_insensitive() -> None:
     assert extract_warning_lines("- [warning] lower-case tag") == ["- [warning] lower-case tag"]
+
+
+def test_extract_warning_lines_ignores_mid_line_mention() -> None:
+    """Prose or quoted diff text containing `[WARNING]` must not be
+    mistaken for a finding line — only bullet/id-anchored lines count."""
+    review = (
+        "The arbiter treats [WARNING] lines as advisory.\n"
+        "+    # [WARNING] legacy comment in diff\n"
+        "- [WARNING] real.py:1 — actual finding\n"
+        "Summary: 0 CRITICAL, 1 WARNING across 1 files."
+    )
+    lines = extract_warning_lines(review)
+    assert lines == ["- [WARNING] real.py:1 — actual finding"]
+
+
+def test_extract_warning_lines_accepts_finding_id_prefix() -> None:
+    """Arbiter-tagged findings use a `[Fn]` prefix before `[WARNING]`
+    — those must still be captured (mirrors `_CRITICAL_LINE_RE`)."""
+    review = "- [F3] [WARNING] foo.py:4 — tagged finding\nSummary: 0 CRITICAL, 1 WARNING across 1 files."
+    assert extract_warning_lines(review) == ["- [F3] [WARNING] foo.py:4 — tagged finding"]

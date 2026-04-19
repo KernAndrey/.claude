@@ -378,14 +378,27 @@ _CRITICAL_LINE_RE = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 _WARNING_TAG_RE = re.compile(r"\[WARNING\]", re.IGNORECASE)
-_WARNING_LINE_RE = re.compile(r"^[^\n]*\[WARNING\][^\n]*$", re.IGNORECASE | re.MULTILINE)
+# Anchored to line start with optional bullet + optional `[Fn]` id — mirrors
+# `_CRITICAL_LINE_RE` so prose or quoted diff lines that merely mention the
+# `[WARNING]` tag are ignored.
+_WARNING_LINE_RE = re.compile(
+    r"^[ \t]*[-*•]?[ \t]*(?:\[F\d+\]\s*)?\[WARNING\][^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def extract_warning_lines(review: str) -> list[str]:
-    """Return every line containing a `[WARNING]` tag, stripped.
+    """Return every finding-shaped `[WARNING]` line, stripped.
 
-    Used to surface warnings in BLOCK-path output so the developer can
-    act on them without opening the log file.
+    Matches only at the start of a line (optional bullet + optional
+    `[Fn]` id + `[WARNING]` tag), so reviewer prose or quoted diff
+    text containing the tag is not surfaced. Mirrors the anchoring of
+    `_CRITICAL_LINE_RE`.
+
+    Continuation lines in multi-line warnings are not captured — the
+    tagged line alone is returned. This matches the existing
+    `_WARNING_TAG_RE` counting behavior; a multi-line capture would
+    need to be coordinated across reviewer output formats.
     """
     return [m.group(0).strip() for m in _WARNING_LINE_RE.finditer(review)]
 

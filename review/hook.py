@@ -56,32 +56,63 @@ LENS_NAMES = (
 
 # Extensions that carry executable logic. Used by the lens router to skip
 # lenses that have nothing to examine on a docs/config/spec-only diff.
-CODE_EXTS: frozenset[str] = frozenset({
-    # Python
-    ".py",
-    # JS/TS family (comprehensive)
-    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
-    # Other typed / compiled languages
-    ".go", ".rs", ".java", ".kt", ".swift",
-    ".rb", ".php", ".cs",
-    # Shell
-    ".sh", ".bash",
-})
+CODE_EXTS: frozenset[str] = frozenset(
+    {
+        # Python
+        ".py",
+        # JS/TS family (comprehensive)
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".vue",
+        ".svelte",
+        # Other typed / compiled languages
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".swift",
+        ".rb",
+        ".php",
+        ".cs",
+        # Shell
+        ".sh",
+        ".bash",
+    }
+)
 
 # Config / infra files with runtime effect. Only the `bugs` lens cares
 # about these (for config-surprise detection). Docs / pure data files
 # are not included and trigger a full review skip when they are the
 # only changes.
-CONFIG_EXTS: frozenset[str] = frozenset({
-    ".yml", ".yaml", ".toml", ".ini", ".env", ".conf", ".cfg",
-    ".tf", ".tfvars",
-    ".json",  # package.json, tsconfig, etc
-})
-CONFIG_FILENAMES: frozenset[str] = frozenset({
-    "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
-    "docker-compose.dev.yml", "docker-compose.prod.yml",
-    "Makefile", "Procfile",
-})
+CONFIG_EXTS: frozenset[str] = frozenset(
+    {
+        ".yml",
+        ".yaml",
+        ".toml",
+        ".ini",
+        ".env",
+        ".conf",
+        ".cfg",
+        ".tf",
+        ".tfvars",
+        ".json",  # package.json, tsconfig, etc
+    }
+)
+CONFIG_FILENAMES: frozenset[str] = frozenset(
+    {
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.dev.yml",
+        "docker-compose.prod.yml",
+        "Makefile",
+        "Procfile",
+    }
+)
 
 
 def warn(msg: str) -> None:
@@ -108,11 +139,13 @@ def read_file(path: Path | str) -> str:
 # Git helpers
 # ---------------------------------------------------------------------------
 
+
 def get_staged_diff() -> tuple[str, str]:
     """Get the staged diff. Returns (diff_text, error_msg)."""
     result = subprocess.run(
         ["git", "diff", "--cached"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         return "", f"git diff --cached failed (rc={result.returncode}): {result.stderr.strip()}"
@@ -122,7 +155,8 @@ def get_staged_diff() -> tuple[str, str]:
 def get_staged_files() -> str:
     result = subprocess.run(
         ["git", "diff", "--cached", "--name-only"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     return result.stdout.strip()
 
@@ -130,7 +164,8 @@ def get_staged_files() -> str:
 def get_git_status() -> str:
     result = subprocess.run(
         ["git", "status", "--porcelain"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     return result.stdout.strip() if result.returncode == 0 else "(git status failed)"
 
@@ -151,16 +186,13 @@ def count_added_lines(diff: str) -> int:
     This is the size signal used to route to single-call vs fan-out
     review: only new code needs LLM attention.
     """
-    return sum(
-        1
-        for line in diff.split("\n")
-        if line.startswith("+") and not line.startswith("+++")
-    )
+    return sum(1 for line in diff.split("\n") if line.startswith("+") and not line.startswith("+++"))
 
 
 # ---------------------------------------------------------------------------
 # Diff processing
 # ---------------------------------------------------------------------------
+
 
 def check_diff_size(diff: str) -> str | None:
     """Return an error message if the diff exceeds MAX_DIFF_LINES, else None."""
@@ -176,6 +208,7 @@ def check_diff_size(diff: str) -> str | None:
 # ---------------------------------------------------------------------------
 # Prompt building — single-call path
 # ---------------------------------------------------------------------------
+
 
 def build_system_prompt() -> str:
     """Assemble system prompt: global combined.md + optional project-local rules."""
@@ -238,6 +271,7 @@ def build_user_prompt(diff: str, files: str, is_merge: bool) -> str:
 # Prompt building — fan-out path
 # ---------------------------------------------------------------------------
 
+
 def build_lens_system_prompt(lens_name: str) -> str:
     """Assemble lens prompt = common preamble + lens-specific body."""
     common = read_file(LENS_DIR / "common.md")
@@ -250,6 +284,7 @@ def build_lens_system_prompt(lens_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Review runners
 # ---------------------------------------------------------------------------
+
 
 def _parse_opencode_json(raw: str) -> str:
     """Extract text content from opencode --format json output."""
@@ -283,8 +318,10 @@ def run_opencode(
         "opencode",
         "run",
         "--pure",
-        "--model", "github-copilot/gpt-5.4",
-        "--format", "json",
+        "--model",
+        "github-copilot/gpt-5.4",
+        "--format",
+        "json",
         full_prompt,
     ]
 
@@ -309,10 +346,13 @@ def run_claude(
     cmd = [
         "claude",
         "-p",
-        "--model", model,
+        "--model",
+        model,
         "--no-session-persistence",
-        "--tools", "Read,Grep,Glob",
-        "--output-format", "text",
+        "--tools",
+        "Read,Grep,Glob",
+        "--output-format",
+        "text",
     ]
 
     if system_prompt:
@@ -387,6 +427,7 @@ def parse_verdict(review: str) -> str:
 # Fan-out — lens router
 # ---------------------------------------------------------------------------
 
+
 def _iter_files(files: str) -> list[str]:
     """Split the staged-files string into non-empty path entries."""
     return [f.strip() for f in files.split("\n") if f.strip()]
@@ -430,9 +471,9 @@ def _has_code_or_config(files: str) -> bool:
 # If no lens is applicable (docs-only diff), run_review skips the entire
 # review without any LLM calls.
 LENS_APPLICABILITY: dict[str, callable] = {
-    "bugs":         _has_code_or_config,
+    "bugs": _has_code_or_config,
     "architecture": _has_code,
-    "tests":        _has_code,
+    "tests": _has_code,
 }
 
 
@@ -444,6 +485,7 @@ def applicable_lenses(files: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Fan-out
 # ---------------------------------------------------------------------------
+
 
 def run_single_lens(
     lens_name: str,
@@ -472,8 +514,13 @@ def run_single_lens(
     try:
         review, stderr, rc = run_opencode(system_prompt, user_prompt)
     except subprocess.TimeoutExpired:
-        return {"name": lens_name, "status": "timeout",
-                "review": "", "error": "opencode timeout", "reviewer": "opencode"}
+        return {
+            "name": lens_name,
+            "status": "timeout",
+            "review": "",
+            "error": "opencode timeout",
+            "reviewer": "opencode",
+        }
     except (FileNotFoundError, OSError) as exc:
         stderr = str(exc)
         rc = -1
@@ -484,20 +531,31 @@ def run_single_lens(
             review, stderr, rc = run_claude(system_prompt, user_prompt)
             reviewer = "claude"
         except subprocess.TimeoutExpired:
-            return {"name": lens_name, "status": "timeout",
-                    "review": "", "error": "claude fallback timeout",
-                    "reviewer": "claude"}
+            return {
+                "name": lens_name,
+                "status": "timeout",
+                "review": "",
+                "error": "claude fallback timeout",
+                "reviewer": "claude",
+            }
         except (FileNotFoundError, OSError) as exc:
-            return {"name": lens_name, "status": "error",
-                    "review": "", "error": f"both runners unavailable: {exc}",
-                    "reviewer": None}
+            return {
+                "name": lens_name,
+                "status": "error",
+                "review": "",
+                "error": f"both runners unavailable: {exc}",
+                "reviewer": None,
+            }
         if rc != 0 or not review or not review.strip():
-            return {"name": lens_name, "status": "error",
-                    "review": review, "error": f"rc={rc} stderr={stderr}",
-                    "reviewer": reviewer}
+            return {
+                "name": lens_name,
+                "status": "error",
+                "review": review,
+                "error": f"rc={rc} stderr={stderr}",
+                "reviewer": reviewer,
+            }
 
-    return {"name": lens_name, "status": "ok", "review": review,
-            "error": "", "reviewer": reviewer}
+    return {"name": lens_name, "status": "ok", "review": review, "error": "", "reviewer": reviewer}
 
 
 def _aggregate_lens_outputs(per_lens: list[dict]) -> str:
@@ -512,11 +570,7 @@ def _aggregate_lens_outputs(per_lens: list[dict]) -> str:
         else:
             parts.append(f"{header}\n\n_Lens unavailable: {d['error']}_")
     total_c = sum(count_criticals(d.get("review", "")) for d in per_lens if d["status"] == "ok")
-    total_w = sum(
-        len(_WARNING_TAG_RE.findall(d.get("review", "")))
-        for d in per_lens
-        if d["status"] == "ok"
-    )
+    total_w = sum(len(_WARNING_TAG_RE.findall(d.get("review", ""))) for d in per_lens if d["status"] == "ok")
     parts.append(f"Summary: {total_c} CRITICAL, {total_w} WARNING across {len(per_lens)} lenses.")
     return "\n\n".join(parts)
 
@@ -545,36 +599,31 @@ def run_fanout(diff: str, files: str, is_merge: bool) -> tuple[str, list[dict]]:
     ]
 
     if skipped:
-        info(
-            f"Fan-out: skipping {len(skipped)} lens(es) "
-            f"({', '.join(skipped)}) — no applicable files."
-        )
+        info(f"Fan-out: skipping {len(skipped)} lens(es) ({', '.join(skipped)}) — no applicable files.")
     info(f"Fan-out: launching {len(applicable)} lens review(s) in parallel...")
 
     if applicable:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(applicable)) as ex:
-            futures = {
-                ex.submit(run_single_lens, name, diff, files, is_merge): name
-                for name in applicable
-            }
+            futures = {ex.submit(run_single_lens, name, diff, files, is_merge): name for name in applicable}
             for fut in concurrent.futures.as_completed(futures):
                 name = futures[fut]
                 try:
                     per_lens.append(fut.result())
                 except Exception as exc:
-                    per_lens.append({
-                        "name": name,
-                        "status": "error",
-                        "review": "",
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "reviewer": None,
-                    })
+                    per_lens.append(
+                        {
+                            "name": name,
+                            "status": "error",
+                            "review": "",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "reviewer": None,
+                        }
+                    )
 
     per_lens.sort(key=lambda d: LENS_NAMES.index(d["name"]))
     ok_count = sum(1 for d in per_lens if d["status"] == "ok")
     info(
-        f"Fan-out complete: {ok_count}/{len(applicable)} lens(es) returned "
-        f"findings ({len(skipped)} skipped by router)."
+        f"Fan-out complete: {ok_count}/{len(applicable)} lens(es) returned findings ({len(skipped)} skipped by router)."
     )
 
     aggregated = _aggregate_lens_outputs(per_lens)
@@ -661,47 +710,44 @@ def run_arbiter(
     """
     all_ids = [f["id"] for f in findings]
     if not findings:
-        return {"status": "skipped", "upheld_ids": set(),
-                "raw": "", "error": "no criticals to arbitrate"}
+        return {"status": "skipped", "upheld_ids": set(), "raw": "", "error": "no criticals to arbitrate"}
 
     system_prompt = read_file(ARBITER_PROMPT_PATH)
     if not system_prompt:
         warn(f"Arbiter prompt {ARBITER_PROMPT_PATH} missing — upholding all findings")
-        return {"status": "unavailable", "upheld_ids": set(all_ids),
-                "raw": "", "error": f"{ARBITER_PROMPT_PATH} not found"}
+        return {
+            "status": "unavailable",
+            "upheld_ids": set(all_ids),
+            "raw": "",
+            "error": f"{ARBITER_PROMPT_PATH} not found",
+        }
 
     user_prompt = (
         "## Full staged diff\n\n"
         "```diff\n" + diff + "\n```\n\n"
-        "## Findings to arbitrate (in order):\n\n"
-        + "\n".join(f["line"] for f in findings)
-        + "\n\n"
+        "## Findings to arbitrate (in order):\n\n" + "\n".join(f["line"] for f in findings) + "\n\n"
         "Output one `[UPHELD]` or `[OVERTURN]` line per finding above, "
         "in the same order, then the `Summary:` line. No other content."
     )
 
-    info(
-        f"Arbiter: analyzing {len(findings)} finding(s) with Claude "
-        f"{ARBITER_MODEL} (may take 30-120s)..."
-    )
+    info(f"Arbiter: analyzing {len(findings)} finding(s) with Claude {ARBITER_MODEL} (may take 30-120s)...")
     try:
         raw, stderr, rc = run_claude(
-            system_prompt, user_prompt,
-            model=ARBITER_MODEL, timeout=ARBITER_TIMEOUT_SECONDS,
+            system_prompt,
+            user_prompt,
+            model=ARBITER_MODEL,
+            timeout=ARBITER_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
         warn(f"Arbiter timed out after {ARBITER_TIMEOUT_SECONDS}s — upholding all findings")
-        return {"status": "unavailable", "upheld_ids": set(all_ids),
-                "raw": "", "error": "timeout"}
+        return {"status": "unavailable", "upheld_ids": set(all_ids), "raw": "", "error": "timeout"}
     except (FileNotFoundError, OSError) as exc:
         warn(f"Arbiter unreachable ({exc}) — upholding all findings")
-        return {"status": "unavailable", "upheld_ids": set(all_ids),
-                "raw": "", "error": f"unreachable: {exc}"}
+        return {"status": "unavailable", "upheld_ids": set(all_ids), "raw": "", "error": f"unreachable: {exc}"}
 
     if rc != 0 or not raw or not raw.strip():
         warn(f"Arbiter failed (rc={rc}) — upholding all findings")
-        return {"status": "unavailable", "upheld_ids": set(all_ids),
-                "raw": raw, "error": f"rc={rc} stderr={stderr}"}
+        return {"status": "unavailable", "upheld_ids": set(all_ids), "raw": raw, "error": f"rc={rc} stderr={stderr}"}
 
     upheld = parse_arbiter_verdict(raw, all_ids)
     overturned = len(all_ids) - len(upheld)
@@ -767,13 +813,12 @@ def _render_fanout_output(
     arbiter: dict,
 ) -> str:
     """Compact summary for fan-out path. Wraps _render_with_arbiter."""
-    warning_count = sum(
-        len(_WARNING_TAG_RE.findall(d.get("review", "")))
-        for d in per_lens if d["status"] == "ok"
-    )
+    warning_count = sum(len(_WARNING_TAG_RE.findall(d.get("review", ""))) for d in per_lens if d["status"] == "ok")
     unavailable = [d["name"] for d in per_lens if d["status"] != "ok"]
     return _render_with_arbiter(
-        findings, upheld_ids, arbiter,
+        findings,
+        upheld_ids,
+        arbiter,
         warning_count=warning_count,
         denominator_label=f"{len(per_lens)} lenses",
         unavailable_label=", ".join(unavailable),
@@ -783,6 +828,7 @@ def _render_fanout_output(
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+
 
 def _format_per_lens(per_lens: list[dict]) -> str:
     parts: list[str] = ["## Per-lens detail\n"]
@@ -797,9 +843,7 @@ def _format_per_lens(per_lens: list[dict]) -> str:
 
 
 def _format_arbiter(arbiter: dict) -> str:
-    parts: list[str] = [
-        f"## Arbiter ({ARBITER_MODEL}) — status: {arbiter.get('status', 'n/a')}\n"
-    ]
+    parts: list[str] = [f"## Arbiter ({ARBITER_MODEL}) — status: {arbiter.get('status', 'n/a')}\n"]
     if arbiter.get("error"):
         parts.append(f"_Error:_ {arbiter['error']}\n")
     upheld = arbiter.get("upheld_ids") or set()
@@ -859,6 +903,7 @@ def save_log(
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
+
 
 def collect_diff() -> tuple[str, str, bool] | None:
     """Collect staged diff and metadata. Returns (diff, files, is_merge) or None."""
@@ -933,7 +978,8 @@ def _run_single_call(
 
     try:
         review, reviewer_stderr, reviewer, returncode = _call_single_reviewer(
-            system_prompt, user_prompt,
+            system_prompt,
+            user_prompt,
         )
     except subprocess.TimeoutExpired:
         warn(f"Review timed out after {TIMEOUT_SECONDS}s — allowing commit")
@@ -952,8 +998,9 @@ def _run_single_call(
 
     if not review or not review.strip():
         warn(f"{reviewer} returned empty output — allowing commit")
-        save_log("EMPTY", files=files, diff=diff, reviewer=reviewer,
-                 error_msg=f"empty output. stderr: {reviewer_stderr}")
+        save_log(
+            "EMPTY", files=files, diff=diff, reviewer=reviewer, error_msg=f"empty output. stderr: {reviewer_stderr}"
+        )
         return None, "EMPTY"
 
     return _arbitrate_single_call_review(review, reviewer, diff, files)
@@ -988,14 +1035,22 @@ def _arbitrate_single_call_review(
     upheld_ids = arbiter["upheld_ids"]
     warning_count = len(_WARNING_TAG_RE.findall(review))
     display = _render_with_arbiter(
-        findings, upheld_ids, arbiter,
+        findings,
+        upheld_ids,
+        arbiter,
         warning_count=warning_count,
         denominator_label=f"1 reviewer ({reviewer})",
     )
     verdict = "BLOCK" if upheld_ids else "OK"
-    save_log(verdict, files=files, diff=diff, review=display,
-             reviewer=f"{reviewer}+arbiter", arbiter=arbiter,
-             diag=f"original review (pre-arbiter):\n{tagged_review}")
+    save_log(
+        verdict,
+        files=files,
+        diff=diff,
+        review=display,
+        reviewer=f"{reviewer}+arbiter",
+        arbiter=arbiter,
+        diag=f"original review (pre-arbiter):\n{tagged_review}",
+    )
     # On BLOCK return the synthesized display so the developer sees the
     # arbiter context. On OK return the raw review so main() can surface
     # [WARNING] lines via _WARNING_TAG_RE — the synthesized display only
@@ -1014,17 +1069,16 @@ def _run_fanout_with_arbiter(
     ok_lenses = [d for d in per_lens if d["status"] == "ok"]
     if not ok_lenses:
         warn("All fan-out lenses failed — allowing commit")
-        save_log("EMPTY", files=files, diff=diff,
-                 reviewer="fan-out", per_lens=per_lens,
-                 error_msg="all lenses unavailable")
+        save_log(
+            "EMPTY", files=files, diff=diff, reviewer="fan-out", per_lens=per_lens, error_msg="all lenses unavailable"
+        )
         return None, "EMPTY"
 
     tagged_aggregated, findings = assign_finding_ids(aggregated)
 
     if not findings:
         display = tagged_aggregated
-        save_log("OK", files=files, diff=diff, review=display,
-                 reviewer="fan-out", per_lens=per_lens)
+        save_log("OK", files=files, diff=diff, review=display, reviewer="fan-out", per_lens=per_lens)
         return display, "OK"
 
     arbiter = run_arbiter(diff, findings)
@@ -1032,9 +1086,9 @@ def _run_fanout_with_arbiter(
     display = _render_fanout_output(per_lens, findings, upheld_ids, arbiter)
     verdict = "BLOCK" if upheld_ids else "OK"
 
-    save_log(verdict, files=files, diff=diff, review=display,
-             reviewer="fan-out+arbiter",
-             per_lens=per_lens, arbiter=arbiter)
+    save_log(
+        verdict, files=files, diff=diff, review=display, reviewer="fan-out+arbiter", per_lens=per_lens, arbiter=arbiter
+    )
     return display, verdict
 
 
@@ -1046,7 +1100,9 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
     if not applicable_lenses(files):
         info("No reviewable content (docs / pure data only) — skipping review.")
         save_log(
-            "SKIP", files=files, diff=diff,
+            "SKIP",
+            files=files,
+            diff=diff,
             error_msg="no applicable lens for this file set",
         )
         return None, "SKIP"
@@ -1078,13 +1134,25 @@ def main() -> None:
         if verdict == "BLOCK":
             error(f"Review BLOCKED this commit:\n\n{review}")
             info(
+                "Fix-in-one-pass directive: address EVERY [CRITICAL] and "
+                "EVERY [WARNING] above in the next commit, plus obvious "
+                "adjacent cases (same edge-case class, missing branch "
+                "coverage, sibling assertions, prod+tests pairing). Do "
+                "NOT minimize to just-barely-pass — each hook iteration "
+                'costs ~20 min and reviewer tokens, and "sneaking '
+                "through\" wastes the user's budget. If the combined "
+                "fix would exceed the 2000-line diff limit, split into "
+                "sequential commits — but each commit still lands its "
+                "slice completely, no halfway work."
+            )
+            info(
                 "Trade-off channel: if a finding above is a deliberate "
                 "trade-off, document it inline via "
                 "`# review-note: <specific reason>` on the relevant line "
                 "(commit messages are not visible to the reviewer in "
                 "this hook stage) — then re-commit. The reviewer honors "
                 "specific, named-invariant explanations.\n"
-                "Use sparingly: vague notes (\"intentional\", \"by design\") "
+                'Use sparingly: vague notes ("intentional", "by design") '
                 "or 3+ in one commit are themselves flagged as CRITICAL. "
                 "This is not a hook-skip substitute."
             )

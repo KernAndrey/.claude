@@ -40,11 +40,7 @@ def test_count_criticals_bare_line() -> None:
 
 
 def test_count_criticals_bullet_prefixes() -> None:
-    review = (
-        "- [CRITICAL] a.py:1 — foo\n"
-        "* [CRITICAL] b.py:2 — bar\n"
-        "  [CRITICAL] c.py:3 — baz"
-    )
+    review = "- [CRITICAL] a.py:1 — foo\n* [CRITICAL] b.py:2 — bar\n  [CRITICAL] c.py:3 — baz"
     assert count_criticals(review) == 3
 
 
@@ -75,13 +71,7 @@ def test_count_criticals_ignores_tag_inside_diff_quote() -> None:
 
 def _full_review(body: str, summary: str = "Summary: 0 CRITICAL, 0 WARNING across 1 files.") -> str:
     """Build a minimally-well-formed review body for tests."""
-    return (
-        "### Section 1 — File audit\n"
-        "- foo.py — 1 hunk — REVIEWED\n"
-        "### Section 2 — Findings\n"
-        f"{body}\n"
-        f"{summary}"
-    )
+    return f"### Section 1 — File audit\n- foo.py — 1 hunk — REVIEWED\n### Section 2 — Findings\n{body}\n{summary}"
 
 
 def test_is_well_formed_requires_summary_as_last_line() -> None:
@@ -237,14 +227,7 @@ def test_run_opencode_empty_system_prompt() -> None:
 
 
 def test_count_added_lines_skips_file_header() -> None:
-    diff = (
-        "diff --git a/foo b/foo\n"
-        "+++ b/foo\n"
-        "+added-1\n"
-        "+added-2\n"
-        "-removed\n"
-        " context\n"
-    )
+    diff = "diff --git a/foo b/foo\n+++ b/foo\n+added-1\n+added-2\n-removed\n context\n"
     assert count_added_lines(diff) == 2
 
 
@@ -268,11 +251,7 @@ def test_fanout_threshold_sane_default() -> None:
 
 
 def test_assign_finding_ids_injects_stable_ids() -> None:
-    review = (
-        "- [CRITICAL] a.py:1 — foo\n"
-        "- [CRITICAL] b.py:2 — bar\n"
-        "[CRITICAL] c.py:3 — baz"
-    )
+    review = "- [CRITICAL] a.py:1 — foo\n- [CRITICAL] b.py:2 — bar\n[CRITICAL] c.py:3 — baz"
     tagged, findings = assign_finding_ids(review)
     assert [f["id"] for f in findings] == ["F1", "F2", "F3"]
     assert "[F1]" in tagged and "[F2]" in tagged and "[F3]" in tagged
@@ -328,11 +307,7 @@ def test_parse_arbiter_verdict_empty_raw_is_all_upheld() -> None:
 
 
 def test_parse_arbiter_verdict_case_insensitive_tags() -> None:
-    raw = (
-        "[upheld] F1 — real.\n"
-        "[Overturn] F2 — theoretical.\n"
-        "Summary: 1 UPHELD, 1 OVERTURN."
-    )
+    raw = "[upheld] F1 — real.\n[Overturn] F2 — theoretical.\nSummary: 1 UPHELD, 1 OVERTURN."
     assert parse_arbiter_verdict(raw, ["F1", "F2"]) == {"F1"}
 
 
@@ -388,15 +363,21 @@ def test_aggregate_lens_outputs_marks_unavailable_lenses() -> None:
 
 def test_aggregate_lens_outputs_distinguishes_router_skip_from_failure() -> None:
     per_lens = [
-        {"name": "bugs", "status": "ok",
-         "review": "No findings in this lens.\nSummary: 0 C, 0 W",
-         "reviewer": "opencode", "error": ""},
-        {"name": "architecture", "status": "skipped_by_router",
-         "review": "", "reviewer": None,
-         "error": "no applicable files for this lens"},
-        {"name": "tests", "status": "timeout",
-         "review": "", "reviewer": "opencode",
-         "error": "opencode timeout"},
+        {
+            "name": "bugs",
+            "status": "ok",
+            "review": "No findings in this lens.\nSummary: 0 C, 0 W",
+            "reviewer": "opencode",
+            "error": "",
+        },
+        {
+            "name": "architecture",
+            "status": "skipped_by_router",
+            "review": "",
+            "reviewer": None,
+            "error": "no applicable files for this lens",
+        },
+        {"name": "tests", "status": "timeout", "review": "", "reviewer": "opencode", "error": "opencode timeout"},
     ]
     aggregated = _aggregate_lens_outputs(per_lens)
     assert "Skipped by router: no applicable files" in aggregated
@@ -409,9 +390,7 @@ def test_aggregate_lens_outputs_distinguishes_router_skip_from_failure() -> None
 
 
 def test_render_fanout_output_splits_upheld_and_overturned() -> None:
-    per_lens = [
-        {"name": "bugs", "status": "ok", "review": "none", "reviewer": "opencode", "error": ""}
-    ]
+    per_lens = [{"name": "bugs", "status": "ok", "review": "none", "reviewer": "opencode", "error": ""}]
     findings = [
         {"id": "F1", "line": "- [F1] [CRITICAL] a.py:1 — real"},
         {"id": "F2", "line": "- [F2] [CRITICAL] b.py:2 — theoretical"},
@@ -437,8 +416,7 @@ def test_render_fanout_output_splits_upheld_and_overturned() -> None:
 
 def test_render_fanout_output_no_findings_shows_none() -> None:
     rendered = _render_fanout_output(
-        [{"name": "bugs", "status": "ok", "review": "none",
-          "reviewer": "opencode", "error": ""}],
+        [{"name": "bugs", "status": "ok", "review": "none", "reviewer": "opencode", "error": ""}],
         findings=[],
         upheld_ids=set(),
         arbiter={"status": "skipped", "upheld_ids": set(), "raw": "", "error": ""},
@@ -516,15 +494,13 @@ def test_applicable_lenses_mixed_code_and_config_runs_all() -> None:
 
 def test_run_review_skips_on_docs_only_diff() -> None:
     """Pre-router short-circuit: docs-only diff → SKIP, no LLM calls."""
-    diff = (
-        "diff --git a/README.md b/README.md\n"
-        "+++ b/README.md\n"
-        "+A new line.\n"
-    )
+    diff = "diff --git a/README.md b/README.md\n+++ b/README.md\n+A new line.\n"
     files = "README.md"
-    with patch("hook.save_log") as mock_log, \
-         patch("hook._run_single_call") as mock_single, \
-         patch("hook._run_fanout_with_arbiter") as mock_fanout:
+    with (
+        patch("hook.save_log") as mock_log,
+        patch("hook._run_single_call") as mock_single,
+        patch("hook._run_fanout_with_arbiter") as mock_fanout,
+    ):
         display, verdict = run_review(diff, files, is_merge=False)
 
     assert verdict == "SKIP"
@@ -538,15 +514,12 @@ def test_run_review_skips_on_docs_only_diff() -> None:
 
 def test_run_review_runs_single_call_on_small_code_diff() -> None:
     """Small code diff → single-call path is selected."""
-    diff = (
-        "diff --git a/foo.py b/foo.py\n"
-        "+++ b/foo.py\n"
-        "+def bar():\n"
-        "+    return 1\n"
-    )
+    diff = "diff --git a/foo.py b/foo.py\n+++ b/foo.py\n+def bar():\n+    return 1\n"
     files = "foo.py"
-    with patch("hook._run_single_call", return_value=(None, "OK")) as mock_single, \
-         patch("hook._run_fanout_with_arbiter") as mock_fanout:
+    with (
+        patch("hook._run_single_call", return_value=(None, "OK")) as mock_single,
+        patch("hook._run_fanout_with_arbiter") as mock_fanout,
+    ):
         run_review(diff, files, is_merge=False)
 
     mock_single.assert_called_once()
@@ -558,8 +531,10 @@ def test_run_review_runs_fanout_on_large_code_diff() -> None:
     added = [f"+line-{i}" for i in range(FANOUT_THRESHOLD + 5)]
     diff = "diff --git a/foo.py b/foo.py\n+++ b/foo.py\n" + "\n".join(added)
     files = "foo.py"
-    with patch("hook._run_single_call") as mock_single, \
-         patch("hook._run_fanout_with_arbiter", return_value=(None, "OK")) as mock_fanout:
+    with (
+        patch("hook._run_single_call") as mock_single,
+        patch("hook._run_fanout_with_arbiter", return_value=(None, "OK")) as mock_fanout,
+    ):
         run_review(diff, files, is_merge=False)
 
     mock_fanout.assert_called_once()
@@ -622,9 +597,7 @@ def test_arbitrate_returns_raw_review_when_arbiter_overturns_all() -> None:
     raw reviewer output is returned so main() can surface [WARNING] lines."""
     from hook import _arbitrate_single_call_review
 
-    with patch("hook.run_arbiter",
-               return_value=_mock_arbiter(upheld_ids=set())), \
-         patch("hook.save_log"):
+    with patch("hook.run_arbiter", return_value=_mock_arbiter(upheld_ids=set())), patch("hook.save_log"):
         display, verdict = _arbitrate_single_call_review(
             review=_SINGLE_CALL_REVIEW_WITH_CRITICAL_AND_WARNING,
             reviewer="opencode",
@@ -642,9 +615,7 @@ def test_arbitrate_returns_synthesized_display_on_block() -> None:
     the synthesized display is returned."""
     from hook import _arbitrate_single_call_review
 
-    with patch("hook.run_arbiter",
-               return_value=_mock_arbiter(upheld_ids={"F1"})), \
-         patch("hook.save_log"):
+    with patch("hook.run_arbiter", return_value=_mock_arbiter(upheld_ids={"F1"})), patch("hook.save_log"):
         display, verdict = _arbitrate_single_call_review(
             review=_SINGLE_CALL_REVIEW_WITH_CRITICAL_AND_WARNING,
             reviewer="opencode",
@@ -668,10 +639,12 @@ def test_arbitrate_skips_arbiter_when_zero_criticals() -> None:
         "- [WARNING] foo.py:1 — style.\n"
         "Summary: 0 CRITICAL, 1 WARNING across 1 files."
     )
-    with patch("hook.run_arbiter") as mock_arbiter, \
-         patch("hook.save_log"):
+    with patch("hook.run_arbiter") as mock_arbiter, patch("hook.save_log"):
         display, verdict = _arbitrate_single_call_review(
-            review=review, reviewer="opencode", diff="", files="foo.py",
+            review=review,
+            reviewer="opencode",
+            diff="",
+            files="foo.py",
         )
 
     assert verdict == "OK"
@@ -684,12 +657,73 @@ def test_arbitrate_blocks_malformed_review_without_calling_arbiter() -> None:
     from hook import _arbitrate_single_call_review
 
     malformed = "- [CRITICAL] foo.py:1 — bug (no summary terminator)"
-    with patch("hook.run_arbiter") as mock_arbiter, \
-         patch("hook.save_log"):
+    with patch("hook.run_arbiter") as mock_arbiter, patch("hook.save_log"):
         display, verdict = _arbitrate_single_call_review(
-            review=malformed, reviewer="opencode", diff="", files="foo.py",
+            review=malformed,
+            reviewer="opencode",
+            diff="",
+            files="foo.py",
         )
 
     assert verdict == "BLOCK"
     assert display == malformed
     mock_arbiter.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# main() BLOCK-path developer guidance (fix-in-one-pass + trade-off channel)
+# ---------------------------------------------------------------------------
+
+
+def _invoke_main_on_block(
+    review_text: str = "- [CRITICAL] foo.py:1 — bug\n\nSummary: 1 CRITICAL.",
+) -> str:
+    """Run hook.main() with a forced BLOCK verdict, return captured stderr."""
+    import io
+    import sys
+
+    from hook import main as hook_main
+
+    buf = io.StringIO()
+    with (
+        patch("hook.collect_diff", return_value=("diff-body", "foo.py", False)),
+        patch("hook.run_review", return_value=(review_text, "BLOCK")),
+        patch.object(sys, "stderr", buf),
+    ):
+        try:
+            hook_main()
+        except SystemExit as exc:
+            assert exc.code == 1, f"BLOCK must exit 1, got {exc.code}"
+        else:
+            raise AssertionError("main() should have called sys.exit(1) on BLOCK")
+
+    return buf.getvalue()
+
+
+def test_main_block_emits_fix_in_one_pass_directive() -> None:
+    """Regression: BLOCK output must include the directive telling the agent
+    to address all CRITICAL+WARNING in one follow-up commit — preventing the
+    iterative "sneak through" that burns reviewer budget."""
+    stderr = _invoke_main_on_block()
+
+    assert "Fix-in-one-pass" in stderr
+    assert "EVERY [CRITICAL]" in stderr
+    assert "EVERY [WARNING]" in stderr
+
+
+def test_main_block_still_emits_tradeoff_channel_info() -> None:
+    """Existing trade-off channel guidance must not regress when the new
+    fix-in-one-pass directive is added to the BLOCK path."""
+    stderr = _invoke_main_on_block()
+
+    assert "Trade-off channel" in stderr
+    assert "review-note:" in stderr
+
+
+def test_main_block_renders_review_summary() -> None:
+    """The upheld findings body itself must reach the developer on BLOCK."""
+    review = "- [CRITICAL] foo.py:7 — regression\n\nSummary: 1 CRITICAL."
+    stderr = _invoke_main_on_block(review)
+
+    assert "Review BLOCKED this commit" in stderr
+    assert "foo.py:7" in stderr

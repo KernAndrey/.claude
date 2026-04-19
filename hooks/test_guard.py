@@ -1,24 +1,9 @@
 from __future__ import annotations
 
-import io
-import json
-from collections.abc import Callable
-
 import pytest
 
+from hooks.conftest import StdinSetter
 from hooks.guard import check_command, main
-
-
-StdinSetter = Callable[[object], None]
-
-
-@pytest.fixture
-def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
-    def _set(payload: object) -> None:
-        text = payload if isinstance(payload, str) else json.dumps(payload)
-        monkeypatch.setattr("sys.stdin", io.StringIO(text))
-
-    return _set
 
 
 @pytest.mark.parametrize(
@@ -26,7 +11,9 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
     [
         # ---------- git-no-verify ----------
         pytest.param(
-            "git commit --no-verify -m 'x'", "git-no-verify", id="no-verify-long",
+            "git commit --no-verify -m 'x'",
+            "git-no-verify",
+            id="no-verify-long",
         ),
         pytest.param(
             "foo && git commit --no-verify -m 'x'",
@@ -40,10 +27,14 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
         # ---------- git-force-push ----------
         pytest.param("git push --force", "git-force-push", id="push-force-long"),
         pytest.param(
-            "git push -f origin main", "git-force-push", id="push-f-short",
+            "git push -f origin main",
+            "git-force-push",
+            id="push-f-short",
         ),
         pytest.param(
-            "git push origin main -f", "git-force-push", id="push-f-trailing",
+            "git push origin main -f",
+            "git-force-push",
+            id="push-f-trailing",
         ),
         pytest.param(
             "git push --force-with-lease feature",
@@ -68,10 +59,14 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
         pytest.param("git push origin main", None, id="push-plain-allowed"),
         pytest.param("git push origin feature", None, id="push-feature-allowed"),
         pytest.param(
-            "git push origin feature-fix", None, id="push-branch-with-dash-f-allowed",
+            "git push origin feature-fix",
+            None,
+            id="push-branch-with-dash-f-allowed",
         ),
         pytest.param(
-            "git push origin some-foo", None, id="push-branch-some-foo-allowed",
+            "git push origin some-foo",
+            None,
+            id="push-branch-some-foo-allowed",
         ),
         # Regression: numeric prefix before `-fix` must NOT trigger force-push.
         pytest.param(
@@ -101,7 +96,9 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
         ),
         # ---------- git-branch-force-delete ----------
         pytest.param(
-            "git branch -D feature", "git-branch-force-delete", id="branch-D",
+            "git branch -D feature",
+            "git-branch-force-delete",
+            id="branch-D",
         ),
         pytest.param(
             "git branch --delete --force feature",
@@ -125,10 +122,14 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
         ),
         pytest.param("git branch -d feature", None, id="branch-d-merged-allowed"),
         pytest.param(
-            "git branch -dv feature", None, id="branch-dv-non-force-allowed",
+            "git branch -dv feature",
+            None,
+            id="branch-dv-non-force-allowed",
         ),
         pytest.param(
-            "git branch -d fix-draft", None, id="branch-d-fix-draft-allowed",
+            "git branch -d fix-draft",
+            None,
+            id="branch-d-fix-draft-allowed",
         ),
         pytest.param(
             "git branch -d add-pdf-export",
@@ -155,7 +156,9 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
         ),
         pytest.param("git branch", None, id="branch-list-allowed"),
         pytest.param(
-            "git branch --list 'feature/*'", None, id="branch-list-glob-allowed",
+            "git branch --list 'feature/*'",
+            None,
+            id="branch-list-glob-allowed",
         ),
         # ---------- git-rebase-protected ----------
         pytest.param("git rebase main", "git-rebase-protected", id="rebase-main"),
@@ -170,7 +173,9 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
             id="rebase-upstream-dev",
         ),
         pytest.param(
-            "git rebase -i main", "git-rebase-protected", id="rebase-interactive-main",
+            "git rebase -i main",
+            "git-rebase-protected",
+            id="rebase-interactive-main",
         ),
         pytest.param(
             "git rebase --onto main feature~5 feature",
@@ -178,23 +183,35 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
             id="rebase-onto-main",
         ),
         pytest.param(
-            "git rebase feature-branch", None, id="rebase-feature-allowed",
+            "git rebase feature-branch",
+            None,
+            id="rebase-feature-allowed",
         ),
         pytest.param(
-            "git rebase main-feature", None, id="rebase-main-feature-no-fp",
+            "git rebase main-feature",
+            None,
+            id="rebase-main-feature-no-fp",
         ),
         pytest.param(
-            "git rebase development", None, id="rebase-development-no-fp",
+            "git rebase development",
+            None,
+            id="rebase-development-no-fp",
         ),
         pytest.param(
-            "git rebase feature-main", None, id="rebase-feature-main-no-fp",
+            "git rebase feature-main",
+            None,
+            id="rebase-feature-main-no-fp",
         ),
         pytest.param(
-            "git rebase prod-dev", None, id="rebase-prod-dev-no-fp",
+            "git rebase prod-dev",
+            None,
+            id="rebase-prod-dev-no-fp",
         ),
         # ---------- git-no-gpg-sign ----------
         pytest.param(
-            "git commit --no-gpg-sign", "git-no-gpg-sign", id="commit-no-gpg-sign",
+            "git commit --no-gpg-sign",
+            "git-no-gpg-sign",
+            id="commit-no-gpg-sign",
         ),
         pytest.param(
             "git -c commit.gpgsign=false commit -m x",
@@ -226,7 +243,9 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
             id="config-system",
         ),
         pytest.param(
-            "git config user.email foo", None, id="config-local-allowed",
+            "git config user.email foo",
+            None,
+            id="config-local-allowed",
         ),
         # ---------- rm-rf-home-or-root ----------
         pytest.param("rm -rf ~", "rm-rf-home-or-root", id="rm-rf-tilde"),
@@ -234,37 +253,53 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
         pytest.param("rm -rf /", "rm-rf-home-or-root", id="rm-rf-root"),
         pytest.param("rm -r ~", "rm-rf-home-or-root", id="rm-r-tilde"),
         pytest.param(
-            "rm -rf ~/foo", None, id="rm-rf-tilde-subpath-allowed",
+            "rm -rf ~/foo",
+            None,
+            id="rm-rf-tilde-subpath-allowed",
         ),
         pytest.param(
-            "rm -rf node_modules", None, id="rm-rf-relative-allowed",
+            "rm -rf node_modules",
+            None,
+            id="rm-rf-relative-allowed",
         ),
         pytest.param("rm -rf /tmp/x", None, id="rm-rf-tmp-allowed"),
         pytest.param("rm file.txt", None, id="rm-no-flag-allowed"),
         pytest.param(
-            "cd / && rm -rf foo", None, id="rm-rf-relative-after-cd-allowed",
+            "cd / && rm -rf foo",
+            None,
+            id="rm-rf-relative-after-cd-allowed",
         ),
         # ---------- git-reset-hard ----------
         pytest.param("git reset --hard", "git-reset-hard", id="reset-hard"),
         pytest.param(
-            "git reset --hard HEAD~3", "git-reset-hard", id="reset-hard-target",
+            "git reset --hard HEAD~3",
+            "git-reset-hard",
+            id="reset-hard-target",
         ),
         pytest.param("git reset HEAD~1", None, id="reset-mixed-allowed"),
         pytest.param(
-            "git reset --soft HEAD~1", None, id="reset-soft-allowed",
+            "git reset --soft HEAD~1",
+            None,
+            id="reset-soft-allowed",
         ),
         # ---------- git-clean-force ----------
         pytest.param("git clean -f", "git-clean-force", id="clean-f"),
         pytest.param("git clean -fdx", "git-clean-force", id="clean-fdx"),
         pytest.param(
-            "git clean --force", "git-clean-force", id="clean-force-long",
+            "git clean --force",
+            "git-clean-force",
+            id="clean-force-long",
         ),
         pytest.param("git clean -n", None, id="clean-dry-run-allowed"),
         pytest.param(
-            "git clean -n some-file", None, id="clean-pathspec-with-dash-allowed",
+            "git clean -n some-file",
+            None,
+            id="clean-pathspec-with-dash-allowed",
         ),
         pytest.param(
-            "git clean -n config-files", None, id="clean-pathspec-config-allowed",
+            "git clean -n config-files",
+            None,
+            id="clean-pathspec-config-allowed",
         ),
         # Regression: pathspec starting with a numeric-prefixed token that
         # contains `-fix` must NOT trigger force-clean.
@@ -285,19 +320,27 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
             id="checkout-dashes",
         ),
         pytest.param(
-            "git checkout .", "git-checkout-discard", id="checkout-dot",
+            "git checkout .",
+            "git-checkout-discard",
+            id="checkout-dot",
         ),
         pytest.param("git checkout main", None, id="checkout-branch-allowed"),
         pytest.param(
-            "git checkout -b new-branch", None, id="checkout-create-allowed",
+            "git checkout -b new-branch",
+            None,
+            id="checkout-create-allowed",
         ),
         # ---------- git-restore-discard ----------
         pytest.param(
-            "git restore file.py", "git-restore-discard", id="restore-file",
+            "git restore file.py",
+            "git-restore-discard",
+            id="restore-file",
         ),
         pytest.param("git restore .", "git-restore-discard", id="restore-dot"),
         pytest.param(
-            "git restore --staged file.py", None, id="restore-staged-allowed",
+            "git restore --staged file.py",
+            None,
+            id="restore-staged-allowed",
         ),
         # ---------- git-commit-amend ----------
         pytest.param("git commit --amend", "git-commit-amend", id="commit-amend"),
@@ -311,14 +354,10 @@ def stdin_payload(monkeypatch: pytest.MonkeyPatch) -> StdinSetter:
 def test_check_command(command: str, expected_rule: str | None) -> None:
     rule = check_command(command)
     if expected_rule is None:
-        assert rule is None, (
-            f"expected allowed, got blocked by {rule.name if rule else None}"
-        )
+        assert rule is None, f"expected allowed, got blocked by {rule.name if rule else None}"
     else:
         assert rule is not None, f"expected blocked by {expected_rule}, got allowed"
-        assert rule.name == expected_rule, (
-            f"expected {expected_rule}, got {rule.name}"
-        )
+        assert rule.name == expected_rule, f"expected {expected_rule}, got {rule.name}"
 
 
 # ---------- main() integration tests ----------

@@ -21,9 +21,20 @@ def main() -> None:
         return
 
     try:
-        # Auto-fix what we can
+        # Auto-fix first: `--fix` can rewrite imports and other code, which
+        # would otherwise leave the file in a non-formatted state if format
+        # ran earlier.
         subprocess.run(
             ["ruff", "check", "--fix", file_path],
+            cwd=cwd,
+            capture_output=True,
+        )
+        # review-note: ruff is the project-wide formatter per the user's
+        # global CLAUDE.md ("ruff check --fix <changed_files>", "ruff check
+        # --select ANN"); downstream repos that pick a different formatter
+        # are out of scope for this global hook.
+        subprocess.run(
+            ["ruff", "format", file_path],
             cwd=cwd,
             capture_output=True,
         )

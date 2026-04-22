@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import io
 import json
 import os
@@ -479,6 +480,26 @@ class TestBackupMain(BaseTest):
         ):
             cc.backup_main()
         self.assertEqual(cm.exception.code, cc.EXIT_SYS)
+
+    def test_rapid_backups_in_same_second_do_not_overwrite(self) -> None:
+        """Regression: two backups within one second must not collide.
+
+        Before the fix, the backup filename used `%Y%m%d-%H%M%S` resolution,
+        so two calls to `backup_main()` inside the same second targeted the
+        same path and the second `copy2` silently overwrote the first,
+        losing a recovery point.
+        """
+        self._write_main()
+        same_second = _dt.datetime(2026, 4, 22, 12, 0, 0)
+        with patch.object(cc._dt, "datetime") as mock_dt:
+            mock_dt.now.side_effect = [
+                same_second.replace(microsecond=100_000),
+                same_second.replace(microsecond=200_000),
+            ]
+            cc.backup_main()
+            cc.backup_main()
+        backups = sorted(self.backups_dir.glob("claude.json.*"))
+        self.assertEqual(len(backups), 2, f"expected 2 distinct backups, got {backups}")
 
 
 class TestReadCurrentState(BaseTest):

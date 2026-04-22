@@ -1,0 +1,22 @@
+# .semgrep-exclude-rules — project-level Semgrep rule exclusions
+#
+# Copy to the root of a project repo as `.semgrep-exclude-rules` and commit it.
+# The global pre-commit hook (~/.claude/git-hooks/pre-commit) picks it up and
+# passes each non-empty non-comment line to semgrep as --exclude-rule=<id>.
+#
+# Format:
+#   - One rule-id per line.
+#   - Lines starting with `#` are ignored (use them to document why a rule is excluded).
+#   - Blank lines are ignored.
+#   - Inline comments are NOT supported — keep the reason on a separate line above the rule-id.
+#
+# Find a rule-id in the semgrep output that blocked your commit, e.g.:
+#   ❯❯❱ python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
+#
+# Examples below — delete them and add your own.
+
+# Rule doesn't apply — Odoo uses psycopg2 (cr.execute with bound params), not SQLAlchemy.
+python.sqlalchemy.security.sqlalchemy-execute-raw-query.sqlalchemy-execute-raw-query
+
+# Rule flags any 'credential' word in log strings; we log mailbox emails as identifiers, not secrets.
+python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure

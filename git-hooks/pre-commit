@@ -69,8 +69,18 @@ run_semgrep() {
     if [ "${#STAGED_FILES[@]}" -eq 0 ]; then
         return 0
     fi
+
+    local exclude_args=()
+    if [ -f ".semgrep-exclude-rules" ]; then
+        while IFS= read -r rule || [ -n "$rule" ]; do
+            [ -z "$rule" ] && continue
+            [ "${rule:0:1}" = "#" ] && continue
+            exclude_args+=("--exclude-rule=$rule")
+        done < .semgrep-exclude-rules
+    fi
+
     echo "[semgrep] scanning staged files..." >&2
-    if ! semgrep --config=auto --error --quiet "${STAGED_FILES[@]}" >&2; then
+    if ! semgrep --config=auto --error --quiet "${exclude_args[@]}" "${STAGED_FILES[@]}" >&2; then
         echo "[semgrep] findings — commit blocked" >&2
         return 1
     fi

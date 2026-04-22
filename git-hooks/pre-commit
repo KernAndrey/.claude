@@ -39,7 +39,47 @@ if [ -f "$COMMIT_MSG_FILE" ]; then
     fi
 fi
 
-# --- Step 3: Run code review (on already-linted code) ---
+# --- Step 3: Collect staged files (A/C/M only) for semgrep ---
+# NUL-delimited so paths with spaces/newlines survive intact. gitleaks
+# reads the index directly and does not need this list.
+STAGED_FILES=()
+while IFS= read -r -d '' staged_path; do
+    STAGED_FILES+=("$staged_path")
+done < <(git diff --cached --name-only --diff-filter=ACM -z)
+
+# --- Step 4: gitleaks — scan the staged index for secrets ---
+run_gitleaks() {
+    if ! command -v gitleaks >/dev/null 2>&1; then
+        echo "[gitleaks] not installed — skipping. Install: https://github.com/gitleaks/gitleaks#installing" >&2
+        return 0
+    fi
+    echo "[gitleaks] scanning staged content..." >&2
+    if ! gitleaks protect --staged --redact >&2; then
+        echo "[gitleaks] secrets detected — commit blocked" >&2
+        return 1
+    fi
+}
+
+# --- Step 5: semgrep — static analysis on staged files ---
+run_semgrep() {
+    if ! command -v semgrep >/dev/null 2>&1; then
+        echo "[semgrep] not installed — skipping. Install: pip install semgrep" >&2
+        return 0
+    fi
+    if [ "${#STAGED_FILES[@]}" -eq 0 ]; then
+        return 0
+    fi
+    echo "[semgrep] scanning staged files..." >&2
+    if ! semgrep --config=auto --error --quiet "${STAGED_FILES[@]}" >&2; then
+        echo "[semgrep] findings — commit blocked" >&2
+        return 1
+    fi
+}
+
+run_gitleaks || exit 1
+run_semgrep || exit 1
+
+# --- Step 6: Run code review (on already-linted + scanned code) ---
 REVIEW_SCRIPT="$HOME/.claude/review/hook.py"
 if [ -f "$REVIEW_SCRIPT" ]; then
     python3 -B "$REVIEW_SCRIPT"

@@ -7,6 +7,12 @@ description: Smart commit — security scan, logical split, branch safety checks
 - Omit all Co-Authored-By and AI attribution from commit messages
 - Write commit messages in English
 - Use conventional commits
+- **Preflight test coverage before every commit.** The AI review hook
+  blocks commits with untested new public behavior. Walk the staged
+  diff in Phase 3.5, map each new-behavior unit to a same-diff test
+  that asserts on it, and write the missing tests before `git commit`.
+  Skipping this turns a 30-second local check into a 10-minute
+  hook-review round trip.
 
 # Smart Commit
 
@@ -15,7 +21,7 @@ Safely commit staged and unstaged changes with security checks, logical splittin
 ## Phase 1: Branch Safety
 
 1. Run `git branch --show-current` to get the current branch.
-2. If the branch is `main`, `master`, or `dev` — halt and inform the user:
+2. If the branch is `main` or `master` — halt and inform the user:
    > You are on `{branch}`. Per project rules, direct commits to shared branches are not allowed. Create a feature branch first.
    Suggest a branch name based on the changes and ask the user to confirm. Wait for the user to switch to a feature branch before proceeding.
 
@@ -67,44 +73,116 @@ Proceed only after explicit user approval for each detected secret.
 
 The AI reviewer (`tests` lens) enforces 100% coverage of new public
 branches. A commit with new behavior and no matching test is blocked.
-This phase catches the gap before the review runs, saving a round
-trip.
+This phase catches the gap **before** the review runs, saving a ~10
+minute round trip per missed unit.
 
-**Automatic classification — pick one path.**
+The lens's canonical rules are in
+`/home/kern/.claude/review/prompts/tests.md`. This phase applies the
+same rules locally; any mismatch means the review will block.
 
-### Path A: tests not required — pass silently
+**Procedure — do this in one pass, in order.**
 
-Skip this phase with no questions and no console output when any of
-the following is true:
-- No files of production code in staged changes (only `.md`, config,
-  CI, migrations, `.json`, lockfiles).
-- Only renames with identical signatures and bodies.
-- Only edits inside test files.
-- Only private `_prefixed` helpers with no new public entry point in
-  the diff.
+### Step 1 — Enumerate every new-behavior unit
 
-### Path B: tests required, tests present — pass silently
+Walk the staged diff end-to-end. For each `+` line, classify it. The
+following are new-behavior units:
 
-If the diff contains any of the following production-code signals:
-- New public (not `_prefixed`) `def` / `class`.
-- New branch (`if` / `elif` / `else` / `match` arm) with business
+- New public (not `_prefixed`) `def` / `class` / method with business
   logic.
-- New `raise` or new exception type.
+- New branch (`if` / `elif` / `else` / `match` arm) with distinct
+  runtime effect a caller can observe (return value, state write,
+  response code, exception).
+- New `raise`, new exception type, new failure return value.
 - Changed public function signature that alters behavior.
 
-Then verify a matching test exists in the same staged set:
-- `Glob` for test files across common conventions:
-  `tests/**`, `test_*.py`, `*_test.py`, `*.test.ts`, `*.test.tsx`,
-  `*.test.js`, `*_test.go`, `*Spec.*`, `*_spec.rb`.
-- Confirm the staged diff adds / modifies a test that exercises the
-  new unit.
+List them by name. This list is the contract you will fulfil with
+tests.
 
-Match present for every new-behavior unit → continue to Phase 4 with
-no output.
+### Step 2 — Apply the exclusion categories
 
-### Path C: tests required, tests missing — BLOCK
+For each listed unit, check whether it falls into one of these
+exclusion categories (same as the review lens, same phrasing). If
+yes, cross it off the list.
 
-Do not ask; do not propose options; do not negotiate. Print and halt:
+1. **Non-production file** — `.md`, config, CI, migration, `.json`,
+   lockfile, shell script.
+2. **Pure rename** — identical signature and body.
+3. **Test file edit only** — tests don't test tests.
+4. **Private `_prefixed` helper** with no new public entry point.
+5. **Declarative / metadata change** — `@api.depends` path expansion,
+   field kwargs (`tracking=`, `index=`, `copy=`), class-level
+   declarative attrs, `_()` wrappers, defensive branch behind a
+   declared invariant (`required=True`, `@api.constrains`, NOT NULL).
+6. **Stdlib/framework-delegated error handler** *(category A)* — ALL
+   FOUR: `try` body is exactly one stdlib call (`Path.read_text`,
+   `Path.mkdir`, `Path.unlink`, `os.replace`, `shutil.copy2`,
+   `input()`, HTTP-client `raise_for_status`); `except` body is
+   `return` / `pass` / `continue` / `die(msg)` / `_logger.<level>`
+   only (no state write, no exception-type change); exception class
+   is hard-to-fixture (`OSError`, `FileNotFoundError`,
+   `PermissionError`, `EOFError`, `KeyboardInterrupt` — NOT
+   `JSONDecodeError` / `UnicodeDecodeError` / `ValueError` / `KeyError`,
+   which are fixture-testable); the enclosing function is called by
+   at least one test in the diff.
+7. **Log-only observer branch** *(category B)* — `if` / `elif` / `else`
+   branch body is only `_logger.<level>(...)` calls, no return, no
+   state write, no raise, no response-code change, no counter. Does
+   NOT apply to `except` blocks or to branches that fall through to
+   a state-writing path.
+8. **Idempotent bootstrap wrapper** *(category C)* — whole function
+   body is one idempotent stdlib setup call (`mkdir(exist_ok=True)`,
+   `Path.touch`, `logging.getLogger`) plus optional category-A
+   handler.
+9. **Declarative view/XML conditional** *(category D)* —
+   single-attribute `invisible=` / `readonly=` / `required=` /
+   `decoration-*` / `attrs=` in Odoo XML, Jinja `{% if %}` show/hide.
+   Does NOT apply when the attribute wires `context=` or
+   `button type="object"` that reshapes state.
+10. **Cosmetic-only outbound kwarg** *(category E)* — one kwarg at
+    one call site; the kwarg is purely cosmetic (formatting strings,
+    log labels, descriptions); the kwarg is NOT `audience=` /
+    `issuer=` / `verify=` / `algorithms=` / `scope=` / `client_id=`
+    (security), NOT `identity_key=` / `dedupe_key=` /
+    `idempotency_key=` (idempotency), NOT `channel=` / `queue=` /
+    `topic=` / `routing_key=` (routing), NOT `sudo=` /
+    `allowed_company_ids=` / `uid=` (authz scope).
+
+For borderline cases (3-of-4 category-A conditions; unclear kwarg
+class; audit-trail log-only branch), **write the test** rather than
+claim the exclusion. A `[WARNING]` from the hook is cheaper than
+arguing.
+
+### Step 3 — For each remaining unit, verify a matching test exists
+
+`Glob` for test files: `tests/**`, `test_*.py`, `*_test.py`,
+`*.test.ts`, `*.test.tsx`, `*.test.js`, `*_test.go`, `*Spec.*`,
+`*_spec.rb`.
+
+Confirm the staged diff adds or modifies a test that **exercises**
+the unit. A test exercises a unit when it both:
+
+- Triggers execution of the unit — either calls the new function/
+  method by name, or supplies input that makes the new branch fire.
+- Makes an assertion about the resulting behavior — return value,
+  state change, raised exception, response code.
+
+A test that does only one of these does NOT exercise the unit.
+Disqualifiers:
+
+- `assert True` / `pass` body.
+- Mocks the thing under test (patching `new_fn` itself, then calling
+  `new_fn` — you asserted against the mock, not the code).
+- Reference to the unit in a comment or docstring but no call.
+- Adds a fixture that uses the unit but no assertion about it.
+
+For bug-fix commits: the regression test must fail on the diff before
+the fix and pass after. Run the test locally before committing.
+
+### Step 4 — Decide
+
+- Every remaining unit has a matching exercising test → pass silently,
+  continue to Phase 4.
+- At least one unit has no matching exercising test → BLOCK:
 
 > ❌ Commit blocked — test coverage required:
 > - `path/to/mod.py::new_fn` (new public function, no matching test)

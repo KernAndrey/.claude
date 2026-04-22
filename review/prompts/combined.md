@@ -136,7 +136,9 @@ Walk the diff against all four categories.
 
 ### Tests — flag every uncovered new behavior
 
-Policy: 100% coverage of new public branches. No compromises.
+Policy: 100% coverage of new public branches — but "new public branch"
+is narrower than "every added line". The exclusion list below is the
+precise boundary; apply it literally.
 
 What requires a test:
 - New public `def` / `class` / method with business logic.
@@ -148,20 +150,78 @@ Sweep: `Glob` for `tests/**`, `test_*.py`, `*_test.py`, `*.test.ts`,
 `*.test.tsx`, `*.test.js`, `*_test.go`, `*Spec.*`, `*_spec.rb`.
 For each new-behavior unit, check the staged diff for a matching test.
 
+<critical>
+If the only way to reach the branch from a test is to monkeypatch the
+stdlib/framework call it guards, a static library argument it
+forwards, or a UI-view attribute it declares, the test asserts against
+the monkeypatch — not against your code. Skip. A different stub return
+value is not a regression.
+</critical>
+
 Exclusions (return clean):
-- Pure config / CI / migration / docstring / `.md`.
-- Shell scripts (`.sh`, `.bash`, extensionless hook-style scripts) —
-  tested indirectly via the higher-level contract they feed.
-- Rename only, same signature and body.
-- Test files themselves.
-- Private `_prefixed` helpers without a new public entry point.
+
+1. **Pure config / CI / migration / docstring / `.md`.** No executable
+   branches.
+2. **Shell scripts** (`.sh`, `.bash`, extensionless hook-style
+   scripts) — tested indirectly via the contract they feed.
+3. **Rename only**, same signature and body.
+4. **Test files themselves.**
+5. **Private `_prefixed` helpers** without a new public entry point.
+6. **Declarative / metadata changes** — `@api.depends` path expansion
+   when compute body unchanged; field kwargs (`tracking=`, `index=`,
+   `check_company=`, `copy=`); class-level declarative attrs
+   (`_order`, `_rec_name`); `_()` translation wrappers; unconditional
+   literals; defensive branches guarded by a declared invariant
+   (`required=True`, `@api.constrains`, NOT NULL).
+7. **Stdlib / framework-delegated error handlers** *(category A)* —
+   ALL of: try body is exactly one stdlib/framework call
+   (`Path.read_text`, `Path.mkdir`, `Path.unlink`, `os.replace`,
+   `shutil.copy2`, `input()`, HTTP-client `raise_for_status`, ORM
+   browse); except body is
+   `return`/`pass`/`continue`/`die(msg)`/`_logger.<level>` only (no
+   state write, no exception-type change); exception class is
+   **hard to induce via fixture** (`OSError`, `FileNotFoundError`,
+   `PermissionError`, `EOFError`, `KeyboardInterrupt`; NOT
+   `JSONDecodeError`/`UnicodeDecodeError`/`binascii.Error`/
+   `ValueError`/`KeyError` — those are fixture-testable, keep as
+   CRITICAL); enclosing function has a happy-path test in the diff.
+8. **Log-only observer branches** *(category B)* — `if`/`elif`/`else`
+   branch whose body is only `_logger.<level>(...)` calls; no return,
+   no state write, no raise, no response-code change, no counter. Does
+   NOT apply to `except` blocks (suppression is a behavior choice) or
+   to branches that fall through to a state-writing path with a
+   defaulted value.
+9. **Idempotent bootstrap wrappers** *(category C)* — whole body is
+   one idempotent stdlib setup call (`mkdir(exist_ok=True)`,
+   `Path.touch`, `os.makedirs(exist_ok=True)`,
+   `logging.getLogger(__name__)`) plus optional category-A handler.
+10. **Declarative view/XML conditionals** *(category D)* —
+    single-attribute conditional visibility / decoration
+    (`invisible=`, `readonly=`, `required=`, `decoration-*`,
+    `attrs=`), Jinja `{% if %}` show/hide. If the attribute wires
+    `context=` or `button type="object"` reshaping state, NOT
+    declarative — test the action.
+11. **Outbound-call-argument assertions — cosmetic kwargs only**
+    *(category E)* — the flagged unit is one kwarg at one call site;
+    the kwarg is cosmetic (formatting strings, log labels,
+    descriptions); the kwarg is NOT security/auth (`audience=`,
+    `issuer=`, `verify=`, `algorithms=`, `scope=`, `client_id=`),
+    NOT idempotency (`identity_key=`, `dedupe_key=`,
+    `idempotency_key=`), NOT routing (`channel=`, `queue=`,
+    `topic=`), NOT authz-scope (`sudo=`, `allowed_company_ids=`,
+    `uid=`).
 
 Nothing else excuses a missing test. "Trivial", "obvious", "covered
 elsewhere" are not exclusions. The only redirect: inline
 `# review-note: covered by <specific-test-path>` with a verifiable
 path.
 
-Every uncovered unit → `[CRITICAL]`, one per unit.
+Severity:
+- All exclusion conditions hold cleanly → return clean.
+- Borderline case (3 of 4 category-A conditions; unclear kwarg
+  semantics; audit-trail log-only branch; state-suggesting view
+  attribute) → `[WARNING]`.
+- Any condition fails outright → `[CRITICAL]`, one per unit.
 
 ## Evidence rule
 

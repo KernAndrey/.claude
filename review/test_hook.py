@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from unittest.mock import MagicMock, patch
 
+from config import FANOUT_THRESHOLD, MAX_DIFF_LINES, RunnerConfig
 from hook import (
-    FANOUT_THRESHOLD,
+    ARBITER,
+    LENS_APPLICABILITY,
     LENS_NAMES,
-    MAX_DIFF_LINES,
     _aggregate_lens_outputs,
     _parse_opencode_json,
     _render_fanout_output,
+    _run_single_call,
+    _verify_runner_configs,
     applicable_lenses,
     assign_finding_ids,
     build_user_prompt,
@@ -22,9 +26,477 @@ from hook import (
     is_well_formed,
     parse_arbiter_verdict,
     parse_verdict,
+    run_arbiter,
+    run_claude,
     run_opencode,
     run_review,
+    run_reviewer,
+    run_single_lens,
+    run_with_fallback,
 )
+
+
+def _pair() -> tuple[RunnerConfig, RunnerConfig]:
+    """Shared primary/fallback pair for fallback-routing tests."""
+    return RunnerConfig("opencode", "p"), RunnerConfig("claude", "f")
+
+
+# ---------------------------------------------------------------------------
+# RunnerConfig dispatch — run_reviewer / run_with_fallback
+# ---------------------------------------------------------------------------
+
+
+def test_run_reviewer_dispatches_opencode() -> None:
+    cfg = RunnerConfig("opencode", "model-x", timeout=42)
+    with patch("hook.run_opencode", return_value=("out", "err", 0)) as m:
+        result = run_reviewer(cfg, "sys", "user")
+    m.assert_called_once_with("sys", "user", "model-x", 42)
+    assert result == ("out", "err", 0)
+
+
+def test_run_reviewer_dispatches_claude() -> None:
+    cfg = RunnerConfig("claude", "sonnet", timeout=99)
+    with patch("hook.run_claude", return_value=("out", "err", 0)) as m:
+        result = run_reviewer(cfg, "sys", "user")
+    m.assert_called_once_with("sys", "user", "sonnet", 99)
+    assert result == ("out", "err", 0)
+
+
+def test_run_reviewer_unknown_backend_raises_value_error() -> None:
+    cfg = RunnerConfig("bogus", "x")  # type: ignore[arg-type]
+    try:
+        run_reviewer(cfg, "s", "u")
+    except ValueError as exc:
+        assert "bogus" in str(exc)
+        return
+    raise AssertionError("expected ValueError for unknown backend")
+
+
+def test_run_with_fallback_returns_primary_on_success() -> None:
+    primary, fallback = _pair()
+    with patch("hook.run_reviewer", return_value=("primary out", "", 0)) as m:
+        review, stderr, rc, used = run_with_fallback(primary, fallback, "s", "u")
+    assert m.call_count == 1
+    assert m.call_args[0][0] is primary
+    assert (review, stderr, rc, used) == ("primary out", "", 0, "opencode")
+
+
+def test_run_with_fallback_falls_back_on_nonzero_rc() -> None:
+    primary, fallback = _pair()
+    seen: list[RunnerConfig] = []
+
+    def fake(cfg: RunnerConfig, sys_p: str, user_p: str) -> tuple[str, str, int]:
+        seen.append(cfg)
+        return ("", "boom", 1) if cfg is primary else ("fallback out", "", 0)
+
+    with patch("hook.run_reviewer", side_effect=fake):
+        review, _, _, used = run_with_fallback(primary, fallback, "s", "u")
+    assert [c is primary for c in seen] == [True, False]
+    assert (review, used) == ("fallback out", "claude")
+
+
+def test_run_with_fallback_falls_back_on_empty_review() -> None:
+    primary, fallback = _pair()
+
+    def fake(cfg: RunnerConfig, sys_p: str, user_p: str) -> tuple[str, str, int]:
+        return ("   \n  ", "", 0) if cfg is primary else ("ok", "", 0)
+
+    with patch("hook.run_reviewer", side_effect=fake):
+        review, _, _, used = run_with_fallback(primary, fallback, "s", "u")
+    assert (review, used) == ("ok", "claude")
+
+
+def test_run_with_fallback_falls_back_on_timeout() -> None:
+    primary, fallback = _pair()
+
+    def fake(cfg: RunnerConfig, sys_p: str, user_p: str) -> tuple[str, str, int]:
+        if cfg is primary:
+            raise subprocess.TimeoutExpired(cmd="opencode", timeout=1)
+        return ("ok", "", 0)
+
+    with patch("hook.run_reviewer", side_effect=fake):
+        review, _, _, used = run_with_fallback(primary, fallback, "s", "u")
+    assert (review, used) == ("ok", "claude")
+
+
+def test_run_with_fallback_falls_back_on_filenotfound() -> None:
+    primary, fallback = _pair()
+
+    def fake(cfg: RunnerConfig, sys_p: str, user_p: str) -> tuple[str, str, int]:
+        if cfg is primary:
+            raise FileNotFoundError("opencode binary missing")
+        return ("ok", "", 0)
+
+    with patch("hook.run_reviewer", side_effect=fake):
+        review, _, _, used = run_with_fallback(primary, fallback, "s", "u")
+    assert (review, used) == ("ok", "claude")
+
+
+def test_run_with_fallback_falls_back_on_oserror() -> None:
+    """OSError covers exec/permission errors broader than FileNotFoundError."""
+    primary, fallback = _pair()
+
+    def fake(cfg: RunnerConfig, sys_p: str, user_p: str) -> tuple[str, str, int]:
+        if cfg is primary:
+            raise PermissionError("opencode not executable")  # subclass of OSError
+        return ("ok", "", 0)
+
+    with patch("hook.run_reviewer", side_effect=fake):
+        review, _, _, used = run_with_fallback(primary, fallback, "s", "u")
+    assert (review, used) == ("ok", "claude")
+
+
+def test_run_with_fallback_no_fallback_returns_primary_failure() -> None:
+    primary = RunnerConfig("opencode", "p")
+    with patch("hook.run_reviewer", return_value=("", "boom", 1)) as m:
+        review, stderr, rc, used = run_with_fallback(primary, None, "s", "u")
+    assert m.call_count == 1
+    assert (review, stderr, rc, used) == ("", "boom", 1, "opencode")
+
+
+def test_run_with_fallback_no_fallback_reraises_timeout() -> None:
+    primary = RunnerConfig("opencode", "p")
+
+    def fake(cfg: RunnerConfig, sys_p: str, user_p: str) -> tuple[str, str, int]:
+        raise subprocess.TimeoutExpired(cmd="opencode", timeout=1)
+
+    with patch("hook.run_reviewer", side_effect=fake):
+        try:
+            run_with_fallback(primary, None, "s", "u")
+        except subprocess.TimeoutExpired:
+            return
+    raise AssertionError("expected TimeoutExpired re-raise when fallback is None")
+
+
+# ---------------------------------------------------------------------------
+# RunnerConfig validation — _verify_runner_configs
+# ---------------------------------------------------------------------------
+
+
+def test_verify_runner_configs_passes_on_default_config() -> None:
+    _verify_runner_configs()  # default PRIMARY/FALLBACK/ARBITER are valid
+
+
+def test_verify_runner_configs_raises_on_invalid_primary_backend() -> None:
+    bogus = RunnerConfig("bogus-backend", "x")  # type: ignore[arg-type]
+    with patch("hook.PRIMARY", bogus):
+        try:
+            _verify_runner_configs()
+        except ValueError as exc:
+            assert "PRIMARY" in str(exc)
+            assert "bogus-backend" in str(exc)
+            return
+    raise AssertionError("expected ValueError on invalid PRIMARY backend")
+
+
+def test_verify_runner_configs_raises_on_invalid_fallback_backend() -> None:
+    bogus = RunnerConfig("typo", "x")  # type: ignore[arg-type]
+    with patch("hook.FALLBACK", bogus):
+        try:
+            _verify_runner_configs()
+        except ValueError as exc:
+            assert "FALLBACK" in str(exc)
+            return
+    raise AssertionError("expected ValueError on invalid FALLBACK backend")
+
+
+def test_verify_runner_configs_raises_on_invalid_arbiter_backend() -> None:
+    bogus = RunnerConfig("nope", "x")  # type: ignore[arg-type]
+    with patch("hook.ARBITER", bogus):
+        try:
+            _verify_runner_configs()
+        except ValueError as exc:
+            assert "ARBITER" in str(exc)
+            return
+    raise AssertionError("expected ValueError on invalid ARBITER backend")
+
+
+def test_verify_runner_configs_allows_none_fallback() -> None:
+    """FALLBACK = None is a supported configuration (no fallback)."""
+    with patch("hook.FALLBACK", None):
+        _verify_runner_configs()  # must not raise
+
+
+def test_lens_names_derived_from_lens_applicability() -> None:
+    """LENS_NAMES is now derived from the registry — drift is structurally
+    impossible. Smoke check that the derivation produced a non-empty tuple
+    in the expected order."""
+    assert tuple(LENS_APPLICABILITY) == LENS_NAMES
+    assert len(LENS_NAMES) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Backend-runner contract — model + timeout propagation
+# ---------------------------------------------------------------------------
+
+
+def test_run_opencode_forwards_timeout_to_subprocess() -> None:
+    """timeout from RunnerConfig must reach subprocess.run(..., timeout=)."""
+    mock_result = MagicMock()
+    mock_result.stdout = '{"type":"text","part":{"type":"text","text":"out"}}\n'
+    mock_result.stderr = ""
+    mock_result.returncode = 0
+
+    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
+        run_opencode("sys", "user", "model-x", 777)
+
+    assert mock_run.call_args.kwargs["timeout"] == 777
+
+
+def test_run_claude_builds_correct_command() -> None:
+    mock_result = MagicMock()
+    mock_result.stdout = "claude review body"
+    mock_result.stderr = ""
+    mock_result.returncode = 0
+
+    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
+        stdout, stderr, rc = run_claude("sys", "user", "sonnet", 600)
+
+    cmd = mock_run.call_args[0][0]
+    assert cmd[0] == "claude"
+    assert "-p" in cmd
+    assert "--model" in cmd
+    assert "sonnet" in cmd
+    assert "--system-prompt" in cmd
+    assert "sys" in cmd  # system prompt value follows the flag
+    assert mock_run.call_args.kwargs["input"] == "user"
+    assert mock_run.call_args.kwargs["timeout"] == 600
+    assert (stdout, stderr, rc) == ("claude review body", "", 0)
+
+
+def test_run_claude_omits_system_prompt_flag_when_empty() -> None:
+    mock_result = MagicMock()
+    mock_result.stdout = "ok"
+    mock_result.stderr = ""
+    mock_result.returncode = 0
+
+    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
+        run_claude("", "user", "sonnet", 600)
+
+    cmd = mock_run.call_args[0][0]
+    assert "--system-prompt" not in cmd
+
+
+def test_run_claude_forwards_timeout_to_subprocess() -> None:
+    mock_result = MagicMock()
+    mock_result.stdout = "ok"
+    mock_result.stderr = ""
+    mock_result.returncode = 0
+
+    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
+        run_claude("sys", "user", "sonnet", 333)
+
+    assert mock_run.call_args.kwargs["timeout"] == 333
+
+
+# ---------------------------------------------------------------------------
+# Arbiter — routing through ARBITER RunnerConfig
+# ---------------------------------------------------------------------------
+
+
+def test_run_arbiter_routes_through_arbiter_config() -> None:
+    """run_arbiter must pass ARBITER (not a hardcoded cfg) to run_reviewer.
+
+    Output format follows _ARBITER_VERDICT_RE: ``[UPHELD] F<n>`` per line.
+    """
+    findings = [
+        {"id": "F1", "line": "[F1] [CRITICAL] foo.py:1 — bar — baz"},
+        {"id": "F2", "line": "[F2] [CRITICAL] foo.py:2 — baz — qux"},
+    ]
+    raw_output = "[UPHELD] F1\n[OVERTURN] F2\nSummary: 1 UPHELD, 1 OVERTURN."
+
+    with (
+        patch("hook.read_file", return_value="arbiter prompt body"),
+        patch("hook.run_reviewer", return_value=(raw_output, "", 0)) as m,
+    ):
+        result = run_arbiter("a diff", findings)
+
+    assert m.call_count == 1
+    assert m.call_args[0][0] is ARBITER
+    assert result["status"] == "ok"
+    # Real parser path: F1 explicitly upheld, F2 explicitly overturned.
+    # If the parser regressed, F2 would default to UPHELD and this would fail.
+    assert result["upheld_ids"] == {"F1"}
+
+
+def test_run_arbiter_timeout_upholds_everything() -> None:
+    findings = [{"id": "F1", "line": "[F1] [CRITICAL] foo.py:1 — bar — baz"}]
+
+    def fake(*_a: object, **_k: object) -> object:
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
+
+    with (
+        patch("hook.read_file", return_value="prompt"),
+        patch("hook.run_reviewer", side_effect=fake),
+    ):
+        result = run_arbiter("a diff", findings)
+
+    assert result["status"] == "unavailable"
+    assert result["upheld_ids"] == {"F1"}
+
+
+# ---------------------------------------------------------------------------
+# Fallback re-raise — no-fallback path for FileNotFoundError/OSError
+# ---------------------------------------------------------------------------
+
+
+def test_run_with_fallback_no_fallback_reraises_filenotfound() -> None:
+    """When FALLBACK is None and the primary binary is missing, the
+    FileNotFoundError must propagate to the caller — not be swallowed."""
+    primary = RunnerConfig("opencode", "p")
+
+    def fake(cfg: RunnerConfig, sys_p: str, user_p: str) -> tuple[str, str, int]:
+        raise FileNotFoundError("no opencode on PATH")
+
+    with patch("hook.run_reviewer", side_effect=fake):
+        try:
+            run_with_fallback(primary, None, "s", "u")
+        except FileNotFoundError:
+            return
+    raise AssertionError("expected FileNotFoundError re-raise when fallback is None")
+
+
+def test_run_with_fallback_no_fallback_reraises_oserror() -> None:
+    primary = RunnerConfig("opencode", "p")
+
+    def fake(cfg: RunnerConfig, sys_p: str, user_p: str) -> tuple[str, str, int]:
+        raise PermissionError("opencode not executable")
+
+    with patch("hook.run_reviewer", side_effect=fake):
+        try:
+            run_with_fallback(primary, None, "s", "u")
+        except PermissionError:
+            return
+    raise AssertionError("expected PermissionError re-raise when fallback is None")
+
+
+# ---------------------------------------------------------------------------
+# run_single_lens — failure-→-status mapping (fan-out path)
+# ---------------------------------------------------------------------------
+
+
+def test_run_single_lens_success_returns_ok_status() -> None:
+    with patch("hook.run_with_fallback", return_value=("a real review body", "", 0, "opencode")):
+        result = run_single_lens("bugs", "diff", "src/foo.py", False)
+    assert result["status"] == "ok"
+    assert result["review"] == "a real review body"
+    assert result["reviewer"] == "opencode"
+    assert result["error"] == ""
+
+
+def test_run_single_lens_nonzero_rc_returns_error_status() -> None:
+    with patch("hook.run_with_fallback", return_value=("partial", "stderr-msg", 7, "claude")):
+        result = run_single_lens("bugs", "diff", "src/foo.py", False)
+    assert result["status"] == "error"
+    assert "rc=7" in result["error"]
+    assert "stderr-msg" in result["error"]
+    assert result["reviewer"] == "claude"
+
+
+def test_run_single_lens_empty_review_returns_error_status() -> None:
+    with patch("hook.run_with_fallback", return_value=("   \n  ", "", 0, "opencode")):
+        result = run_single_lens("bugs", "diff", "src/foo.py", False)
+    assert result["status"] == "error"
+    assert result["reviewer"] == "opencode"
+
+
+def test_run_single_lens_timeout_returns_timeout_status() -> None:
+    def fake(*_args: object, **_kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
+
+    with patch("hook.run_with_fallback", side_effect=fake):
+        result = run_single_lens("bugs", "diff", "src/foo.py", False)
+    assert result["status"] == "timeout"
+    assert "timeout" in result["error"]
+    # Default config has FALLBACK=claude/sonnet, so the timeout label points
+    # at the backend that finally timed out — claude.
+    assert result["reviewer"] == "claude"
+
+
+def test_run_single_lens_filenotfound_returns_error_status() -> None:
+    def fake(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError("no claude on PATH")
+
+    with patch("hook.run_with_fallback", side_effect=fake):
+        result = run_single_lens("bugs", "diff", "src/foo.py", False)
+    assert result["status"] == "error"
+    assert "both runners unavailable" in result["error"]
+    assert result["reviewer"] is None
+
+
+def test_run_single_lens_oserror_returns_error_status() -> None:
+    def fake(*_args: object, **_kwargs: object) -> object:
+        raise PermissionError("claude not executable")
+
+    with patch("hook.run_with_fallback", side_effect=fake):
+        result = run_single_lens("bugs", "diff", "src/foo.py", False)
+    assert result["status"] == "error"
+    assert "both runners unavailable" in result["error"]
+    assert result["reviewer"] is None
+
+
+def test_run_single_lens_missing_prompt_returns_error_status() -> None:
+    with patch("hook.build_lens_system_prompt", return_value=""):
+        result = run_single_lens("bugs", "diff", "src/foo.py", False)
+    assert result["status"] == "error"
+    assert "lens_bugs.md" in result["error"]
+    assert result["reviewer"] is None
+
+
+# ---------------------------------------------------------------------------
+# _run_single_call — exception branches in single-call path
+# ---------------------------------------------------------------------------
+
+
+def test_run_single_call_timeout_returns_timeout_verdict() -> None:
+    """When the single-call reviewer times out, the hook fails open
+    with verdict TIMEOUT and review=None (commit allowed)."""
+
+    def fake(*_args: object, **_kwargs: object) -> object:
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=1)
+
+    with (
+        patch("hook.build_system_prompt", return_value="sys"),
+        patch("hook.run_with_fallback", side_effect=fake),
+        patch("hook.save_log"),
+    ):
+        review, verdict = _run_single_call("diff", "src/foo.py", False)
+
+    assert review is None
+    assert verdict == "TIMEOUT"
+
+
+def test_run_single_call_filenotfound_returns_skip_verdict() -> None:
+    def fake(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError("no claude on PATH")
+
+    with (
+        patch("hook.build_system_prompt", return_value="sys"),
+        patch("hook.run_with_fallback", side_effect=fake),
+        patch("hook.save_log"),
+    ):
+        review, verdict = _run_single_call("diff", "src/foo.py", False)
+
+    assert review is None
+    assert verdict == "SKIP"
+
+
+def test_run_single_call_oserror_returns_skip_verdict() -> None:
+    """Generic OSError (e.g., permission denied launching the binary)
+    must take the same fail-open path as FileNotFoundError."""
+
+    def fake(*_args: object, **_kwargs: object) -> object:
+        raise PermissionError("claude not executable")
+
+    with (
+        patch("hook.build_system_prompt", return_value="sys"),
+        patch("hook.run_with_fallback", side_effect=fake),
+        patch("hook.save_log"),
+    ):
+        review, verdict = _run_single_call("diff", "src/foo.py", False)
+
+    assert review is None
+    assert verdict == "SKIP"
 
 
 # ---------------------------------------------------------------------------
@@ -195,7 +667,7 @@ def test_run_opencode_builds_correct_command() -> None:
     mock_result.returncode = 0
 
     with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
-        stdout, stderr, rc = run_opencode("sys", "user")
+        stdout, stderr, rc = run_opencode("sys", "user", "github-copilot/gpt-5.4", 1200)
 
     cmd = mock_run.call_args[0][0]
     assert cmd[0] == "opencode"
@@ -218,7 +690,7 @@ def test_run_opencode_empty_system_prompt() -> None:
     mock_result.returncode = 0
 
     with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
-        run_opencode("", "user only")
+        run_opencode("", "user only", "github-copilot/gpt-5.4", 1200)
 
     cmd = mock_run.call_args[0][0]
     assert cmd[-1] == "user only"

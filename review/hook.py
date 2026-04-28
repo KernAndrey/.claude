@@ -32,7 +32,17 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# --- Configuration ---
+from config import (
+    ARBITER,
+    FALLBACK,
+    FANOUT_THRESHOLD,
+    MAX_DIFF_LINES,
+    MIN_LINES_TO_REVIEW,
+    PRIMARY,
+    RunnerConfig,
+)
+
+# --- Path configuration (derived/fixed locations, not user-tunable) ---
 REVIEW_ROOT = Path.home() / ".claude" / "review"
 PROMPTS_DIR = REVIEW_ROOT / "prompts"
 GLOBAL_PROMPT = PROMPTS_DIR / "combined.md"
@@ -40,19 +50,6 @@ PROJECT_PROMPT = Path(".claude") / "review_prompt.md"
 LENS_DIR = PROMPTS_DIR
 ARBITER_PROMPT_PATH = LENS_DIR / "arbiter.md"
 LOG_DIR = REVIEW_ROOT / "logs"
-
-MAX_DIFF_LINES = 3000
-MIN_LINES_TO_REVIEW = 1
-FANOUT_THRESHOLD = 150  # added-line count above which we fan-out
-TIMEOUT_SECONDS = 1200
-ARBITER_MODEL = "opus"
-ARBITER_TIMEOUT_SECONDS = 900
-
-LENS_NAMES = (
-    "bugs",
-    "architecture",
-    "tests",
-)
 
 # Extensions that carry executable logic. Used by the lens router to skip
 # lenses that have nothing to examine on a docs/config/spec-only diff.
@@ -334,7 +331,8 @@ def _parse_opencode_json(raw: str) -> str:
 def run_opencode(
     system_prompt: str,
     user_prompt: str,
-    timeout: int = TIMEOUT_SECONDS,
+    model: str,
+    timeout: int,
 ) -> tuple[str, str, int]:
     """Run OpenCode CLI (--pure, no plugins). Returns (stdout, stderr, rc)."""
     full_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
@@ -344,7 +342,7 @@ def run_opencode(
         "run",
         "--pure",
         "--model",
-        "github-copilot/gpt-5.4",
+        model,
         "--format",
         "json",
         full_prompt,
@@ -364,8 +362,8 @@ def run_opencode(
 def run_claude(
     system_prompt: str,
     user_prompt: str,
-    model: str = "sonnet",
-    timeout: int = TIMEOUT_SECONDS,
+    model: str,
+    timeout: int,
 ) -> tuple[str, str, int]:
     """Run Claude Code CLI. Returns (stdout, stderr, rc)."""
     cmd = [
@@ -392,6 +390,93 @@ def run_claude(
     )
 
     return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+
+_VALID_BACKENDS: frozenset[str] = frozenset({"opencode", "claude"})
+
+
+def _verify_runner_configs() -> None:
+    """Pre-flight check for PRIMARY/FALLBACK/ARBITER backend names.
+
+    Without this, a misconfigured backend (e.g. typo in config.py) only
+    surfaces when ``run_reviewer()`` is finally called and raises
+    ``ValueError`` — which then bubbles up to ``main()``'s fail-open
+    ``except Exception`` and silently skips the entire review gate.
+    Calling this from ``main()`` first means the misconfig is caught
+    early and named in the warn log before fail-open kicks in.
+    """
+    for label, cfg in (("PRIMARY", PRIMARY), ("FALLBACK", FALLBACK), ("ARBITER", ARBITER)):
+        if cfg is None:
+            continue
+        if cfg.backend not in _VALID_BACKENDS:
+            raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {sorted(_VALID_BACKENDS)}")
+
+
+def run_reviewer(
+    cfg: RunnerConfig,
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str, str, int]:
+    """Dispatch to the configured backend. Returns (review, stderr, rc).
+
+    Assumes backends have been pre-validated via ``_verify_runner_configs``
+    at ``main()`` startup — so an unknown backend here means a programmer
+    error (someone built a RunnerConfig outside of config.py with a typo),
+    not a user misconfig.
+    """
+    if cfg.backend == "opencode":
+        return run_opencode(system_prompt, user_prompt, cfg.model, cfg.timeout)
+    if cfg.backend == "claude":
+        return run_claude(system_prompt, user_prompt, cfg.model, cfg.timeout)
+    raise ValueError(f"unknown backend: {cfg.backend!r}")
+
+
+def run_with_fallback(
+    primary: RunnerConfig,
+    fallback: RunnerConfig | None,
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str, str, int, str]:
+    """Try primary; fall back on timeout/error/empty output.
+
+    Returns (review, stderr, rc, used_backend_name) where
+    ``used_backend_name`` is one of ``"opencode"``, ``"claude"`` (the
+    backend that produced the returned tuple — useful for log labels).
+
+    Raises ``subprocess.TimeoutExpired`` only if the fallback also
+    times out, or if there is no fallback configured. Raises
+    ``FileNotFoundError``/``OSError`` only when both runners are
+    unreachable (or there is no fallback).
+    """
+    review = ""
+    stderr = ""
+    rc = -1
+    primary_failed_reason: str | None = None
+
+    try:
+        review, stderr, rc = run_reviewer(primary, system_prompt, user_prompt)
+    except subprocess.TimeoutExpired:
+        if fallback is None:
+            raise
+        primary_failed_reason = f"{primary.backend} timeout"
+    except (FileNotFoundError, OSError) as exc:
+        if fallback is None:
+            raise
+        primary_failed_reason = f"{primary.backend} unreachable: {exc}"
+
+    if primary_failed_reason is None and rc == 0 and review and review.strip():
+        return review, stderr, rc, primary.backend
+
+    if fallback is None:
+        return review, stderr, rc, primary.backend
+
+    if primary_failed_reason is not None:
+        warn(f"{primary_failed_reason}, falling back to {fallback.backend}")
+    else:
+        warn(f"{primary.backend} failed (rc={rc}), falling back to {fallback.backend}")
+
+    review, stderr, rc = run_reviewer(fallback, system_prompt, user_prompt)
+    return review, stderr, rc, fallback.backend
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +647,11 @@ LENS_APPLICABILITY: dict[str, callable] = {
     "tests": _has_code,
 }
 
+# Single source of truth for lens names — derived from the registry so
+# the two cannot drift. Order follows LENS_APPLICABILITY (insertion-ordered
+# dict on Python 3.7+).
+LENS_NAMES: tuple[str, ...] = tuple(LENS_APPLICABILITY)
+
 
 def applicable_lenses(files: str) -> list[str]:
     """Return lenses worth running for this file set, in LENS_NAMES order."""
@@ -592,56 +682,37 @@ def run_single_lens(
 
     user_prompt = build_user_prompt(diff, files, is_merge)
 
-    review: str = ""
-    stderr: str = ""
-    rc: int = -1
-    reviewer: str = "opencode"
-
     try:
-        review, stderr, rc = run_opencode(system_prompt, user_prompt)
+        review, stderr, rc, used = run_with_fallback(PRIMARY, FALLBACK, system_prompt, user_prompt)
     except subprocess.TimeoutExpired:
+        # Only fired if the fallback (or sole runner) timed out.
+        timed_out = FALLBACK.backend if FALLBACK is not None else PRIMARY.backend
         return {
             "name": lens_name,
             "status": "timeout",
             "review": "",
-            "error": "opencode timeout",
-            "reviewer": "opencode",
+            "error": f"{timed_out} timeout",
+            "reviewer": timed_out,
         }
     except (FileNotFoundError, OSError) as exc:
-        stderr = str(exc)
-        rc = -1
+        return {
+            "name": lens_name,
+            "status": "error",
+            "review": "",
+            "error": f"both runners unavailable: {exc}",
+            "reviewer": None,
+        }
 
     if rc != 0 or not review or not review.strip():
-        # fallback to Claude Code
-        try:
-            review, stderr, rc = run_claude(system_prompt, user_prompt)
-            reviewer = "claude"
-        except subprocess.TimeoutExpired:
-            return {
-                "name": lens_name,
-                "status": "timeout",
-                "review": "",
-                "error": "claude fallback timeout",
-                "reviewer": "claude",
-            }
-        except (FileNotFoundError, OSError) as exc:
-            return {
-                "name": lens_name,
-                "status": "error",
-                "review": "",
-                "error": f"both runners unavailable: {exc}",
-                "reviewer": None,
-            }
-        if rc != 0 or not review or not review.strip():
-            return {
-                "name": lens_name,
-                "status": "error",
-                "review": review,
-                "error": f"rc={rc} stderr={stderr}",
-                "reviewer": reviewer,
-            }
+        return {
+            "name": lens_name,
+            "status": "error",
+            "review": review,
+            "error": f"rc={rc} stderr={stderr}",
+            "reviewer": used,
+        }
 
-    return {"name": lens_name, "status": "ok", "review": review, "error": "", "reviewer": reviewer}
+    return {"name": lens_name, "status": "ok", "review": review, "error": "", "reviewer": used}
 
 
 def _aggregate_lens_outputs(per_lens: list[dict]) -> str:
@@ -816,16 +887,11 @@ def run_arbiter(
         "in the same order, then the `Summary:` line. No other content."
     )
 
-    info(f"Arbiter: analyzing {len(findings)} finding(s) with Claude {ARBITER_MODEL} (may take 30-120s)...")
+    info(f"Arbiter: analyzing {len(findings)} finding(s) with {ARBITER.backend} {ARBITER.model} (may take 30-120s)...")
     try:
-        raw, stderr, rc = run_claude(
-            system_prompt,
-            user_prompt,
-            model=ARBITER_MODEL,
-            timeout=ARBITER_TIMEOUT_SECONDS,
-        )
+        raw, stderr, rc = run_reviewer(ARBITER, system_prompt, user_prompt)
     except subprocess.TimeoutExpired:
-        warn(f"Arbiter timed out after {ARBITER_TIMEOUT_SECONDS}s — upholding all findings")
+        warn(f"Arbiter timed out after {ARBITER.timeout}s — upholding all findings")
         return {"status": "unavailable", "upheld_ids": set(all_ids), "raw": "", "error": "timeout"}
     except (FileNotFoundError, OSError) as exc:
         warn(f"Arbiter unreachable ({exc}) — upholding all findings")
@@ -937,7 +1003,7 @@ def _format_per_lens(per_lens: list[dict]) -> str:
 
 
 def _format_arbiter(arbiter: dict) -> str:
-    parts: list[str] = [f"## Arbiter ({ARBITER_MODEL}) — status: {arbiter.get('status', 'n/a')}\n"]
+    parts: list[str] = [f"## Arbiter ({ARBITER.model}) — status: {arbiter.get('status', 'n/a')}\n"]
     if arbiter.get("error"):
         parts.append(f"_Error:_ {arbiter['error']}\n")
     upheld = arbiter.get("upheld_ids") or set()
@@ -1031,31 +1097,6 @@ def collect_diff() -> tuple[str, str, bool] | None:
     return diff, files, is_merge
 
 
-def _call_single_reviewer(
-    system_prompt: str,
-    user_prompt: str,
-) -> tuple[str, str, str, int]:
-    """Try OpenCode first, fall back to Claude Code. (Single-call path only.)"""
-    reviewer: str | None = None
-    review: str = ""
-    reviewer_stderr: str = ""
-    returncode: int = -1
-
-    try:
-        review, reviewer_stderr, returncode = run_opencode(system_prompt, user_prompt)
-        reviewer = "opencode"
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-        warn(f"OpenCode unavailable ({exc}), falling back to Claude Code")
-
-    if reviewer is None or returncode != 0 or not review:
-        if reviewer == "opencode":
-            warn(f"OpenCode failed (rc={returncode}), falling back to Claude Code")
-        review, reviewer_stderr, returncode = run_claude(system_prompt, user_prompt)
-        reviewer = "claude"
-
-    return review, reviewer_stderr, reviewer, returncode
-
-
 def _run_single_call(
     diff: str,
     files: str,
@@ -1071,15 +1112,12 @@ def _run_single_call(
     user_prompt = build_user_prompt(diff, files, is_merge)
 
     try:
-        review, reviewer_stderr, reviewer, returncode = _call_single_reviewer(
-            system_prompt,
-            user_prompt,
-        )
-    except subprocess.TimeoutExpired:
-        warn(f"Review timed out after {TIMEOUT_SECONDS}s — allowing commit")
+        review, reviewer_stderr, returncode, reviewer = run_with_fallback(PRIMARY, FALLBACK, system_prompt, user_prompt)
+    except subprocess.TimeoutExpired as exc:
+        warn(f"Review timed out after {exc.timeout}s — allowing commit")
         save_log("TIMEOUT", files=files, diff=diff, error_msg="timed out")
         return None, "TIMEOUT"
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         warn("Both reviewers unavailable — allowing commit")
         save_log("SKIP", files=files, diff=diff, error_msg="no reviewer available")
         return None, "SKIP"
@@ -1214,6 +1252,8 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
 
 def main() -> None:
     try:
+        _verify_runner_configs()
+
         context = collect_diff()
         if not context:
             sys.exit(0)

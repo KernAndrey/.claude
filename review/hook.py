@@ -32,6 +32,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from backends import BACKENDS
 from config import (
     ARBITER,
     FALLBACK,
@@ -308,93 +309,6 @@ def build_lens_system_prompt(lens_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _parse_opencode_json(raw: str) -> str:
-    """Extract text content from opencode --format json output."""
-    import json
-
-    parts: list[str] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "text":
-            text = event.get("part", {}).get("text", "")
-            if text:
-                parts.append(text)
-    return "\n".join(parts) if parts else ""
-
-
-def run_opencode(
-    system_prompt: str,
-    user_prompt: str,
-    model: str,
-    timeout: int,
-) -> tuple[str, str, int]:
-    """Run OpenCode CLI (--pure, no plugins). Returns (stdout, stderr, rc)."""
-    full_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
-
-    cmd = [
-        "opencode",
-        "run",
-        "--pure",
-        "--model",
-        model,
-        "--format",
-        "json",
-        full_prompt,
-    ]
-
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-
-    review = _parse_opencode_json(result.stdout) if result.stdout else ""
-    return review, result.stderr.strip(), result.returncode
-
-
-def run_claude(
-    system_prompt: str,
-    user_prompt: str,
-    model: str,
-    timeout: int,
-) -> tuple[str, str, int]:
-    """Run Claude Code CLI. Returns (stdout, stderr, rc)."""
-    cmd = [
-        "claude",
-        "-p",
-        "--model",
-        model,
-        "--no-session-persistence",
-        "--tools",
-        "Read,Grep,Glob",
-        "--output-format",
-        "text",
-    ]
-
-    if system_prompt:
-        cmd.extend(["--system-prompt", system_prompt])
-
-    result = subprocess.run(
-        cmd,
-        input=user_prompt,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-
-    return result.stdout.strip(), result.stderr.strip(), result.returncode
-
-
-_VALID_BACKENDS: frozenset[str] = frozenset({"opencode", "claude"})
-
-
 def _verify_runner_configs() -> None:
     """Pre-flight check for PRIMARY/FALLBACK/ARBITER backend names.
 
@@ -405,11 +319,12 @@ def _verify_runner_configs() -> None:
     Calling this from ``main()`` first means the misconfig is caught
     early and named in the warn log before fail-open kicks in.
     """
+    valid = sorted(BACKENDS)
     for label, cfg in (("PRIMARY", PRIMARY), ("FALLBACK", FALLBACK), ("ARBITER", ARBITER)):
         if cfg is None:
             continue
-        if cfg.backend not in _VALID_BACKENDS:
-            raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {sorted(_VALID_BACKENDS)}")
+        if cfg.backend not in BACKENDS:
+            raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {valid}")
 
 
 def run_reviewer(
@@ -420,15 +335,15 @@ def run_reviewer(
     """Dispatch to the configured backend. Returns (review, stderr, rc).
 
     Assumes backends have been pre-validated via ``_verify_runner_configs``
-    at ``main()`` startup — so an unknown backend here means a programmer
-    error (someone built a RunnerConfig outside of config.py with a typo),
-    not a user misconfig.
+    at ``main()`` startup, so an unknown backend here means either a
+    programmer error (a RunnerConfig built outside config.py with a
+    typo) or a backend that is named in config but not registered in
+    ``backends.BACKENDS``.
     """
-    if cfg.backend == "opencode":
-        return run_opencode(system_prompt, user_prompt, cfg.model, cfg.timeout)
-    if cfg.backend == "claude":
-        return run_claude(system_prompt, user_prompt, cfg.model, cfg.timeout)
-    raise ValueError(f"unknown backend: {cfg.backend!r}")
+    backend = BACKENDS.get(cfg.backend)
+    if backend is None:
+        raise ValueError(f"unknown backend: {cfg.backend!r}")
+    return backend.run(system_prompt, user_prompt, cfg.model, cfg.timeout)
 
 
 def run_with_fallback(

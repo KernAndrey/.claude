@@ -4,13 +4,13 @@ import os
 import subprocess
 from unittest.mock import MagicMock, patch
 
+from backends import BACKENDS, Backend, ClaudeBackend, OpencodeBackend
 from config import FANOUT_THRESHOLD, MAX_DIFF_LINES, RunnerConfig
 from hook import (
     ARBITER,
     LENS_APPLICABILITY,
     LENS_NAMES,
     _aggregate_lens_outputs,
-    _parse_opencode_json,
     _render_fanout_output,
     _run_single_call,
     _verify_runner_configs,
@@ -27,8 +27,6 @@ from hook import (
     parse_arbiter_verdict,
     parse_verdict,
     run_arbiter,
-    run_claude,
-    run_opencode,
     run_review,
     run_reviewer,
     run_single_lens,
@@ -48,7 +46,7 @@ def _pair() -> tuple[RunnerConfig, RunnerConfig]:
 
 def test_run_reviewer_dispatches_opencode() -> None:
     cfg = RunnerConfig("opencode", "model-x", timeout=42)
-    with patch("hook.run_opencode", return_value=("out", "err", 0)) as m:
+    with patch.object(BACKENDS["opencode"], "run", return_value=("out", "err", 0)) as m:
         result = run_reviewer(cfg, "sys", "user")
     m.assert_called_once_with("sys", "user", "model-x", 42)
     assert result == ("out", "err", 0)
@@ -56,14 +54,14 @@ def test_run_reviewer_dispatches_opencode() -> None:
 
 def test_run_reviewer_dispatches_claude() -> None:
     cfg = RunnerConfig("claude", "sonnet", timeout=99)
-    with patch("hook.run_claude", return_value=("out", "err", 0)) as m:
+    with patch.object(BACKENDS["claude"], "run", return_value=("out", "err", 0)) as m:
         result = run_reviewer(cfg, "sys", "user")
     m.assert_called_once_with("sys", "user", "sonnet", 99)
     assert result == ("out", "err", 0)
 
 
 def test_run_reviewer_unknown_backend_raises_value_error() -> None:
-    cfg = RunnerConfig("bogus", "x")  # type: ignore[arg-type]
+    cfg = RunnerConfig("bogus", "x")
     try:
         run_reviewer(cfg, "s", "u")
     except ValueError as exc:
@@ -178,7 +176,7 @@ def test_verify_runner_configs_passes_on_default_config() -> None:
 
 
 def test_verify_runner_configs_raises_on_invalid_primary_backend() -> None:
-    bogus = RunnerConfig("bogus-backend", "x")  # type: ignore[arg-type]
+    bogus = RunnerConfig("bogus-backend", "x")
     with patch("hook.PRIMARY", bogus):
         try:
             _verify_runner_configs()
@@ -190,7 +188,7 @@ def test_verify_runner_configs_raises_on_invalid_primary_backend() -> None:
 
 
 def test_verify_runner_configs_raises_on_invalid_fallback_backend() -> None:
-    bogus = RunnerConfig("typo", "x")  # type: ignore[arg-type]
+    bogus = RunnerConfig("typo", "x")
     with patch("hook.FALLBACK", bogus):
         try:
             _verify_runner_configs()
@@ -201,7 +199,7 @@ def test_verify_runner_configs_raises_on_invalid_fallback_backend() -> None:
 
 
 def test_verify_runner_configs_raises_on_invalid_arbiter_backend() -> None:
-    bogus = RunnerConfig("nope", "x")  # type: ignore[arg-type]
+    bogus = RunnerConfig("nope", "x")
     with patch("hook.ARBITER", bogus):
         try:
             _verify_runner_configs()
@@ -226,31 +224,114 @@ def test_lens_names_derived_from_lens_applicability() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Backend registry contract — adding a new backend is single-touch-point
+# ---------------------------------------------------------------------------
+
+
+def test_backends_registry_keys_match_class_names() -> None:
+    """Registry keys must equal each backend's declared name attribute."""
+    for key, backend in BACKENDS.items():
+        assert key == backend.name
+
+
+def test_backends_registry_contains_default_backends() -> None:
+    """opencode and claude are always present out of the box."""
+    assert "opencode" in BACKENDS
+    assert "claude" in BACKENDS
+    assert isinstance(BACKENDS["opencode"], OpencodeBackend)
+    assert isinstance(BACKENDS["claude"], ClaudeBackend)
+
+
+def test_backend_subclass_must_implement_run() -> None:
+    """ABC blocks instantiation of incomplete backends — protects against
+    a future Backend subclass forgetting to implement run()."""
+
+    class Incomplete(Backend):
+        name = "incomplete"
+
+    try:
+        Incomplete()  # type: ignore[abstract]
+    except TypeError:
+        return
+    raise AssertionError("expected TypeError on Backend subclass missing run()")
+
+
+def test_run_reviewer_dispatches_to_custom_backend() -> None:
+    """A new Backend subclass + registry entry is the entire recipe.
+
+    Proves that run_reviewer routes through BACKENDS without any
+    backend-name hardcoding — adding 'codex' or 'kimi' would work the
+    same way.
+    """
+    calls: list[tuple[str, str, str, int]] = []
+
+    class FakeBackend(Backend):
+        name = "fake"
+
+        def run(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            model: str,
+            timeout: int,
+        ) -> tuple[str, str, int]:
+            calls.append((system_prompt, user_prompt, model, timeout))
+            return "out", "", 0
+
+    fake = FakeBackend()
+    with patch.dict("hook.BACKENDS", {"fake": fake}):
+        cfg = RunnerConfig("fake", "fake-model", timeout=42)
+        out, err, rc = run_reviewer(cfg, "sys", "usr")
+    assert (out, err, rc) == ("out", "", 0)
+    assert calls == [("sys", "usr", "fake-model", 42)]
+
+
+def test_verify_runner_configs_error_lists_registered_backends() -> None:
+    """Error message must enumerate keys from BACKENDS, not a hardcoded set.
+
+    Defends against a future revert from BACKENDS-driven validation back
+    to a frozen literal set that drifts from the real registry.
+    """
+    bogus = RunnerConfig("ghost", "x")
+    with patch("hook.PRIMARY", bogus):
+        try:
+            _verify_runner_configs()
+        except ValueError as exc:
+            msg = str(exc)
+            assert "ghost" in msg
+            assert "must be one of" in msg
+            for name in BACKENDS:
+                assert name in msg, f"registered backend {name!r} missing from error message"
+            return
+    raise AssertionError("expected ValueError when PRIMARY backend not in BACKENDS")
+
+
+# ---------------------------------------------------------------------------
 # Backend-runner contract — model + timeout propagation
 # ---------------------------------------------------------------------------
 
 
-def test_run_opencode_forwards_timeout_to_subprocess() -> None:
+def test_opencode_backend_forwards_timeout() -> None:
     """timeout from RunnerConfig must reach subprocess.run(..., timeout=)."""
     mock_result = MagicMock()
     mock_result.stdout = '{"type":"text","part":{"type":"text","text":"out"}}\n'
     mock_result.stderr = ""
     mock_result.returncode = 0
 
-    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
-        run_opencode("sys", "user", "model-x", 777)
+    with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
+        OpencodeBackend().run("sys", "user", "model-x", 777)
 
     assert mock_run.call_args.kwargs["timeout"] == 777
 
 
-def test_run_claude_builds_correct_command() -> None:
+def test_claude_backend_builds_correct_command() -> None:
     mock_result = MagicMock()
     mock_result.stdout = "claude review body"
     mock_result.stderr = ""
     mock_result.returncode = 0
 
-    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
-        stdout, stderr, rc = run_claude("sys", "user", "sonnet", 600)
+    with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
+        stdout, stderr, rc = ClaudeBackend().run("sys", "user", "sonnet", 600)
 
     cmd = mock_run.call_args[0][0]
     assert cmd[0] == "claude"
@@ -264,27 +345,27 @@ def test_run_claude_builds_correct_command() -> None:
     assert (stdout, stderr, rc) == ("claude review body", "", 0)
 
 
-def test_run_claude_omits_system_prompt_flag_when_empty() -> None:
+def test_claude_backend_omits_system_prompt_flag_when_empty() -> None:
     mock_result = MagicMock()
     mock_result.stdout = "ok"
     mock_result.stderr = ""
     mock_result.returncode = 0
 
-    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
-        run_claude("", "user", "sonnet", 600)
+    with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
+        ClaudeBackend().run("", "user", "sonnet", 600)
 
     cmd = mock_run.call_args[0][0]
     assert "--system-prompt" not in cmd
 
 
-def test_run_claude_forwards_timeout_to_subprocess() -> None:
+def test_claude_backend_forwards_timeout() -> None:
     mock_result = MagicMock()
     mock_result.stdout = "ok"
     mock_result.stderr = ""
     mock_result.returncode = 0
 
-    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
-        run_claude("sys", "user", "sonnet", 333)
+    with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
+        ClaudeBackend().run("sys", "user", "sonnet", 333)
 
     assert mock_run.call_args.kwargs["timeout"] == 333
 
@@ -644,30 +725,50 @@ def test_over_limit_returns_message() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_parse_opencode_json_extracts_last_text() -> None:
+def test_opencode_backend_parses_json_text_events() -> None:
     raw = (
         '{"type":"step_start","timestamp":1}\n'
         '{"type":"text","timestamp":2,"part":{"type":"text","text":"partial"}}\n'
         '{"type":"text","timestamp":3,"part":{"type":"text","text":"[WARNING] foo\\n\\nSummary: 0 CRITICAL"}}\n'
         '{"type":"step_finish","timestamp":4}\n'
     )
-    assert _parse_opencode_json(raw) == "partial\n[WARNING] foo\n\nSummary: 0 CRITICAL"
+    assert OpencodeBackend._parse_json(raw) == "partial\n[WARNING] foo\n\nSummary: 0 CRITICAL"
 
 
-def test_parse_opencode_json_empty_output() -> None:
-    assert _parse_opencode_json("") == ""
-    assert _parse_opencode_json('{"type":"step_start"}\n') == ""
+def test_opencode_backend_parses_empty_json_output() -> None:
+    assert OpencodeBackend._parse_json("") == ""
+    assert OpencodeBackend._parse_json('{"type":"step_start"}\n') == ""
 
 
-def test_run_opencode_builds_correct_command() -> None:
+def test_opencode_backend_parses_skips_malformed_and_non_text_lines() -> None:
+    """A malformed JSON line in the middle of the stream is skipped, and
+    valid non-text events (step_start, tool_call, ...) are filtered out
+    — subsequent valid text events still come through.
+
+    Defends the ``except json.JSONDecodeError: continue`` branch and
+    the ``if event.get("type") == "text"`` filter against regressions
+    that would abort parsing or drop subsequent text on a single bad
+    line.
+    """
+    raw = (
+        '{"type":"text","part":{"type":"text","text":"first"}}\n'
+        "this is not valid json at all\n"
+        '{"type":"step_start","timestamp":1}\n'
+        '{"type":"tool_call","part":{"name":"Read"}}\n'
+        '{"type":"text","part":{"type":"text","text":"second"}}\n'
+    )
+    assert OpencodeBackend._parse_json(raw) == "first\nsecond"
+
+
+def test_opencode_backend_builds_correct_command() -> None:
     json_output = '{"type":"text","part":{"type":"text","text":"done"}}\n'
     mock_result = MagicMock()
     mock_result.stdout = json_output
     mock_result.stderr = ""
     mock_result.returncode = 0
 
-    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
-        stdout, stderr, rc = run_opencode("sys", "user", "github-copilot/gpt-5.4", 1200)
+    with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
+        stdout, stderr, rc = OpencodeBackend().run("sys", "user", "github-copilot/gpt-5.4", 1200)
 
     cmd = mock_run.call_args[0][0]
     assert cmd[0] == "opencode"
@@ -682,18 +783,49 @@ def test_run_opencode_builds_correct_command() -> None:
     assert rc == 0
 
 
-def test_run_opencode_empty_system_prompt() -> None:
+def test_opencode_backend_empty_system_prompt() -> None:
     json_output = '{"type":"text","part":{"type":"text","text":"done"}}\n'
     mock_result = MagicMock()
     mock_result.stdout = json_output
     mock_result.stderr = ""
     mock_result.returncode = 0
 
-    with patch("hook.subprocess.run", return_value=mock_result) as mock_run:
-        run_opencode("", "user only", "github-copilot/gpt-5.4", 1200)
+    with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
+        OpencodeBackend().run("", "user only", "github-copilot/gpt-5.4", 1200)
 
     cmd = mock_run.call_args[0][0]
     assert cmd[-1] == "user only"
+
+
+def test_opencode_backend_run_empty_stdout_short_circuits_parser() -> None:
+    """When the CLI returns empty stdout, run() must return an empty
+    review without invoking _parse_json — the ``if result.stdout``
+    short-circuit. stderr and returncode still flow through to the
+    caller so error reporting (rc=1, "no model found", ...) is not
+    swallowed.
+    """
+    mock_result = MagicMock()
+    mock_result.stdout = ""
+    mock_result.stderr = "no model found"
+    mock_result.returncode = 1
+
+    sentinel_called: list[bool] = []
+    real_parse = OpencodeBackend._parse_json
+
+    def tracking_parse(raw: str) -> str:
+        sentinel_called.append(True)
+        return real_parse(raw)
+
+    with (
+        patch("backends.subprocess.run", return_value=mock_result),
+        patch.object(OpencodeBackend, "_parse_json", staticmethod(tracking_parse)),
+    ):
+        review, stderr, rc = OpencodeBackend().run("sys", "user", "model-x", 600)
+
+    assert review == ""
+    assert stderr == "no model found"
+    assert rc == 1
+    assert sentinel_called == [], "_parse_json must not be called when stdout is empty"
 
 
 # ---------------------------------------------------------------------------

@@ -4,7 +4,7 @@ import os
 import subprocess
 from unittest.mock import MagicMock, patch
 
-from backends import BACKENDS, Backend, ClaudeBackend, OpencodeBackend
+from backends import BACKENDS, Backend, ClaudeBackend, OpencodeBackend, _build_registry
 from config import FANOUT_THRESHOLD, MAX_DIFF_LINES, RunnerConfig
 from hook import (
     ARBITER,
@@ -254,6 +254,83 @@ def test_backend_subclass_must_implement_run() -> None:
     except TypeError:
         return
     raise AssertionError("expected TypeError on Backend subclass missing run()")
+
+
+def test_build_registry_rejects_duplicate_backend_names() -> None:
+    """A copy-paste mistake that forgets to rename ``name`` must fail at
+    import time, not silently shadow an existing backend.
+
+    Without this guard, ``BACKENDS`` last-write-wins on the dict
+    comprehension, ``_verify_runner_configs`` still accepts the key,
+    and ``run_reviewer`` dispatches the surviving backend with no
+    startup error.
+    """
+
+    class FirstClaude(Backend):
+        name = "claude"
+
+        def run(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            model: str,
+            timeout: int,
+        ) -> tuple[str, str, int]:
+            return "first", "", 0
+
+    class SecondClaude(Backend):
+        name = "claude"
+
+        def run(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            model: str,
+            timeout: int,
+        ) -> tuple[str, str, int]:
+            return "second", "", 0
+
+    try:
+        _build_registry(FirstClaude(), SecondClaude())
+    except ValueError as exc:
+        msg = str(exc)
+        assert "claude" in msg
+        assert "FirstClaude" in msg
+        assert "SecondClaude" in msg
+        return
+    raise AssertionError("expected ValueError on duplicate backend name")
+
+
+def test_build_registry_accepts_distinct_names() -> None:
+    """Smoke check: distinct names build a registry with both entries."""
+
+    class Foo(Backend):
+        name = "foo"
+
+        def run(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            model: str,
+            timeout: int,
+        ) -> tuple[str, str, int]:
+            return "foo-out", "", 0
+
+    class Bar(Backend):
+        name = "bar"
+
+        def run(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            model: str,
+            timeout: int,
+        ) -> tuple[str, str, int]:
+            return "bar-out", "", 0
+
+    foo, bar = Foo(), Bar()
+    registry = _build_registry(foo, bar)
+    assert registry == {"foo": foo, "bar": bar}
 
 
 def test_run_reviewer_dispatches_to_custom_backend() -> None:

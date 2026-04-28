@@ -91,6 +91,16 @@ The `Backend` ABC enforces one method (`run`). A subclass that
 forgets to implement it cannot be instantiated — the test suite
 catches this via `test_backend_subclass_must_implement_run`.
 
+`Backend.run` must be **thread-safe**: `hook.run_fanout` invokes the
+same Backend instance from multiple worker threads. Keep all mutable
+state inside `run` locals; do not stash request-scoped data on
+`self`.
+
+The registry is built via `_build_registry(...)`, which raises
+`ValueError` at import time if two backends share the same `name`
+(e.g. a copy-paste that forgets to rename). A plain dict
+comprehension would silently shadow.
+
 ## Pipeline
 
 `hook.py:main()` runs in this order:

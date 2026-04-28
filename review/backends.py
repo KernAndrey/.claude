@@ -36,7 +36,13 @@ class Backend(ABC):
         model: str,
         timeout: int,
     ) -> tuple[str, str, int]:
-        """Invoke the CLI. Return (review_text, stderr, returncode)."""
+        """Invoke the CLI. Return (review_text, stderr, returncode).
+
+        Must be thread-safe: ``hook.run_fanout`` calls the same Backend
+        instance from multiple worker threads concurrently. Keep all
+        mutable state inside ``run`` locals; do not stash request-scoped
+        data on ``self``.
+        """
 
 
 class OpencodeBackend(Backend):
@@ -121,8 +127,29 @@ class ClaudeBackend(Backend):
         return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
+def _build_registry(*backends: Backend) -> dict[str, Backend]:
+    """Build the BACKENDS registry, rejecting duplicate ``name`` values.
+
+    A plain ``{b.name: b for ...}`` comprehension would last-write-wins on
+    a name collision — a copy-paste mistake that forgets to rename
+    ``name`` would silently shadow an existing backend, and
+    ``_verify_runner_configs`` would still accept the key.
+    """
+    registry: dict[str, Backend] = {}
+    for b in backends:
+        if b.name in registry:
+            raise ValueError(
+                f"duplicate backend name: {b.name!r} "
+                f"(both {type(registry[b.name]).__name__} and {type(b).__name__} claim it)"
+            )
+        registry[b.name] = b
+    return registry
+
+
 # Registry. The single source of truth for backend names. Adding a new
 # backend = adding one entry here (plus the class above).
-BACKENDS: dict[str, Backend] = {
-    b.name: b for b in (OpencodeBackend(), ClaudeBackend())
-}  # review-note: Backend ABC over a Callable map is deliberate — each backend owns its parser as a method (OpencodeBackend._parse_json) and the ABC enforces the contract via test_backend_subclass_must_implement_run; a Callable dict has no equivalent guard.
+# review-note: Backend ABC over a Callable map is deliberate — each backend
+# owns its parser as a method (OpencodeBackend._parse_json) and the ABC
+# enforces the contract via test_backend_subclass_must_implement_run; a
+# Callable dict has no equivalent guard.
+BACKENDS: dict[str, Backend] = _build_registry(OpencodeBackend(), ClaudeBackend())

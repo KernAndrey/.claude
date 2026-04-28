@@ -64,7 +64,16 @@
     "command": "bash /home/kern/.claude/statusline-command.sh"
   },
   "enabledPlugins": {
-    "ralph-loop@claude-plugins-official": true
+    "ralph-loop@claude-plugins-official": true,
+    "claude-seo@agricidaniel-seo": true
+  },
+  "extraKnownMarketplaces": {
+    "agricidaniel-seo": {
+      "source": {
+        "source": "github",
+        "repo": "AgriciDaniel/claude-seo"
+      }
+    }
   },
   "effortLevel": "high",
   "advisorModel": "opus",
@@ -73,7 +82,8 @@
     "mode": "hold"
   },
   "skipDangerousModePermissionPrompt": true,
+  "teammateMode": "tmux",
+  "agentPushNotifEnabled": true,
   "skipAutoPermissionPrompt": true,
-  "voiceEnabled": true,
-  "teammateMode": "tmux"
+  "voiceEnabled": true
 }

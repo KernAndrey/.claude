@@ -8,7 +8,7 @@ Called by ~/.claude/git-hooks/pre-commit. Modes:
   reading prompts/combined.md.
 - Large diff (added lines >= FANOUT_THRESHOLD): 3 parallel lens calls
   (bugs / architecture / tests), aggregated, then passed through a
-  Claude Opus arbiter that UPHOLDs or OVERTURNs each [CRITICAL]
+  Claude Sonnet arbiter that UPHOLDs or OVERTURNs each [CRITICAL]
   finding — only when CRITICALs are present.
 
 The router (LENS_APPLICABILITY) skips lenses that have nothing to
@@ -45,7 +45,7 @@ MAX_DIFF_LINES = 3000
 MIN_LINES_TO_REVIEW = 1
 FANOUT_THRESHOLD = 150  # added-line count above which we fan-out
 TIMEOUT_SECONDS = 1200
-ARBITER_MODEL = "opus"
+ARBITER_MODEL = "sonnet"
 ARBITER_TIMEOUT_SECONDS = 900
 
 LENS_NAMES = (
@@ -789,7 +789,7 @@ def run_arbiter(
     diff: str,
     findings: list[dict],
 ) -> dict:
-    """Run the Claude Opus arbiter over findings.
+    """Run the Claude Sonnet arbiter over findings.
 
     Returns {status, upheld_ids, raw, error}. Fail-open on any error:
     upheld_ids will equal the full set of input finding IDs.
@@ -1109,7 +1109,7 @@ def _arbitrate_single_call_review(
     """Apply well-formed/critical/arbiter logic to a single-call review.
 
     Mirrors the fan-out arbiter step so small diffs also benefit from
-    Opus calibration when the primary reviewer flags CRITICALs.
+    Sonnet calibration when the primary reviewer flags CRITICALs.
     """
     if not is_well_formed(review):
         warn("Reviewer output missing `Summary:` terminator — treating as malformed (fail-closed BLOCK)")

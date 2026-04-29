@@ -43,7 +43,7 @@ Missing annotations must be added before proceeding.
 
 ### After every commit — review WARNINGs
 
-After each successful commit, list every `[WARNING]` from the review and assign one decision per item: **Fix now**, **Fix in follow-up `<task-id>`** (only when out of scope), or **Accept because `<concrete reason>`**. Default to fixing when no specific reason to accept exists.
+After each successful commit, list every `[WARNING]` from the review and assign one decision per item: **Fix now** or **Accept because `<concrete reason>`**. Default to fixing when no specific reason to accept exists.
 
 ### Test discipline
 

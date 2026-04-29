@@ -35,6 +35,8 @@ Safely commit staged and unstaged changes with security checks, logical splittin
 
 **This phase is mandatory.**
 
+Two layers run: (a) you scan manually here, before `git commit`; (b) pre-commit hooks `gitleaks` (secrets in staged content) and `semgrep --config=auto` run automatically at commit time and either can BLOCK the commit. For semgrep false positives, drop `.semgrep-exclude-rules` at the repo root — one rule-id per line, `#` for comments. The hook passes each line as `--exclude-rule=<id>`. Example: `~/.claude/git-hooks/.semgrep-exclude-rules.example`.
+
 Scan ALL changed and new files (both staged and unstaged) for secrets and sensitive data. For each changed file, read its diff and check for:
 
 ### Patterns to detect
@@ -199,6 +201,17 @@ Where the referenced test path actually exists AND contains an
 assertion on the new behavior. Verify with `Read` before honoring.
 Unverifiable references do not unblock the commit.
 
+### When the AI review hook blocks for missing tests
+
+The only acceptable response is to write real tests for every flagged code path and address every `[CRITICAL]` and every `[WARNING]` in the **next** commit. The following are not fixes — they are cheating, and the next review will block them again or ship broken code:
+
+- Deleting the production code so the branch disappears.
+- Writing stub tests (`assert True`, mocking the very thing under test, tests that pass without exercising the branch).
+- Splitting the commit so the untested code lands in a later one.
+- Escalating to the user to skip tests — tests are not negotiable.
+
+Partial fixes only re-trigger the same block. Write the tests.
+
 ## Phase 4: Analyze and Split
 
 Review all changes and group them into logical commits. A logical commit is a cohesive set of changes that represents one idea:
@@ -267,6 +280,15 @@ Repeat steps 1–8 for each subsequent logical commit.
 ### Why the stash-guard exists
 
 The pre-commit framework has a bug where, when unstaged changes are present at commit time, it generates a binary patch, resets the working tree to HEAD, runs hooks (which can reformat staged files via `ruff-format`), then restores the patch with `git apply --index`. The `--index` flag writes blob hashes from the patch header into `.git/index` without ensuring those blobs are written to `.git/objects/`. Result: the index references missing blobs, and subsequent commits fail with `invalid object … Error building trees`. Keeping the working tree clean of unstaged content at commit time prevents pre-commit from entering its stash/restore path, which is the only way to avoid this corruption reliably.
+
+## Phase 6.5: Review WARNINGs
+
+After each successful commit, list every `[WARNING]` from the AI review and assign one decision per item:
+
+- **Fix now** — default when no specific reason to accept exists.
+- **Accept because `<concrete reason>`** — must be a concrete reason, not a hand-wave.
+
+Surface the list and decisions to the user before moving on to the next commit or summary.
 
 ## Phase 7: Summary
 

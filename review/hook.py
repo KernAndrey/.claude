@@ -42,7 +42,7 @@ from config import (
     ARBITER,
     FALLBACK,
     FANOUT_THRESHOLD,
-    MAX_DIFF_LINES,
+    MAX_PROD_LINES,
     MIN_LINES_TO_REVIEW,
     PRIMARY,
     RunnerConfig,
@@ -223,13 +223,20 @@ def count_added_production_lines(diff: str) -> int:
 
 
 def check_diff_size(diff: str) -> str | None:
-    """Return an error message if the diff exceeds MAX_DIFF_LINES, else None."""
-    line_count = len(diff.split("\n"))
-    if line_count <= MAX_DIFF_LINES:
+    """Return an error message if added prod lines exceed MAX_PROD_LINES, else None.
+
+    Counts only added (`+`) lines in production-code files
+    (CODE_EXTS minus test files). Tests, docs, configs, removals, and
+    context lines are intentionally exempt — reviewer recall scales
+    with prod-code complexity, not with total text volume.
+    """
+    prod = count_added_production_lines(diff)
+    if prod <= MAX_PROD_LINES:
         return None
     return (
-        f"Diff is {line_count} lines (limit {MAX_DIFF_LINES}). "
-        "Split this into smaller commits so each one can be fully reviewed."
+        f"Diff has {prod} added production-code lines (limit {MAX_PROD_LINES}). "
+        "Split this into smaller commits so each one can be fully reviewed. "
+        "Test, doc, config, and lock-file changes do not count toward the limit."
     )
 
 
@@ -1194,7 +1201,7 @@ def main() -> None:
                 "NOT minimize to just-barely-pass — each hook iteration "
                 'costs ~20 min and reviewer tokens, and "sneaking '
                 "through\" wastes the user's budget. If the combined "
-                "fix would exceed the 3000-line diff limit, split into "
+                f"fix would exceed the {MAX_PROD_LINES}-prod-line limit, split into "
                 "sequential commits — but each commit still lands its "
                 "slice completely, no halfway work."
             )

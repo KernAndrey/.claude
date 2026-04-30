@@ -5,7 +5,7 @@ import subprocess
 from unittest.mock import MagicMock, patch
 
 from backends import BACKENDS, Backend, ClaudeBackend, OpencodeBackend, _build_registry
-from config import FANOUT_THRESHOLD, MAX_DIFF_LINES, RunnerConfig
+from config import FANOUT_THRESHOLD, MAX_PROD_LINES, RunnerConfig
 from hook import (
     ARBITER,
     LENS_APPLICABILITY,
@@ -879,17 +879,33 @@ def test_parse_verdict_trailing_ok_or_block_is_malformed() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _build_prod_diff(added_lines: int) -> str:
+    body = "\n".join(f"+line {i}" for i in range(added_lines))
+    return f"diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -0,0 +1,{added_lines} @@\n{body}"
+
+
 def test_under_limit_returns_none() -> None:
-    diff = "\n".join(f"line {i}" for i in range(MAX_DIFF_LINES))
-    assert check_diff_size(diff) is None
+    assert check_diff_size(_build_prod_diff(MAX_PROD_LINES)) is None
 
 
 def test_over_limit_returns_message() -> None:
-    diff = "\n".join(f"line {i}" for i in range(MAX_DIFF_LINES + 1))
-    result = check_diff_size(diff)
+    result = check_diff_size(_build_prod_diff(MAX_PROD_LINES + 1))
     assert result is not None
     assert "Split" in result
-    assert str(MAX_DIFF_LINES) in result
+    assert str(MAX_PROD_LINES) in result
+    assert "production-code" in result
+
+
+def test_test_file_diff_does_not_trip_cap() -> None:
+    body = "\n".join(f"+line {i}" for i in range(MAX_PROD_LINES * 5))
+    diff = (
+        "diff --git a/tests/foo_test.py b/tests/foo_test.py\n"
+        "--- a/tests/foo_test.py\n"
+        "+++ b/tests/foo_test.py\n"
+        f"@@ -0,0 +1,{MAX_PROD_LINES * 5} @@\n"
+        f"{body}"
+    )
+    assert check_diff_size(diff) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1134,7 +1150,7 @@ def test_count_added_production_lines_zero_on_no_added() -> None:
 
 
 def test_fanout_threshold_sane_default() -> None:
-    assert FANOUT_THRESHOLD == 150
+    assert FANOUT_THRESHOLD == 100
     # Three lenses: bugs, architecture, tests. Types was removed (ruff ANN
     # covers it); security/perf/rootcause folded into bugs; duplication/
     # complexity folded into architecture.

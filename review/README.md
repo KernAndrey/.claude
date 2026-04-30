@@ -48,11 +48,14 @@ Common edits:
   when the sole reviewer is unreachable; commits proceed with a warn
   log.
 - **Run the arbiter on OpenCode** — `ARBITER = RunnerConfig("opencode", "github-copilot/gpt-5.4", timeout=900)`.
-- **Bigger / smaller fan-out cutoff** — change `FANOUT_THRESHOLD`
-  (added production lines required to switch from single-call to
-  three-lens fan-out).
-- **Cap diff size** — `MAX_DIFF_LINES = 3000`. Larger diffs are
-  rejected outright with an instruction to split.
+- **Cap commit prod-surface** — `MAX_PROD_LINES = 300`. Commits with
+  more added production-code lines are rejected outright. Tests, docs,
+  configs, lock-files, removals, and context lines do not count — only
+  added lines in `CODE_EXTS` files outside test paths.
+- **Bigger / smaller fan-out cutoff** — `FANOUT_THRESHOLD = 100`. At or
+  above this added-prod-line count, the review fans out into three
+  parallel lens calls (bugs / architecture / tests) plus arbiter. Below
+  it, a single combined call.
 
 `backend` is a string. It must match a key in `backends.BACKENDS`.
 Validated at startup by `_verify_runner_configs()` — a typo in
@@ -108,8 +111,8 @@ comprehension would silently shadow.
 1. **`_verify_runner_configs()`** — backend names in `config.py` exist
    in `BACKENDS`. Fail loudly on typos before any LLM call.
 2. **`collect_diff()`** — read `git diff --cached`. Empty diff →
-   skip. Diff over `MAX_DIFF_LINES` → reject with split instruction.
-   Diff under `MIN_LINES_TO_REVIEW` → skip.
+   skip. Added prod lines over `MAX_PROD_LINES` → reject with split
+   instruction. Diff under `MIN_LINES_TO_REVIEW` (total) → skip.
 3. **Lens routing** — `applicable_lenses(files)` skips lenses with
    nothing to look at (e.g. `architecture` on a docs-only diff).
    Docs-only diffs short-circuit to skip with no LLM calls.

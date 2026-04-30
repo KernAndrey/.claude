@@ -39,10 +39,13 @@ ARBITER: RunnerConfig = RunnerConfig(
     "claude", "sonnet", timeout=900
 )  # review-note: user explicitly swapped arbiter from Opus to Sonnet earlier in this session (commit 31e7575); deliberate cost/latency trade-off owned by the user
 
-# Diff-size routing.
-MAX_DIFF_LINES = 3000  # commits larger than this are rejected outright
-MIN_LINES_TO_REVIEW = 1  # commits smaller than this skip review
-FANOUT_THRESHOLD = 150  # at or above this added-line count, fan out per-lens
+# Diff-size routing. Both gates use added-prod-line count
+# (count_added_production_lines) — total diff length is no longer
+# considered. Tests, docs, configs, lock-files, removals, context lines
+# do not consume the budget.
+MAX_PROD_LINES = 300  # commits with more added prod lines are rejected
+MIN_LINES_TO_REVIEW = 1  # commits smaller than this (total) skip review
+FANOUT_THRESHOLD = 100  # at or above this added prod line count, fan out per-lens
 
 # NOTE: LENS_NAMES is intentionally not in this file. The lens registry
 # (LENS_APPLICABILITY in hook.py) owns the order; LENS_NAMES is derived

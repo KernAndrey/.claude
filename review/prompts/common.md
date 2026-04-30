@@ -16,6 +16,8 @@ Each finding you miss surfaces in the next commit round. The developer
 pays by re-running the review, re-committing, re-reading the output.
 One round with ten findings is strictly cheaper than five rounds with
 two findings each.
+
+If you need more context for better review quality - you can read other files of the repo.
 </critical>
 
 ## Where your value is

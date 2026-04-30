@@ -60,10 +60,19 @@ class OpencodeBackend(Backend):
         timeout: int,
     ) -> tuple[str, str, int]:
         full_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
+        # `--agent pre-commit-reviewer` pins opencode to a read-only tool set
+        # (read/list/glob/grep) defined in ~/.config/opencode/agent/pre-commit-reviewer.md.
+        # Without it opencode runs as the default `build` agent with full bash + edit
+        # access and routinely mutates the index (`git add` of untracked files,
+        # `git stash` round-trips that leave missing-blob refs) during diff
+        # investigation. See ~/.claude/git-hooks/pre-commit for the corresponding
+        # write-tree/read-tree backstop.
         cmd = [
             "opencode",
             "run",
             "--pure",
+            "--agent",
+            "pre-commit-reviewer",
             "--model",
             model,
             "--format",

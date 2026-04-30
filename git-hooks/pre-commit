@@ -8,6 +8,30 @@ set -euo pipefail
 [ "${_CLAUDE_HOOK_RUNNING:-}" = "1" ] && exit 0
 export _CLAUDE_HOOK_RUNNING=1
 
+# --- Index snapshot ---
+# The AI review backend (opencode) is an agent with bash access; during its
+# investigation it can run `git add`, stash, or other index-mutating commands
+# that silently leak untracked files into the commit (or, via stash/apply
+# --index, leave missing-blob refs in the index — the same symptom blamed on
+# the pre-commit framework historically). Snapshot the index at hook entry
+# and restore it on exit, regardless of whether sub-tools mutate it. Verify-
+# only sub-tools (gitleaks --staged, semgrep on file paths, our local
+# verify-only hook) make this restore a no-op; index-mutating sub-tools get
+# their changes rolled back.
+_CLAUDE_INDEX_SNAPSHOT=""
+if _CLAUDE_INDEX_SNAPSHOT="$(git write-tree 2>/dev/null)"; then
+    trap '
+        if [ -n "${_CLAUDE_INDEX_SNAPSHOT:-}" ]; then
+            _current="$(git write-tree 2>/dev/null)" || _current=CORRUPT
+            if [ "$_current" != "$_CLAUDE_INDEX_SNAPSHOT" ]; then
+                echo "[claude-hook] index mutated by sub-tool ($_current vs $_CLAUDE_INDEX_SNAPSHOT) — restoring snapshot" >&2
+                git read-tree "$_CLAUDE_INDEX_SNAPSHOT" 2>/dev/null || \
+                    echo "[claude-hook] restore failed — run: git read-tree $_CLAUDE_INDEX_SNAPSHOT" >&2
+            fi
+        fi
+    ' EXIT INT TERM HUP
+fi
+
 # --- Step 1: Run repo-local pre-commit hook (linters: ruff, pylint, xmllint) ---
 # core.hooksPath overrides .git/hooks/, so we call the local one explicitly.
 # In worktrees, git-dir points to .git/worktrees/<name> which has no hooks/.

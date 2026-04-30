@@ -401,6 +401,25 @@ def test_opencode_backend_forwards_timeout() -> None:
     assert mock_run.call_args.kwargs["timeout"] == 777
 
 
+def test_opencode_backend_pins_pre_commit_reviewer_agent() -> None:
+    """The opencode invocation must pin --agent pre-commit-reviewer so the
+    LLM cannot reach bash/edit/write tools and silently mutate the index
+    during diff investigation. Pairs with the index snapshot/restore in
+    ~/.claude/git-hooks/pre-commit — losing this pin widens the blast
+    radius the snapshot has to roll back."""
+    mock_result = MagicMock()
+    mock_result.stdout = ""
+    mock_result.stderr = ""
+    mock_result.returncode = 0
+
+    with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
+        OpencodeBackend().run("sys", "user", "model-x", 60)
+
+    cmd = mock_run.call_args[0][0]
+    agent_idx = cmd.index("--agent")
+    assert cmd[agent_idx + 1] == "pre-commit-reviewer"
+
+
 def test_claude_backend_builds_correct_command() -> None:
     mock_result = MagicMock()
     mock_result.stdout = "claude review body"

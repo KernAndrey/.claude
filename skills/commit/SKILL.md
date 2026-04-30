@@ -247,7 +247,7 @@ If any `.py` files are in the changeset:
 For each logical commit, run these steps **in order, per commit** (not once for the whole phase):
 
 1. **Stage specific files**: `git add <file1> <file2>` — blanket staging (`-A`, `.`) risks including secrets and binaries.
-2. **Stash-guard the unstaged tail** — critical to avoid pre-commit index corruption (see Phase 8):
+2. **Stash-guard the unstaged tail** — gives linters and security scanners a working tree that matches the index exactly, so the commit captures only what was reviewed:
    ```bash
    git stash push -u -k -m "commit-skill-wip-$(date +%s)"
    ```
@@ -279,7 +279,9 @@ Repeat steps 1–8 for each subsequent logical commit.
 
 ### Why the stash-guard exists
 
-The pre-commit framework has a bug where, when unstaged changes are present at commit time, it generates a binary patch, resets the working tree to HEAD, runs hooks (which can reformat staged files via `ruff-format`), then restores the patch with `git apply --index`. The `--index` flag writes blob hashes from the patch header into `.git/index` without ensuring those blobs are written to `.git/objects/`. Result: the index references missing blobs, and subsequent commits fail with `invalid object … Error building trees`. Keeping the working tree clean of unstaged content at commit time prevents pre-commit from entering its stash/restore path, which is the only way to avoid this corruption reliably.
+Linters in the per-repo hooks operate on file paths in the working tree, not on staged blobs. If the working tree mixes staged content with unstaged edits to the same file, the verifier sees the mix — it can flag the unstaged edits and block a commit whose staged content is actually clean. Stashing the unstaged tail gives the hooks a working tree that matches the index exactly, so verification reflects what will actually be committed.
+
+Historical note: untracked files leaking into commits and `error: invalid object … Error building trees` corruption were both blamed on the pre-commit framework (https://pre-commit.com) for a long time, but the dominant source turned out to be the AI review backend (`opencode`), which is an agent with bash access and freely runs `git add` / `git stash` during its investigation of the diff. The per-repo `.git/hooks/pre-commit` files in `hubcraft-console`, `hubcraft-tms`, `odoo`, and `usko_internal_webapp` were converted to verify-only vanilla bash (no auto-fix, no re-stage), and `~/.claude/git-hooks/pre-commit` now snapshots the index at hook entry via `git write-tree` and restores it on exit via `git read-tree`, rolling back any sub-tool mutation regardless of source. Do not run `pre-commit install` in those repos — it would reintroduce the framework wrapper.
 
 ## Phase 6.5: Review WARNINGs
 
@@ -299,7 +301,7 @@ After all commits are done, show:
 
 ## Phase 8: Troubleshooting — index corruption
 
-If `git commit` reports `invalid object <sha> … Error building trees`, or `git fsck` lists `missing blob` entries, the index has been poisoned by the pre-commit stash/restore bug (see Phase 6 rationale). Recover:
+If `git commit` reports `invalid object <sha> … Error building trees`, or `git fsck` lists `missing blob` entries, the index has been poisoned. The most common cause is a manual `pre-commit run` (or `pre-commit run --hook-stage pre-commit`) executed against a dirty working tree — its `git apply --index` writes blob hashes into the index without ensuring the blobs are written to `.git/objects/`. The commit-time hook in those repos no longer goes through the framework, so this should only show up after manual invocation. Recover:
 
 ```bash
 git reset                          # reset index to HEAD; working tree untouched, files safe
@@ -307,7 +309,7 @@ git fsck --no-dangling             # expect empty output — index is clean
 rm -f ~/.cache/pre-commit/patch*   # drop stale pre-commit patches; it regenerates as needed
 ```
 
-Then re-stage the intended files and run Phase 6 again. The stash-guard there prevents recurrence.
+Then re-stage the intended files and run Phase 6 again.
 
 If `git fsck` still reports missing blobs after `git reset`, stop and report to the user — the object DB itself is damaged and needs manual intervention.
 
@@ -320,4 +322,4 @@ If `git fsck` still reports missing blobs after `git reset`, stop and report to 
 - If the diff exceeds 3000 lines, the hook rejects it — split into smaller commits.
 - The AI reviewer `tests` lens blocks any commit with new public behavior and no matching test. Phase 3.5 catches this early — keep code and tests in the same commit.
 - When splitting a large feature, slice by **vertical** (each slice = code + its tests), never by layer (all code → all tests).
-- Before `git commit` the working tree must contain only staged changes. The skill stashes the unstaged tail in Phase 6 — do not skip that step: it is the workaround for a pre-commit framework bug where `git apply --index` writes blob hashes to the index without writing the blobs themselves.
+- Before `git commit` the working tree must contain only staged changes. The skill stashes the unstaged tail in Phase 6 — do not skip that step: it keeps linters and re-stages from leaking unstaged or untracked content into the commit.

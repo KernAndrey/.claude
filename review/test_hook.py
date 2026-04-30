@@ -1149,6 +1149,30 @@ def test_count_added_production_lines_zero_on_no_added() -> None:
     assert count_added_production_lines(diff) == 0
 
 
+def test_save_log_diff_stats_includes_prod_count(tmp_path) -> None:
+    """The Diff stats line records both total and prod-added counts."""
+    from hook import save_log as _save_log
+
+    diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+a\n+b\n+c\n"
+        "diff --git a/tests/foo_test.py b/tests/foo_test.py\n"
+        "--- a/tests/foo_test.py\n"
+        "+++ b/tests/foo_test.py\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+t\n+u\n"
+    )
+    with patch("hook.LOG_DIR", tmp_path):
+        _save_log("OK", diff=diff)
+    written = next(tmp_path.glob("*_OK.md")).read_text(encoding="utf-8")
+    total = len(diff.splitlines())
+    assert f"{total} lines in diff" in written
+    assert "(3 added prod line(s))" in written
+
+
 def test_fanout_threshold_sane_default() -> None:
     assert FANOUT_THRESHOLD == 100
     # Three lenses: bugs, architecture, tests. Types was removed (ruff ANN

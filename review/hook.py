@@ -968,7 +968,10 @@ def save_log(
         if files:
             sections.append(f"**Files:**\n{files}\n")
         if diff:
-            sections.append(f"## Diff stats\n{len(diff.splitlines())} lines in diff\n")
+            sections.append(
+                f"## Diff stats\n{len(diff.splitlines())} lines in diff "
+                f"({count_added_production_lines(diff)} added prod line(s))\n"
+            )
         if error_msg:
             sections.append(f"## Error\n```\n{error_msg}\n```\n")
         if diag:

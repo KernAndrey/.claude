@@ -33,20 +33,34 @@ Everything tunable lives in two files:
 
 ### `config.py` — switch reviewer roles
 
-Three `RunnerConfig` slots:
+Three slots:
 
 ```python
-PRIMARY:  RunnerConfig         = RunnerConfig("opencode", "github-copilot/gpt-5.4")
-FALLBACK: RunnerConfig | None  = RunnerConfig("claude",   "sonnet")
-ARBITER:  RunnerConfig         = RunnerConfig("claude",   "sonnet", timeout=900)
+PRIMARIES: list[RunnerConfig]  = [RunnerConfig("opencode", "github-copilot/gpt-5.4")]
+FALLBACK:  RunnerConfig | None = RunnerConfig("claude", "sonnet")
+ARBITER:   RunnerConfig        = RunnerConfig("claude", "sonnet", timeout=900)
 ```
 
 Common edits:
 
-- **Make Claude Code primary** — `PRIMARY = RunnerConfig("claude", "sonnet")`.
-- **Disable the fallback** — `FALLBACK = None`. The hook fails open
-  when the sole reviewer is unreachable; commits proceed with a warn
-  log.
+- **Make Claude Code the sole reviewer** — `PRIMARIES = [RunnerConfig("claude", "sonnet")]`.
+- **Run two reviewers in parallel and let the arbiter consolidate
+  their findings** — append a second entry:
+
+  ```python
+  PRIMARIES = [
+      RunnerConfig("opencode", "github-copilot/gpt-5.4"),
+      RunnerConfig("claude",   "sonnet"),
+  ]
+  ```
+
+  Both reviewers run concurrently against the same diff. The arbiter
+  receives every `[CRITICAL]` finding (with a `<backend>-Fn` ID
+  prefix), groups duplicates into clusters, and emits one
+  UPHELD/OVERTURN verdict per cluster. See **Multi-backend mode**
+  below for full semantics and stats.
+- **Disable the fallback** — `FALLBACK = None`. Then a total-failure
+  run (every primary down) goes fail-open with a warn log.
 - **Run the arbiter on OpenCode** — `ARBITER = RunnerConfig("opencode", "github-copilot/gpt-5.4", timeout=900)`.
 - **Cap commit prod-surface** — `MAX_PROD_LINES = 300`. Commits with
   more added production-code lines are rejected outright. Tests, docs,
@@ -182,12 +196,82 @@ Test discipline (per top-level `~/.claude/CLAUDE.md`): every new
 code path needs a same-diff test or a documented skip. The AI review
 hook will block missing coverage.
 
+## Multi-backend mode
+
+When `PRIMARIES` has more than one entry the hook switches to a
+parallel orchestration:
+
+1. Every primary runs **concurrently** against the same staged diff.
+   Each backend independently chooses single-call vs fan-out per the
+   usual `FANOUT_THRESHOLD` rule. No per-primary fallback.
+2. Findings get backend-prefixed IDs (`opencode-F1`, `claude-F2`) so
+   downstream stages can distinguish reviewers.
+3. The arbiter receives **all** findings from **all** primaries and
+   reads `prompts/arbiter_multi.md`. Its job is two-fold: cluster
+   duplicates (same defect found by multiple reviewers) and validate
+   each cluster (UPHELD / OVERTURN). Output regex:
+   `^\s*\[CLUSTER\s+(C\d+)\]` for groupings,
+   `^\s*\[(UPHELD|OVERTURN)\]\s*(C\d+)` for verdicts.
+4. **`FALLBACK` is now a safety-net.** It fires only when **every**
+   primary failed (no usable output anywhere). The fallback result is
+   appended to the run with `fallback_used=True` and recorded in the
+   stats — a recurring fallback rate is itself a reliability signal
+   to act on.
+
+`N==1` is a degenerate case of the same flow: one primary, the legacy
+single-backend arbiter (`prompts/arbiter.md`) is used so existing
+markdown-log layout stays byte-for-byte stable, and fallback fires
+the same way it used to (the only primary failing == "all" failing).
+
+### Stats — `logs/stats.jsonl` + per-run sidecar JSON
+
+Every orchestrator run writes two files:
+
+- `logs/<timestamp>_<project>_<verdict>.stats.json` — full per-run
+  detail (per-backend status, latency, raw + clustered finding
+  counts, arbiter status + duration, fallback trigger reason).
+- `logs/stats.jsonl` — append-only one-line-per-run aggregate.
+  Designed for `jq` and `stats_cli.py` to slice across many commits.
+
+Schema is versioned (`schema_version: 1`). The shape is documented at
+the top of `stats.py` and exercised by
+`test_hook.py::test_build_run_stats_schema_shape`.
+
+### `stats_cli.py` — compare backends
+
+```bash
+# Default: per-backend aggregates (runs, success rate, p50/p95 latency,
+# avg findings, upheld %, solo %).
+python ~/.claude/review/stats_cli.py
+
+# Head-to-head pair view (only over commits where both ran).
+python ~/.claude/review/stats_cli.py --compare
+
+# Last N runs, per-backend status + duration.
+python ~/.claude/review/stats_cli.py --last 20
+
+# Filters compose. Date filter, backend filter, project filter.
+python ~/.claude/review/stats_cli.py --since 2026-04-01 --backend opencode
+python ~/.claude/review/stats_cli.py --project hubcraft-tms
+
+# Raw JSON for jq pipelines.
+python ~/.claude/review/stats_cli.py --json | jq '.[].verdict'
+```
+
+Quick `jq` recipe — per-backend latency series for trend plotting:
+
+```bash
+jq -r '[.timestamp, (.backends[] | .config.backend + ":" + (.duration_seconds|tostring))] | @tsv' \
+  ~/.claude/review/logs/stats.jsonl
+```
+
 ## Logs
 
 Every review writes a markdown log to
 `~/.claude/review/logs/<timestamp>_<project>_<verdict>.md` with the
-full diff, per-lens output, and arbiter rationale. Used as input for
-the `replay.py` smoke harness when refactoring this package.
+full diff, per-backend section (multi-backend mode), per-lens output,
+and arbiter rationale. Used as input for the `replay.py` smoke harness
+when refactoring this package.
 
 ## Trade-off channel
 

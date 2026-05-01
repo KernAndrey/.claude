@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from backends import BACKENDS, Backend, ClaudeBackend, OpencodeBackend, _build_registry
@@ -177,14 +178,37 @@ def test_verify_runner_configs_passes_on_default_config() -> None:
 
 def test_verify_runner_configs_raises_on_invalid_primary_backend() -> None:
     bogus = RunnerConfig("bogus-backend", "x")
-    with patch("hook.PRIMARY", bogus):
+    with patch("hook.PRIMARIES", [bogus]):
         try:
             _verify_runner_configs()
         except ValueError as exc:
-            assert "PRIMARY" in str(exc)
+            assert "PRIMARIES" in str(exc)
             assert "bogus-backend" in str(exc)
             return
-    raise AssertionError("expected ValueError on invalid PRIMARY backend")
+    raise AssertionError("expected ValueError on invalid PRIMARIES entry")
+
+
+def test_verify_runner_configs_raises_on_empty_primaries() -> None:
+    """An empty PRIMARIES list is a misconfiguration (no reviewers to run)."""
+    with patch("hook.PRIMARIES", []):
+        try:
+            _verify_runner_configs()
+        except ValueError as exc:
+            assert "PRIMARIES" in str(exc)
+            return
+    raise AssertionError("expected ValueError on empty PRIMARIES")
+
+
+def test_verify_runner_configs_raises_on_duplicate_primaries() -> None:
+    """Two PRIMARIES with the same (backend, model) is always a typo."""
+    dup = RunnerConfig("opencode", "github-copilot/gpt-5.4")
+    with patch("hook.PRIMARIES", [dup, dup]):
+        try:
+            _verify_runner_configs()
+        except ValueError as exc:
+            assert "duplicate" in str(exc).lower()
+            return
+    raise AssertionError("expected ValueError on duplicate PRIMARIES entry")
 
 
 def test_verify_runner_configs_raises_on_invalid_fallback_backend() -> None:
@@ -370,7 +394,7 @@ def test_verify_runner_configs_error_lists_registered_backends() -> None:
     to a frozen literal set that drifts from the real registry.
     """
     bogus = RunnerConfig("ghost", "x")
-    with patch("hook.PRIMARY", bogus):
+    with patch("hook.PRIMARIES", [bogus]):
         try:
             _verify_runner_configs()
         except ValueError as exc:
@@ -380,7 +404,7 @@ def test_verify_runner_configs_error_lists_registered_backends() -> None:
             for name in BACKENDS:
                 assert name in msg, f"registered backend {name!r} missing from error message"
             return
-    raise AssertionError("expected ValueError when PRIMARY backend not in BACKENDS")
+    raise AssertionError("expected ValueError when PRIMARIES entry not in BACKENDS")
 
 
 # ---------------------------------------------------------------------------
@@ -1168,7 +1192,7 @@ def test_count_added_production_lines_zero_on_no_added() -> None:
     assert count_added_production_lines(diff) == 0
 
 
-def test_save_log_diff_stats_includes_prod_count(tmp_path) -> None:
+def test_save_log_diff_stats_includes_prod_count(tmp_path: Path) -> None:
     """The Diff stats line records both total and prod-added counts."""
     from hook import save_log as _save_log
 
@@ -1757,12 +1781,26 @@ def _invoke_main_on_block(
     import io
     import sys
 
+    from hook import error as hook_error
     from hook import main as hook_main
 
     buf = io.StringIO()
+
+    def fake_pipeline(diff: str, files: str, is_merge: bool) -> str:
+        # Mirror the production BLOCK code path: emit the developer-facing
+        # banner + both directives so the assertions stay end-to-end.
+        from hook import _BLOCK_FIX_DIRECTIVE, _BLOCK_TRADEOFF_DIRECTIVE
+        from hook import info as hook_info
+
+        hook_error(f"Review BLOCKED this commit:\n\n{review_text}")
+        hook_info(_BLOCK_FIX_DIRECTIVE)
+        hook_info(_BLOCK_TRADEOFF_DIRECTIVE)
+        return "BLOCK"
+
     with (
         patch("hook.collect_diff", return_value=("diff-body", "foo.py", False)),
-        patch("hook.run_review", return_value=(review_text, "BLOCK")),
+        patch("hook._run_multi_backend_pipeline", side_effect=fake_pipeline),
+        patch("hook.applicable_lenses", return_value=["bugs"]),
         patch.object(sys, "stderr", buf),
     ):
         try:
@@ -1916,11 +1954,22 @@ def _invoke_main_on_ok(review_text: str) -> str:
     import sys
 
     from hook import main as hook_main
+    from hook import warn as hook_warn
 
     buf = io.StringIO()
+
+    def fake_pipeline(diff: str, files: str, is_merge: bool) -> str:
+        # Mirror the OK-path banner gate from _run_multi_backend_pipeline.
+        from hook import extract_warning_lines
+
+        if extract_warning_lines(review_text):
+            hook_warn(f"Review notes (non-blocking warnings):\n{review_text}")
+        return "OK"
+
     with (
         patch("hook.collect_diff", return_value=("diff-body", "foo.py", False)),
-        patch("hook.run_review", return_value=(review_text, "OK")),
+        patch("hook._run_multi_backend_pipeline", side_effect=fake_pipeline),
+        patch("hook.applicable_lenses", return_value=["bugs"]),
         patch.object(sys, "stderr", buf),
     ):
         try:
@@ -1976,3 +2025,526 @@ def test_aggregate_lens_outputs_warning_count_uses_anchored_regex() -> None:
     aggregated = _aggregate_lens_outputs(per_lens)
     # Exactly 1 warning counted, not 2.
     assert "1 WARNING" in aggregated.splitlines()[-1]
+
+
+# ---------------------------------------------------------------------------
+# Multi-backend orchestration — orchestrator.py + consolidation.py + stats.py
+# ---------------------------------------------------------------------------
+
+
+def test_assign_finding_ids_with_prefix_attaches_backend_label() -> None:
+    """Multi-backend mode tags IDs as `<backend>-Fn` so the arbiter
+    can disambiguate which reviewer flagged what."""
+    review = "- [CRITICAL] foo.py:1 — bug\n- [CRITICAL] bar.py:2 — bug2"
+    tagged, findings = assign_finding_ids(review, prefix="opencode")
+    assert "[opencode-F1]" in tagged
+    assert "[opencode-F2]" in tagged
+    assert [f["id"] for f in findings] == ["opencode-F1", "opencode-F2"]
+
+
+def test_assign_finding_ids_no_prefix_keeps_bare_ids() -> None:
+    """N==1 (default) mode keeps the legacy bare F1/F2 IDs so existing
+    log layout and arbiter regex stay byte-for-byte stable."""
+    review = "- [CRITICAL] foo.py:1 — bug"
+    tagged, findings = assign_finding_ids(review)
+    assert "[F1]" in tagged
+    assert findings[0]["id"] == "F1"
+
+
+def test_critical_regex_accepts_prefixed_id() -> None:
+    """count_criticals must recognise both `[F1]` and `[opencode-F1]`."""
+    bare = "- [F1] [CRITICAL] foo.py:1 — bug"
+    prefixed = "- [opencode-F1] [CRITICAL] foo.py:1 — bug"
+    assert count_criticals(bare) == 1
+    assert count_criticals(prefixed) == 1
+
+
+def test_warning_regex_accepts_prefixed_id() -> None:
+    """extract_warning_lines must accept the same prefixed ID shape."""
+    prefixed = "- [claude-F2] [WARNING] bar.py:7 — note"
+    assert extract_warning_lines(prefixed) == [prefixed.strip()]
+
+
+def test_run_multi_backend_runs_two_primaries_in_parallel() -> None:
+    """Two backends both produce results; orchestrator preserves PRIMARIES order."""
+    import time
+
+    from orchestrator import run_multi_backend
+
+    a = RunnerConfig("opencode", "model-a")
+    b = RunnerConfig("claude", "model-b")
+    findings = "### Section 1\nfile audit\n### Section 2\n- [CRITICAL] f.py:1 — bug\nSummary: 1 CRITICAL across 1 file."
+
+    barrier_seen: list[float] = []
+
+    def slow_backend_run(system: str, user: str, model: str, timeout: int) -> tuple[str, str, int]:
+        barrier_seen.append(time.monotonic())
+        time.sleep(0.05)
+        return findings, "", 0
+
+    fake_a = MagicMock()
+    fake_a.run.side_effect = slow_backend_run
+    fake_b = MagicMock()
+    fake_b.run.side_effect = slow_backend_run
+
+    with (
+        patch("orchestrator.PRIMARIES", [a, b]),
+        patch("orchestrator.FALLBACK", None),
+        patch("hook.applicable_lenses", return_value=["bugs"]),
+        patch("hook.count_added_production_lines", return_value=10),
+        patch.dict("hook.BACKENDS", {"opencode": fake_a, "claude": fake_b}, clear=False),
+    ):
+        results = run_multi_backend("diff", "f.py", False)
+
+    assert [r.cfg for r in results] == [a, b]
+    assert all(r.status == "ok" for r in results)
+    # Parallel execution → both backends started within 50ms of each other.
+    assert max(barrier_seen) - min(barrier_seen) < 0.05
+
+
+def test_run_multi_backend_one_fails_no_fallback_at_n_gt_1() -> None:
+    """When one of two primaries fails, fallback must NOT trigger
+    (the other backend still produced output)."""
+    from orchestrator import run_multi_backend
+
+    a = RunnerConfig("opencode", "m1")
+    b = RunnerConfig("claude", "m2")
+    fb = RunnerConfig("opencode", "fallback-model")
+    findings = "### Section 1\nx\n### Section 2\n- [CRITICAL] f.py:1 — bug\nSummary: 1 CRITICAL."
+
+    fake_a = MagicMock()
+    fake_a.run.side_effect = subprocess.TimeoutExpired(cmd="opencode", timeout=1)
+    fake_b = MagicMock()
+    fake_b.run.return_value = (findings, "", 0)
+    fake_fb = MagicMock()
+    fake_fb.run.return_value = ("MUST NOT BE CALLED", "", 0)
+
+    with (
+        patch("orchestrator.PRIMARIES", [a, b]),
+        patch("orchestrator.FALLBACK", fb),
+        patch("hook.applicable_lenses", return_value=["bugs"]),
+        patch("hook.count_added_production_lines", return_value=10),
+        patch.dict("hook.BACKENDS", {"opencode": fake_a, "claude": fake_b}, clear=False),
+    ):
+        results = run_multi_backend("diff", "f.py", False)
+
+    assert len(results) == 2
+    assert results[0].status == "timeout"
+    assert results[1].status == "ok"
+    fake_fb.run.assert_not_called()
+    assert all(not r.fallback_used for r in results)
+
+
+def test_run_multi_backend_all_fail_triggers_fallback() -> None:
+    """When every primary fails, FALLBACK fires once as a safety net."""
+    from orchestrator import run_multi_backend
+
+    # Three distinct backend names so each MagicMock owns its own registry slot.
+    a = RunnerConfig("alpha", "m1")
+    b = RunnerConfig("beta", "m2")
+    fb = RunnerConfig("gamma", "fb-model")
+    findings = "### Section 1\nx\n### Section 2\nNo findings.\nSummary: 0 CRITICAL."
+
+    fake_a = MagicMock()
+    fake_a.run.return_value = ("", "boom-a", 1)
+    fake_b = MagicMock()
+    fake_b.run.return_value = ("", "boom-b", 1)
+    fake_fb = MagicMock()
+    fake_fb.run.return_value = (findings, "", 0)
+
+    with (
+        patch("orchestrator.PRIMARIES", [a, b]),
+        patch("orchestrator.FALLBACK", fb),
+        patch("hook.applicable_lenses", return_value=["bugs"]),
+        patch("hook.count_added_production_lines", return_value=10),
+        patch.dict("hook.BACKENDS", {"alpha": fake_a, "beta": fake_b, "gamma": fake_fb}, clear=False),
+    ):
+        results = run_multi_backend("diff", "f.py", False)
+
+    fake_fb.run.assert_called_once()
+    assert len(results) == 3
+    assert results[-1].fallback_used is True
+    assert results[-1].status == "ok"
+    assert {r.cfg.backend for r in results[:-1]} == {"alpha", "beta"}
+    assert all(r.status != "ok" for r in results[:-1])
+
+
+def test_run_multi_backend_all_fail_no_fallback_returns_failures() -> None:
+    """With FALLBACK=None and every primary failing, the result list contains
+    only the failed primaries (caller upstream goes fail-open)."""
+    from orchestrator import run_multi_backend
+
+    a = RunnerConfig("opencode", "m1")
+    fake_a = MagicMock()
+    fake_a.run.return_value = ("", "stderr", 1)
+
+    with (
+        patch("orchestrator.PRIMARIES", [a]),
+        patch("orchestrator.FALLBACK", None),
+        patch("hook.applicable_lenses", return_value=["bugs"]),
+        patch("hook.count_added_production_lines", return_value=10),
+        patch.dict("hook.BACKENDS", {"opencode": fake_a}, clear=False),
+    ):
+        results = run_multi_backend("diff", "f.py", False)
+
+    assert len(results) == 1
+    assert results[0].status == "error"
+    assert results[0].fallback_used is False
+
+
+def test_total_failure_reason_describes_failures() -> None:
+    """The fallback reason string must name every failed primary so the
+    user can spot which backend is unreliable."""
+    from orchestrator import BackendReviewResult, total_failure_reason
+
+    cfg_a = RunnerConfig("opencode", "m1")
+    cfg_b = RunnerConfig("claude", "m2")
+    r_a = BackendReviewResult(
+        cfg_a, "opencode", "timeout", "", [], None, "opencode timeout after 1200s", 0.0, 1.0, False
+    )
+    r_b = BackendReviewResult(cfg_b, "claude", "error", "", [], None, "claude rc=1", 0.0, 1.0, False)
+
+    reason = total_failure_reason([r_a, r_b])
+    assert reason is not None
+    assert "opencode/m1" in reason
+    assert "claude/m2" in reason
+    assert "timeout" in reason
+
+
+def test_consolidate_no_findings_skips_arbiter() -> None:
+    """When no backend produced [CRITICAL] findings, arbiter is not invoked."""
+    from consolidation import consolidate
+    from orchestrator import BackendReviewResult
+
+    cfg = RunnerConfig("opencode", "m")
+    r = BackendReviewResult(cfg, "opencode", "ok", "no criticals here", [], None, None, 0.0, 1.0, False)
+
+    cons = consolidate([r], "diff")
+    assert cons.clusters == []
+    assert cons.upheld_clusters == []
+    assert cons.arbiter_status == "skipped_no_findings"
+
+
+def test_consolidate_clusters_duplicates_via_arbiter() -> None:
+    """Multi-backend arbiter groups findings from different backends into
+    one cluster and applies a single verdict."""
+    from consolidation import consolidate
+    from orchestrator import BackendReviewResult
+
+    a = RunnerConfig("opencode", "m1")
+    b = RunnerConfig("claude", "m2")
+    findings_a = [{"id": "opencode-F1", "line": "[opencode-F1] [CRITICAL] f.py:1 — same bug"}]
+    findings_b = [{"id": "claude-F1", "line": "[claude-F1] [CRITICAL] f.py:1 — same bug"}]
+    r_a = BackendReviewResult(a, "opencode", "ok", "x", findings_a, None, None, 0.0, 1.0, False)
+    r_b = BackendReviewResult(b, "claude", "ok", "x", findings_b, None, None, 0.0, 1.0, False)
+
+    arbiter_raw = (
+        "[CLUSTER C1] opencode-F1, claude-F1\n"
+        "[UPHELD] C1 — same defect\n"
+        "Summary: 1 UPHELD, 0 OVERTURN, 1 clusters total."
+    )
+
+    with (
+        patch("consolidation.PRIMARIES", [a, b]),
+        patch("hook.read_file", return_value="arbiter prompt body"),
+        patch("hook.run_reviewer", return_value=(arbiter_raw, "", 0)),
+    ):
+        cons = consolidate([r_a, r_b], "diff body")
+
+    assert len(cons.clusters) == 1
+    assert cons.clusters[0].cluster_id == "C1"
+    assert set(cons.clusters[0].member_ids) == {"opencode-F1", "claude-F1"}
+    assert set(cons.clusters[0].contributors) == {"opencode", "claude"}
+    assert cons.upheld_clusters == cons.clusters
+
+
+def test_parse_multi_arbiter_output_fail_open_for_missing_finding() -> None:
+    """If the arbiter forgets to cluster a finding, it gets a singleton
+    UPHELD cluster — fail-open: better to over-block than to drop a
+    flagged defect."""
+    from consolidation import parse_multi_arbiter_output
+
+    findings = [
+        {"id": "opencode-F1", "line": "[opencode-F1] [CRITICAL] a"},
+        {"id": "claude-F1", "line": "[claude-F1] [CRITICAL] b"},
+    ]
+    raw = "[CLUSTER C1] opencode-F1\n[UPHELD] C1 — real bug\nSummary: 1 UPHELD, 0 OVERTURN, 1 clusters total."
+    clusters = parse_multi_arbiter_output(raw, findings)
+
+    assert len(clusters) == 2
+    forgotten = [c for c in clusters if "claude-F1" in c.member_ids]
+    assert len(forgotten) == 1
+    assert forgotten[0].upheld is True
+
+
+def test_consolidate_arbiter_failure_upholds_everything() -> None:
+    """Arbiter timeout/missing prompt must fail-open: every finding is
+    upheld in a singleton cluster (consistent with legacy behavior)."""
+    from consolidation import consolidate
+    from orchestrator import BackendReviewResult
+
+    a = RunnerConfig("opencode", "m1")
+    b = RunnerConfig("claude", "m2")
+    findings_a = [{"id": "opencode-F1", "line": "[opencode-F1] [CRITICAL] f.py — x"}]
+    findings_b = [{"id": "claude-F1", "line": "[claude-F1] [CRITICAL] g.py — y"}]
+    r_a = BackendReviewResult(a, "opencode", "ok", "x", findings_a, None, None, 0.0, 1.0, False)
+    r_b = BackendReviewResult(b, "claude", "ok", "x", findings_b, None, None, 0.0, 1.0, False)
+
+    with (
+        patch("consolidation.PRIMARIES", [a, b]),
+        patch("hook.read_file", return_value="prompt"),
+        patch("hook.run_reviewer", side_effect=subprocess.TimeoutExpired(cmd="x", timeout=1)),
+    ):
+        cons = consolidate([r_a, r_b], "diff body")
+
+    assert cons.arbiter_status == "timeout"
+    assert len(cons.clusters) == 2
+    assert all(c.upheld for c in cons.clusters)
+
+
+def test_build_run_stats_schema_shape() -> None:
+    """Stats object must contain the documented top-level keys + per-backend
+    metrics so jq queries written against the schema keep working."""
+    from consolidation import ConsolidationResult, FindingCluster
+    from orchestrator import BackendReviewResult
+    from stats import DiffStats, build_run_stats
+
+    cfg = RunnerConfig("opencode", "m1")
+    findings = [{"id": "opencode-F1", "line": "[opencode-F1] [CRITICAL] f.py — bug"}]
+    r = BackendReviewResult(cfg, "opencode", "ok", "review body", findings, None, None, 0.0, 12.5, False)
+
+    cluster = FindingCluster("C1", ("opencode-F1",), ("opencode",), findings[0]["line"], upheld=True)
+    cons = ConsolidationResult(
+        clusters=[cluster],
+        upheld_clusters=[cluster],
+        arbiter_status="ran",
+        arbiter_error=None,
+        arbiter_raw_output="raw",
+        arbiter_started_at=0.0,
+        arbiter_ended_at=2.0,
+    )
+
+    obj = build_run_stats(
+        [r],
+        cons,
+        DiffStats(total_lines=10, added_prod_lines=5, files_count=1),
+        verdict="BLOCK",
+        project="proj",
+        timestamp="2026-05-01T10:00:00",
+    )
+    assert obj["schema_version"] == 1
+    assert obj["verdict"] == "BLOCK"
+    assert obj["project"] == "proj"
+    assert obj["diff"] == {"total_lines": 10, "added_prod_lines": 5, "files_count": 1}
+    assert obj["fallback"] == {"triggered": False, "reason": None}
+    assert len(obj["backends"]) == 1
+    b = obj["backends"][0]
+    assert b["upheld_findings"] == 1
+    assert b["overturned_findings"] == 0
+    assert b["solo_findings"] == 1
+    assert b["consensus_findings"] == 0
+    assert b["duration_seconds"] == 12.5
+
+
+def test_save_stats_writes_sidecar_and_appends_jsonl(tmp_path: Path) -> None:
+    """Two consecutive saves → two lines in stats.jsonl + two sidecar files."""
+    import json as _json
+
+    from stats import save as save_stats
+
+    md1 = tmp_path / "2026-05-01_a_OK.md"
+    md1.write_text("placeholder")
+    md2 = tmp_path / "2026-05-01_b_BLOCK.md"
+    md2.write_text("placeholder")
+    aggregate = tmp_path / "stats.jsonl"
+
+    obj1 = {"schema_version": 1, "verdict": "OK"}
+    obj2 = {"schema_version": 1, "verdict": "BLOCK"}
+    save_stats(obj1, md1, aggregate)
+    save_stats(obj2, md2, aggregate)
+
+    assert (tmp_path / "2026-05-01_a_OK.stats.json").exists()
+    assert (tmp_path / "2026-05-01_b_BLOCK.stats.json").exists()
+    lines = aggregate.read_text().strip().splitlines()
+    assert len(lines) == 2
+    assert _json.loads(lines[0])["verdict"] == "OK"
+    assert _json.loads(lines[1])["verdict"] == "BLOCK"
+
+
+def test_n1_backwards_compat_markdown_omits_multi_sections(tmp_path: Path) -> None:
+    """At N==1 the markdown log must NOT grow new per-backend / consolidation
+    sections. The user explicitly required byte-for-byte preservation of the
+    classic single-backend log layout — this snapshot pins it.
+    """
+    from consolidation import ConsolidationResult, FindingCluster
+    from hook import _persist_run
+    from orchestrator import BackendReviewResult
+
+    cfg = RunnerConfig("opencode", "m1")
+    findings = [{"id": "F1", "line": "[F1] [CRITICAL] foo.py:1 — bug"}]
+    r = BackendReviewResult(
+        cfg,
+        "opencode",
+        "ok",
+        "review body with finding\n[F1] [CRITICAL] foo.py:1 — bug",
+        findings,
+        None,
+        None,
+        0.0,
+        1.0,
+        False,
+    )
+    cluster = FindingCluster("C1", ("F1",), ("",), findings[0]["line"], upheld=True)
+    cons = ConsolidationResult(
+        clusters=[cluster],
+        upheld_clusters=[cluster],
+        arbiter_status="ran",
+        arbiter_error=None,
+        arbiter_raw_output="raw",
+        arbiter_started_at=0.0,
+        arbiter_ended_at=1.0,
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_save_log(*args: object, **kwargs: object) -> Path | None:
+        captured.update(kwargs)
+        return tmp_path / "fake.md"
+
+    def fake_save_stats(*args: object, **kwargs: object) -> None:
+        return None
+
+    with (
+        patch("hook.save_log", side_effect=fake_save_log),
+        patch("hook.LOG_DIR", tmp_path),
+        patch("stats.save", side_effect=fake_save_stats),
+    ):
+        _persist_run("BLOCK", "foo.py", "diff body", "display body", [r], cons)
+
+    # Backwards compat: at N==1, neither section is produced.
+    assert captured.get("per_backend") is None, "N==1 must not emit a per-backend section in the markdown log"
+    assert captured.get("consolidation") is None, "N==1 must not emit a consolidation section in the markdown log"
+
+    # And the resulting markdown body confirms no new section headers leak in.
+    body = "\n".join(
+        _invoke_real_save_log_sections(
+            verdict="BLOCK",
+            files="foo.py",
+            diff="diff body",
+            review="display body",
+            reviewer="opencode+arbiter",
+            per_backend=None,
+            consolidation=None,
+        )
+    )
+    assert "## Per-backend results" not in body
+    assert "## Consolidation" not in body
+    # Sanity: existing sections are still there.
+    assert "## Diff stats" in body
+    assert "## Review output" in body
+
+
+def _invoke_real_save_log_sections(**kwargs: object) -> list[str]:
+    """Helper: drive `_build_log_sections` with a fixed timestamp/project."""
+    from hook import _build_log_sections
+
+    return _build_log_sections(
+        project="proj",
+        timestamp="2026-05-01_10-00-00",
+        verdict=kwargs.get("verdict", "OK"),  # type: ignore[arg-type]
+        files=kwargs.get("files", ""),  # type: ignore[arg-type]
+        diff=kwargs.get("diff", ""),  # type: ignore[arg-type]
+        review=kwargs.get("review", ""),  # type: ignore[arg-type]
+        error_msg=kwargs.get("error_msg"),  # type: ignore[arg-type]
+        diag=kwargs.get("diag"),  # type: ignore[arg-type]
+        reviewer=kwargs.get("reviewer"),  # type: ignore[arg-type]
+        per_lens=kwargs.get("per_lens"),  # type: ignore[arg-type]
+        arbiter=kwargs.get("arbiter"),  # type: ignore[arg-type]
+        per_backend=kwargs.get("per_backend"),  # type: ignore[arg-type]
+        consolidation=kwargs.get("consolidation"),  # type: ignore[arg-type]
+    )
+
+
+def test_n_gt_1_markdown_includes_multi_sections() -> None:
+    """At N>1 the markdown log must grow the per-backend + consolidation
+    sections so the user can audit each reviewer's contribution."""
+    from consolidation import ConsolidationResult, FindingCluster
+    from orchestrator import BackendReviewResult
+
+    cfg_a = RunnerConfig("opencode", "m1")
+    cfg_b = RunnerConfig("claude", "m2")
+    r_a = BackendReviewResult(cfg_a, "opencode", "ok", "alpha review", [], None, None, 0.0, 1.0, False)
+    r_b = BackendReviewResult(cfg_b, "claude", "ok", "beta review", [], None, None, 0.0, 1.5, False)
+    cluster = FindingCluster("C1", ("opencode-F1", "claude-F1"), ("opencode", "claude"), "shared bug", upheld=True)
+    cons = ConsolidationResult(
+        clusters=[cluster],
+        upheld_clusters=[cluster],
+        arbiter_status="ran",
+        arbiter_error=None,
+        arbiter_raw_output="r",
+        arbiter_started_at=0.0,
+        arbiter_ended_at=2.0,
+    )
+
+    body = "\n".join(
+        _invoke_real_save_log_sections(
+            verdict="BLOCK",
+            files="foo.py",
+            diff="diff body",
+            review="display body",
+            reviewer="opencode+claude+arbiter",
+            per_backend=[r_a, r_b],
+            consolidation=cons,
+        )
+    )
+    assert "## Per-backend results" in body
+    assert "## Consolidation" in body
+    assert "opencode/m1" in body
+    assert "claude/m2" in body
+
+
+def test_aggregate_per_backend_computes_consensus_and_solo_rates() -> None:
+    """The CLI summary view depends on these aggregates being consistent."""
+    from stats import aggregate_per_backend
+
+    rows = [
+        {
+            "backends": [
+                {
+                    "config": {"backend": "opencode", "model": "m1"},
+                    "status": "ok",
+                    "duration_seconds": 10.0,
+                    "raw_findings": {"critical": 2, "warning": 0},
+                    "consensus_findings": 1,
+                    "solo_findings": 1,
+                    "upheld_findings": 1,
+                    "overturned_findings": 1,
+                },
+            ],
+        },
+        {
+            "backends": [
+                {
+                    "config": {"backend": "opencode", "model": "m1"},
+                    "status": "ok",
+                    "duration_seconds": 30.0,
+                    "raw_findings": {"critical": 4, "warning": 0},
+                    "consensus_findings": 2,
+                    "solo_findings": 2,
+                    "upheld_findings": 3,
+                    "overturned_findings": 1,
+                },
+            ],
+        },
+    ]
+    out = aggregate_per_backend(rows)
+    key = "opencode/m1"
+    assert key in out
+    m = out[key]
+    assert m["runs"] == 2
+    assert m["ok_count"] == 2
+    assert m["success_rate"] == 1.0
+    assert m["upheld_total"] == 4
+    assert m["overturned_total"] == 2
+    # 3/(3+1)=0.75, plus prior run 1/(1+1)=0.5 → combined upheld_rate = 4/6 ≈ 0.667
+    assert abs(m["upheld_rate"] - 4 / 6) < 1e-3

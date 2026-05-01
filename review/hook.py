@@ -44,7 +44,7 @@ from config import (
     FANOUT_THRESHOLD,
     MAX_PROD_LINES,
     MIN_LINES_TO_REVIEW,
-    PRIMARY,
+    PRIMARIES,
     RunnerConfig,
 )
 
@@ -322,7 +322,7 @@ def build_lens_system_prompt(lens_name: str) -> str:
 
 
 def _verify_runner_configs() -> None:
-    """Pre-flight check for PRIMARY/FALLBACK/ARBITER backend names.
+    """Pre-flight check for every PRIMARIES entry + FALLBACK + ARBITER.
 
     Without this, a misconfigured backend (e.g. typo in config.py) only
     surfaces when ``run_reviewer()`` is finally called and raises
@@ -330,9 +330,31 @@ def _verify_runner_configs() -> None:
     ``except Exception`` and silently skips the entire review gate.
     Calling this from ``main()`` first means the misconfig is caught
     early and named in the warn log before fail-open kicks in.
+
+    Also rejects an empty PRIMARIES list (no reviewer = nothing to do)
+    and duplicate ``(backend, model)`` pairs in PRIMARIES (running
+    the same backend twice with the same model is always a copy-paste
+    mistake, never intentional).
     """
     valid = sorted(BACKENDS)
-    for label, cfg in (("PRIMARY", PRIMARY), ("FALLBACK", FALLBACK), ("ARBITER", ARBITER)):
+
+    if not PRIMARIES:
+        raise ValueError("PRIMARIES is empty; configure at least one reviewer in review/config.py")
+
+    seen_pairs: set[tuple[str, str]] = set()
+    for idx, cfg in enumerate(PRIMARIES, start=1):
+        label = f"PRIMARIES[{idx - 1}]"
+        if cfg.backend not in BACKENDS:
+            raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {valid}")
+        pair = (cfg.backend, cfg.model)
+        if pair in seen_pairs:
+            raise ValueError(
+                f"{label} duplicates an earlier PRIMARIES entry "
+                f"({cfg.backend!r}, {cfg.model!r}); each (backend, model) pair must be unique"
+            )
+        seen_pairs.add(pair)
+
+    for label, cfg in (("FALLBACK", FALLBACK), ("ARBITER", ARBITER)):
         if cfg is None:
             continue
         if cfg.backend not in BACKENDS:
@@ -410,8 +432,16 @@ def run_with_fallback(
 # Parsing — reviewer output
 # ---------------------------------------------------------------------------
 
+# Optional finding ID: bare `[F1]` (single-backend mode) or
+# backend-prefixed `[opencode-F1]` / `[claude-F2]` (multi-backend mode,
+# emitted by orchestrator._run_review_for_backend with prefix=cfg.backend).
+# Backend names match `[a-z][a-z0-9_-]*` — opencode, claude, future
+# additions like codex/kimi/gpt_5_4. Keep narrow on purpose to avoid
+# matching arbitrary `[anything-F1]` brackets in reviewer prose.
+_FINDING_ID_PATTERN = r"(?:[a-z][a-z0-9_-]*-)?F\d+"
+
 _CRITICAL_LINE_RE = re.compile(
-    r"^[ \t]*[-*•]?[ \t]*(?:\[F\d+\]\s*)?\[CRITICAL\]",
+    rf"^[ \t]*[-*•]?[ \t]*(?:\[{_FINDING_ID_PATTERN}\]\s*)?\[CRITICAL\]",
     re.MULTILINE | re.IGNORECASE,
 )
 # Anchored to line start with optional bullet + optional `[Fn]` id — mirrors
@@ -419,7 +449,7 @@ _CRITICAL_LINE_RE = re.compile(
 # `[WARNING]` tag are ignored. Single source of truth for every warning
 # count / gate / surface path in this module.
 _WARNING_LINE_RE = re.compile(
-    r"^[ \t]*[-*•]?[ \t]*(?:\[F\d+\]\s*)?\[WARNING\][^\n]*$",
+    rf"^[ \t]*[-*•]?[ \t]*(?:\[{_FINDING_ID_PATTERN}\]\s*)?\[WARNING\][^\n]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -610,10 +640,10 @@ def run_single_lens(
     user_prompt = build_user_prompt(diff, files, is_merge)
 
     try:
-        review, stderr, rc, used = run_with_fallback(PRIMARY, FALLBACK, system_prompt, user_prompt)
+        review, stderr, rc, used = run_with_fallback(PRIMARIES[0], FALLBACK, system_prompt, user_prompt)
     except subprocess.TimeoutExpired:
         # Only fired if the fallback (or sole runner) timed out.
-        timed_out = FALLBACK.backend if FALLBACK is not None else PRIMARY.backend
+        timed_out = FALLBACK.backend if FALLBACK is not None else PRIMARIES[0].backend
         return {
             "name": lens_name,
             "status": "timeout",
@@ -732,23 +762,32 @@ _FINDING_ID_INJECT_RE = re.compile(
 )
 
 
-def assign_finding_ids(review_text: str) -> tuple[str, list[dict]]:
-    """Inject stable IDs (F1, F2, ...) into every [CRITICAL] line.
+def assign_finding_ids(review_text: str, prefix: str = "") -> tuple[str, list[dict]]:
+    """Inject stable IDs into every [CRITICAL] line.
 
-    Returns (tagged_text, findings). findings: list of
-    ``{"id": "F1", "line": "<full finding line, stripped>"}``.
+    With ``prefix=""`` (default, single-backend mode): IDs are
+    ``F1, F2, ...`` — exactly as before.
+
+    With ``prefix="opencode"`` (multi-backend mode, set by the
+    orchestrator per backend): IDs become ``opencode-F1, opencode-F2, ...``
+    so the arbiter can disambiguate which reviewer flagged what when
+    consolidating.
+
+    Returns ``(tagged_text, findings)`` where findings is a list of
+    ``{"id": "<id>", "line": "<full finding line, stripped>"}``.
     """
     counter = [0]
+    id_prefix = f"{prefix}-" if prefix else ""
 
     def _replace(m: re.Match) -> str:
         counter[0] += 1
-        return f"{m.group(1)}[F{counter[0]}] {m.group(2)}"
+        return f"{m.group(1)}[{id_prefix}F{counter[0]}] {m.group(2)}"
 
     tagged = _FINDING_ID_INJECT_RE.sub(_replace, review_text)
 
     findings: list[dict] = []
     line_re = re.compile(
-        r"^[ \t]*[-*•]?[ \t]*\[(F\d+)\]\s*\[CRITICAL\].*$",
+        rf"^[ \t]*[-*•]?[ \t]*\[({_FINDING_ID_PATTERN})\]\s*\[CRITICAL\].*$",
         re.IGNORECASE,
     )
     for line in tagged.splitlines():
@@ -941,6 +980,54 @@ def _format_arbiter(arbiter: dict) -> str:
     return "\n".join(parts) + "\n"
 
 
+def _build_log_sections(
+    project: str,
+    timestamp: str,
+    verdict: str,
+    files: str,
+    diff: str,
+    review: str,
+    error_msg: str | None,
+    diag: str | None,
+    reviewer: str | None,
+    per_lens: list[dict] | None,
+    arbiter: dict | None,
+    per_backend: list | None,
+    consolidation: object | None,
+) -> list[str]:
+    """Compose the markdown sections for save_log without I/O."""
+    sections: list[str] = [
+        f"# Review: {project} @ {timestamp}\n",
+        f"**Verdict:** {verdict}",
+    ]
+    if reviewer:
+        sections.append(f"**Reviewer:** {reviewer}")
+    if files:
+        sections.append(f"**Files:**\n{files}\n")
+    if diff:
+        sections.append(
+            f"## Diff stats\n{len(diff.splitlines())} lines in diff "
+            f"({count_added_production_lines(diff)} added prod line(s))\n"
+        )
+    if error_msg:
+        sections.append(f"## Error\n```\n{error_msg}\n```\n")
+    if diag:
+        sections.append(f"## Diagnostics\n```\n{diag}\n```\n")
+    if review:
+        sections.append(f"## Review output\n```\n{review}\n```\n")
+    if per_backend:
+        sections.append(_format_per_backend(per_backend))
+    if consolidation is not None:
+        sections.append(_format_consolidation_section(consolidation))
+    if per_lens:
+        sections.append(_format_per_lens(per_lens))
+    if arbiter:
+        sections.append(_format_arbiter(arbiter))
+    if diff:
+        sections.append(f"## Full diff\n```diff\n{diff}\n```")
+    return sections
+
+
 def save_log(
     verdict: str,
     files: str = "",
@@ -951,43 +1038,102 @@ def save_log(
     reviewer: str | None = None,
     per_lens: list[dict] | None = None,
     arbiter: dict | None = None,
-) -> None:
-    """Save review to a log file for debugging."""
+    per_backend: list | None = None,
+    consolidation: object | None = None,
+) -> Path | None:
+    """Save review to a log file for debugging.
+
+    Returns the log path on success (so the caller can drop a sidecar
+    ``.stats.json`` next to it), or ``None`` if writing failed. Failure
+    is silent — a busted log directory must not block a commit.
+
+    ``per_backend`` and ``consolidation`` are populated only by the
+    multi-backend orchestrator path (``main()`` after orchestrator
+    integration). At N==1 they remain ``None`` and the markdown layout
+    is identical to single-backend mode.
+    """
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         project = Path.cwd().name
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         log_path = LOG_DIR / f"{timestamp}_{project}_{verdict}.md"
-
-        sections: list[str] = [
-            f"# Review: {project} @ {timestamp}\n",
-            f"**Verdict:** {verdict}",
-        ]
-        if reviewer:
-            sections.append(f"**Reviewer:** {reviewer}")
-        if files:
-            sections.append(f"**Files:**\n{files}\n")
-        if diff:
-            sections.append(
-                f"## Diff stats\n{len(diff.splitlines())} lines in diff "
-                f"({count_added_production_lines(diff)} added prod line(s))\n"
-            )
-        if error_msg:
-            sections.append(f"## Error\n```\n{error_msg}\n```\n")
-        if diag:
-            sections.append(f"## Diagnostics\n```\n{diag}\n```\n")
-        if review:
-            sections.append(f"## Review output\n```\n{review}\n```\n")
-        if per_lens:
-            sections.append(_format_per_lens(per_lens))
-        if arbiter:
-            sections.append(_format_arbiter(arbiter))
-        if diff:
-            sections.append(f"## Full diff\n```diff\n{diff}\n```")
-
+        sections = _build_log_sections(
+            project,
+            timestamp,
+            verdict,
+            files,
+            diff,
+            review,
+            error_msg,
+            diag,
+            reviewer,
+            per_lens,
+            arbiter,
+            per_backend,
+            consolidation,
+        )
         log_path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+        return log_path
     except OSError:
-        pass
+        return None
+
+
+def _format_per_backend(results: list) -> str:
+    """Render the ``## Per-backend results`` section for multi-backend logs.
+
+    Accepts ``list[orchestrator.BackendReviewResult]`` (typed loosely
+    to keep the import lazy and avoid an import cycle).
+    """
+    parts: list[str] = ["## Per-backend results\n"]
+    for r in results:
+        label = f"{r.cfg.backend}/{r.cfg.model}"
+        if r.fallback_used:
+            label += " (FALLBACK)"
+        duration = max(r.ended_at - r.started_at, 0.0)
+        parts.append(f"### {label} — {r.status} ({duration:.1f}s)\n")
+        if r.error:
+            parts.append(f"_Error:_ {r.error}\n")
+        if r.per_lens:
+            for lens in r.per_lens:
+                lens_dur = max(
+                    (lens.get("ended_at", 0.0) or 0.0) - (lens.get("started_at", 0.0) or 0.0),
+                    0.0,
+                )
+                parts.append(
+                    f"- lens `{lens['name']}`: {lens['status']} ({lens_dur:.1f}s)"
+                    + (f" — {lens['error']}" if lens.get("error") else "")
+                )
+            parts.append("")
+        if r.review_text:
+            parts.append("```\n" + r.review_text + "\n```\n")
+    return "\n".join(parts) + "\n"
+
+
+def _format_consolidation_section(consolidation: object) -> str:
+    """Render the ``## Consolidation`` section showing clusters + verdicts."""
+    cons = consolidation  # narrow alias; types kept loose to avoid the cycle
+    parts: list[str] = [
+        f"## Consolidation — arbiter status: {cons.arbiter_status}\n",  # type: ignore[attr-defined]
+    ]
+    if cons.arbiter_error:  # type: ignore[attr-defined]
+        parts.append(f"_Arbiter error:_ {cons.arbiter_error}\n")  # type: ignore[attr-defined]
+    parts.append(
+        f"_Clusters:_ {len(cons.clusters)} total, "  # type: ignore[attr-defined]
+        f"{len(cons.upheld_clusters)} upheld, "  # type: ignore[attr-defined]
+        f"{len(cons.clusters) - len(cons.upheld_clusters)} overturned\n"  # type: ignore[attr-defined]
+    )
+    for c in cons.clusters:  # type: ignore[attr-defined]
+        members = ", ".join(c.member_ids)
+        verdict = "UPHELD" if c.upheld else "OVERTURN"
+        contribs = ", ".join(b for b in c.contributors if b) or "—"
+        parts.append(f"- **{c.cluster_id}** [{verdict}] contributors: {contribs} | members: {members}")
+        if c.canonical_line:
+            parts.append(f"  > {c.canonical_line}")
+    parts.append("")
+    if cons.arbiter_raw_output:  # type: ignore[attr-defined]
+        parts.append("### Arbiter raw output\n")
+        parts.append("```\n" + cons.arbiter_raw_output + "\n```\n")  # type: ignore[attr-defined]
+    return "\n".join(parts) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1042,7 +1188,9 @@ def _run_single_call(
     user_prompt = build_user_prompt(diff, files, is_merge)
 
     try:
-        review, reviewer_stderr, returncode, reviewer = run_with_fallback(PRIMARY, FALLBACK, system_prompt, user_prompt)
+        review, reviewer_stderr, returncode, reviewer = run_with_fallback(
+            PRIMARIES[0], FALLBACK, system_prompt, user_prompt
+        )
     except subprocess.TimeoutExpired as exc:
         warn(f"Review timed out after {exc.timeout}s — allowing commit")
         save_log("TIMEOUT", files=files, diff=diff, error_msg="timed out")
@@ -1157,6 +1305,12 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
     """Execute the review. Routes between single-call and fan-out+arbiter.
 
     Short-circuits to SKIP when no lens is applicable (docs-only diff).
+
+    Legacy single-backend orchestration kept for the test surface and
+    any external callers that import it. The production hook entry
+    point (``main()``) now goes through ``orchestrator.run_multi_backend``
+    so multi-backend review and per-run stats happen automatically
+    even when ``len(PRIMARIES) == 1``.
     """
     if not applicable_lenses(files):
         info("No reviewable content (docs / pure data only) — skipping review.")
@@ -1180,6 +1334,171 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
     return _run_single_call(diff, files, is_merge)
 
 
+def _summarize_results_label(results: list) -> str:
+    """One-line `Reviewer:` label for save_log: `opencode+claude+arbiter`."""
+    if not results:
+        return "no-reviewers"
+    parts: list[str] = []
+    for r in results:
+        tag = r.cfg.backend
+        if r.fallback_used:
+            tag += "(fallback)"
+        if r.status != "ok":
+            tag += f"({r.status})"
+        parts.append(tag)
+    return "+".join(parts) + "+arbiter"
+
+
+def _render_consolidation_display(
+    results: list,
+    consolidation: object,
+) -> str:
+    """Developer-facing summary used both for stdout and the markdown log.
+
+    Lists upheld clusters first (with backend contributors and the
+    canonical line), then overturned, then warning lines emitted by
+    any backend. Mirrors the shape of the legacy ``_render_with_arbiter``
+    output so eyeballing two adjacent log files (one N==1, one N>1)
+    feels consistent.
+    """
+    cons = consolidation
+    upheld = cons.upheld_clusters  # type: ignore[attr-defined]
+    overturned = [c for c in cons.clusters if not c.upheld]  # type: ignore[attr-defined]
+
+    warning_lines: list[str] = []
+    for r in results:
+        if r.status == "ok" and r.review_text:
+            warning_lines.extend(extract_warning_lines(r.review_text))
+
+    sections: list[str] = ["## Review summary\n"]
+    if upheld:
+        sections.append(f"### Upheld findings ({len(upheld)})\n")
+        for c in upheld:
+            contribs = ", ".join(b for b in c.contributors if b) or "—"
+            sections.append(f"- **{c.cluster_id}** [{contribs}] {c.canonical_line}")
+    if overturned:
+        sections.append(f"\n### Overturned by arbiter ({len(overturned)})\n")
+        for c in overturned:
+            contribs = ", ".join(b for b in c.contributors if b) or "—"
+            sections.append(f"- {c.cluster_id} [{contribs}] {c.canonical_line}")
+    if warning_lines:
+        sections.append(f"\n### Warnings ({len(warning_lines)})\n")
+        sections.extend(f"- {ln}" for ln in warning_lines)
+
+    backends_label = ", ".join(
+        f"{r.cfg.backend}/{r.cfg.model}{' (fallback)' if r.fallback_used else ''}" for r in results
+    )
+    sections.append(
+        f"\nSummary: {len(upheld)} UPHELD, {len(overturned)} OVERTURN, "
+        f"{len(warning_lines)} WARNING across {backends_label}."
+    )
+    return "\n".join(sections)
+
+
+def _diff_stats_for(diff: str, files: str) -> object:
+    """Build a stats.DiffStats from the staged diff + files string."""
+    from stats import DiffStats
+
+    return DiffStats(
+        total_lines=len(diff.splitlines()),
+        added_prod_lines=count_added_production_lines(diff),
+        files_count=len([f for f in files.splitlines() if f.strip()]),
+    )
+
+
+_BLOCK_FIX_DIRECTIVE = (
+    "Fix-in-one-pass directive: address EVERY [CRITICAL] and "
+    "EVERY [WARNING] above in the next commit, plus obvious "
+    "adjacent cases (same edge-case class, missing branch "
+    "coverage, sibling assertions, prod+tests pairing). Do "
+    "NOT minimize to just-barely-pass — each hook iteration "
+    'costs ~20 min and reviewer tokens, and "sneaking '
+    "through\" wastes the user's budget. If the combined "
+    f"fix would exceed the {MAX_PROD_LINES}-prod-line limit, split into "
+    "sequential commits — but each commit still lands its "
+    "slice completely, no halfway work."
+)
+_BLOCK_TRADEOFF_DIRECTIVE = (
+    "Trade-off channel: if a finding above is a deliberate "
+    "trade-off, document it inline via "
+    "`# review-note: <specific reason>` on the relevant line "
+    "(commit messages are not visible to the reviewer in "
+    "this hook stage) — then re-commit. The reviewer honors "
+    "specific, named-invariant explanations.\n"
+    'Use sparingly: vague notes ("intentional", "by design") '
+    "or 3+ in one commit are themselves flagged as CRITICAL. "
+    "This is not a hook-skip substitute."
+)
+
+
+def _persist_run(
+    verdict: str,
+    files: str,
+    diff: str,
+    display: str,
+    results: list,
+    cons: object,
+    error_msg: str | None = None,
+) -> None:
+    """Save the markdown log + sidecar stats for one orchestrator run."""
+    from stats import build_run_stats, default_aggregate_path
+    from stats import save as save_stats
+
+    stats_obj = build_run_stats(
+        results,
+        cons,  # type: ignore[arg-type]
+        _diff_stats_for(diff, files),  # type: ignore[arg-type]
+        verdict,
+        Path.cwd().name,
+        datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+    # At N==1 the markdown layout must stay byte-for-byte identical to
+    # the legacy single-backend log (existing snapshot test pins this).
+    # The new per-backend / consolidation sections only appear when there
+    # is genuinely more than one reviewer to compare. Stats sidecars are
+    # written either way — they are additive, not visible in markdown.
+    multi = len(results) > 1
+    log_path = save_log(
+        verdict,
+        files=files,
+        diff=diff,
+        review=display,
+        reviewer=_summarize_results_label(results),
+        per_backend=results if multi else None,
+        consolidation=cons if multi else None,
+        error_msg=error_msg,
+    )
+    if log_path is not None:
+        save_stats(stats_obj, log_path, default_aggregate_path())
+
+
+def _run_multi_backend_pipeline(diff: str, files: str, is_merge: bool) -> str:
+    """Run orchestrator → consolidation → log + stats. Returns verdict."""
+    from consolidation import consolidate
+    from orchestrator import run_multi_backend
+
+    results = run_multi_backend(diff, files, is_merge)
+    any_ok = any(r.status == "ok" and r.review_text and r.review_text.strip() for r in results)
+    if not any_ok:
+        warn("All reviewers (and fallback if configured) failed — allowing commit")
+        cons = consolidate(results, diff)
+        _persist_run("EMPTY", files, diff, "", results, cons, error_msg="no reviewer produced output")
+        return "EMPTY"
+
+    cons = consolidate(results, diff)
+    verdict = "BLOCK" if cons.upheld_clusters else "OK"
+    display = _render_consolidation_display(results, cons)
+    _persist_run(verdict, files, diff, display, results, cons)
+
+    if verdict == "BLOCK":
+        error(f"Review BLOCKED this commit:\n\n{display}")
+        info(_BLOCK_FIX_DIRECTIVE)
+        info(_BLOCK_TRADEOFF_DIRECTIVE)
+    elif extract_warning_lines(display):
+        warn(f"Review notes (non-blocking warnings):\n{display}")
+    return verdict
+
+
 def main() -> None:
     try:
         _verify_runner_configs()
@@ -1189,41 +1508,21 @@ def main() -> None:
             sys.exit(0)
 
         diff, files, is_merge = context
-        review, verdict = run_review(diff, files, is_merge)
 
-        if review is None:
+        if not applicable_lenses(files):
+            info("No reviewable content (docs / pure data only) — skipping review.")
+            save_log("SKIP", files=files, diff=diff, error_msg="no applicable lens for this file set")
             sys.exit(0)
 
-        if verdict == "BLOCK":
-            error(f"Review BLOCKED this commit:\n\n{review}")
-            info(
-                "Fix-in-one-pass directive: address EVERY [CRITICAL] and "
-                "EVERY [WARNING] above in the next commit, plus obvious "
-                "adjacent cases (same edge-case class, missing branch "
-                "coverage, sibling assertions, prod+tests pairing). Do "
-                "NOT minimize to just-barely-pass — each hook iteration "
-                'costs ~20 min and reviewer tokens, and "sneaking '
-                "through\" wastes the user's budget. If the combined "
-                f"fix would exceed the {MAX_PROD_LINES}-prod-line limit, split into "
-                "sequential commits — but each commit still lands its "
-                "slice completely, no halfway work."
-            )
-            info(
-                "Trade-off channel: if a finding above is a deliberate "
-                "trade-off, document it inline via "
-                "`# review-note: <specific reason>` on the relevant line "
-                "(commit messages are not visible to the reviewer in "
-                "this hook stage) — then re-commit. The reviewer honors "
-                "specific, named-invariant explanations.\n"
-                'Use sparingly: vague notes ("intentional", "by design") '
-                "or 3+ in one commit are themselves flagged as CRITICAL. "
-                "This is not a hook-skip substitute."
-            )
-            sys.exit(1)
+        added = count_added_production_lines(diff)
+        backend_labels = ", ".join(c.backend for c in PRIMARIES)
+        info(
+            f"Reviewing {len(files.splitlines())} file(s), +{added} added prod line(s), "
+            f"backends=[{backend_labels}] (mode auto: per-backend single-call vs fan-out)"
+        )
 
-        if extract_warning_lines(review):
-            warn(f"Review notes (non-blocking warnings):\n{review}")
-        sys.exit(0)
+        verdict = _run_multi_backend_pipeline(diff, files, is_merge)
+        sys.exit(1 if verdict == "BLOCK" else 0)
 
     except Exception as exc:
         # Never let a bug in this script block a commit

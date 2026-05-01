@@ -1,0 +1,40 @@
+# Read-only sub-agent definition for the Kimi pre-commit reviewer.
+#
+# Loaded indirectly: the parent agent (kimi-pre-commit-reviewer.yaml) wires
+# coder / explore / plan slots all to this single file, so any dispatch
+# attempt — regardless of which subagent the parent picks — ends up here
+# with the same locked-down toolset.
+#
+# This sub-agent does NOT extend the default kimi `coder` / `explore` /
+# `plan` definitions because those carry Shell / WriteFile / web tools we
+# need stripped, and `extend:` in kimi 1.40 fully replaces — not merges —
+# tool lists when the child sets them. Defining tools inline keeps this
+# file independent of the kimi install path.
+#
+# Sibling files:
+#   kimi-readonly-system.md           — the system prompt loaded below.
+#   kimi-pre-commit-reviewer.yaml     — the parent that wires this in.
+version: 1
+agent:
+  name: kimi-pre-commit-readonly
+  system_prompt_path: ./kimi-readonly-system.md
+  system_prompt_args:
+    ROLE_ADDITIONAL: ""
+  when_to_use: |
+    Read-only investigator for pre-commit code review. Use to inspect
+    files via ReadFile / Glob / Grep when forming a review verdict on
+    the staged diff. Cannot run Shell, write files, or fetch URLs.
+  tools:
+    - kimi_cli.tools.file:ReadFile
+    - kimi_cli.tools.file:ReadMediaFile
+    - kimi_cli.tools.file:Glob
+    - kimi_cli.tools.file:Grep
+    - kimi_cli.tools.todo:SetTodoList
+  exclude_tools:
+    - kimi_cli.tools.shell:Shell
+    - kimi_cli.tools.file:WriteFile
+    - kimi_cli.tools.file:StrReplaceFile
+    - kimi_cli.tools.web:SearchWeb
+    - kimi_cli.tools.web:FetchURL
+    - kimi_cli.tools.agent:Agent
+  subagents: {}

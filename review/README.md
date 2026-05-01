@@ -90,7 +90,7 @@ class CodexBackend(Backend):
         ...
 
 BACKENDS: dict[str, Backend] = _build_registry(
-    OpencodeBackend(), ClaudeBackend(), CodexBackend(),
+    OpencodeBackend(), ClaudeBackend(), KimiBackend(), CodexBackend(),
 )
 ```
 
@@ -165,6 +165,31 @@ Add a new lens by:
 2. Add `"<name>": _has_code` (or your own predicate) to
    `LENS_APPLICABILITY` in `hook.py`. `LENS_NAMES` is derived from
    the dict, so order is the dict's insertion order.
+
+## Enabling Kimi K2
+
+`KimiBackend` is registered out of the box but not enabled. To turn it on:
+
+1. Install the kimi CLI per <https://www.kimi.com/code/docs/en/>.
+2. `kimi login` once for OAuth (no API-key env var is documented).
+3. Active Kimi membership subscription is required — Kimi Code is paywalled.
+4. Uncomment `RunnerConfig("kimi", "kimi-for-coding")` in `config.py`'s
+   `PRIMARIES` block.
+
+The backend invokes `kimi --print --model <m> --output-format text
+--agent-file <path> --prompt <combined>`. `--print` implicitly enables
+`--yolo` (auto-approve all tool calls), so the project-shipped agent file at
+`review/agents/kimi-pre-commit-reviewer.yaml` is the only thing keeping the
+reviewer from writing to the working tree during diff investigation. The
+YAML denies `Shell`, `WriteFile`, `StrReplaceFile`, `SearchWeb`, `FetchURL`
+via `exclude_tools`, leaving the read-only tools (`ReadFile`, `Glob`,
+`Grep`) the reviewer needs.
+
+If the kimi CLI rejects the YAML on first run (the schema is only partially
+documented — `exclude_tools` may need to land on a sub-agent rather than the
+top-level agent), tighten the YAML against the actual stderr. The
+orchestrator will fail-soft to `FALLBACK` while you iterate, so a broken
+kimi never blocks a commit on its own.
 
 ## Skipping the gate
 

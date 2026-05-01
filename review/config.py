@@ -45,7 +45,10 @@ class RunnerConfig:
 #     ]
 PRIMARIES: list[RunnerConfig] = [
     RunnerConfig("opencode", "github-copilot/gpt-5.4"),
-    # RunnerConfig("claude", "sonnet"),  # uncomment to enable parallel double-review
+    RunnerConfig(
+        "kimi", "kimi-code/kimi-for-coding"
+    ),  # Kimi K2; requires `kimi login`. Model alias must match ~/.kimi/config.toml [models.*] key. KimiBackend pins review/agents/kimi-pre-commit-reviewer.yaml automatically. review-note: no startup capability probe by design — this hook only runs on the owner's machine (~/.claude is single-user config), the reviewer fail-opens on backend errors (hook.py:1525+, fallback to claude/sonnet on total primary failure), and a probe per commit would burn ~1-2s for no real safety on a misconfigured machine the user would notice immediately anyway.
+    # RunnerConfig("claude", "sonnet"),  # uncomment to enable parallel triple-review
 ]
 
 # Safety-net reviewer used ONLY if every primary fails (timeout / rc!=0

@@ -25,6 +25,9 @@ from __future__ import annotations
 import json
 import subprocess
 from abc import ABC, abstractmethod
+from pathlib import Path
+
+_KIMI_AGENT_FILE = str(Path(__file__).parent / "agents" / "kimi-pre-commit-reviewer.yaml")
 
 
 class Backend(ABC):
@@ -140,6 +143,79 @@ class ClaudeBackend(Backend):
         return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
+_KIMI_PREAMBLE = (
+    "**Important context for this review run.** kimi is invoked from a "
+    "directory that does not contain the diff's source files. The diff in "
+    "the user prompt below is the complete, authoritative artefact to "
+    "review — its hunks already include surrounding context lines. Do "
+    "**not** call `ReadFile`, `Glob`, `Grep`, or `Shell` to look up the "
+    "diff's files; they are not on this filesystem and the resulting tool "
+    "calls will return empty/wrong results and waste your token budget. "
+    "Treat the diff as the entire source of truth and produce the full "
+    "review (Section 1, Section 2 across all lenses, Section 3) in a "
+    "single response."
+)
+
+
+class KimiBackend(Backend):
+    name = "kimi"
+
+    def run(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        model: str,
+        timeout: int,
+    ) -> tuple[str, str, int]:
+        # Kimi has no --system-prompt flag → concatenate (same way
+        # OpencodeBackend does). Stdin is not a documented path for --prompt,
+        # so the combined prompt rides on argv; combined size is well under
+        # ARG_MAX even at FANOUT_THRESHOLD.
+        # Prepend a kimi-specific preamble that overrides the generic
+        # "use Read/Grep/Glob" instruction in prompts/combined.md — kimi
+        # runs from ~/.claude, not the user's repo, so filesystem lookups
+        # are wrong-tree and a previous live smoke had kimi spend 768s
+        # chasing missing files before truncating mid-review.
+        # review-note: keeping the preamble in prompt text is a deliberate
+        # kimi-specific cost optimization. Passing `cwd=<repo>` to subprocess
+        # would let kimi reach the files, but combined.md tells reviewers to
+        # use Read/Grep/Glob — kimi would then spend tokens browsing instead
+        # of reviewing the diff (the 768s smoke incident above). The "shared
+        # prompt contract" refactor across backends is out of scope here.
+        system_prompt = f"{_KIMI_PREAMBLE}\n\n{system_prompt}" if system_prompt else _KIMI_PREAMBLE
+        # `system_prompt` is non-empty after the line above (either the
+        # original prefixed with the preamble, or the bare preamble), so an
+        # `else user_prompt` branch here would be unreachable.
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        # `--quiet` is `--print --output-format text --final-message-only` —
+        # gives clean stdout (just the final assistant reply) instead of the
+        # event-stream dump `--print` alone produces. `--print` implicitly
+        # enables --yolo (auto-approve all tool calls), so `--agent-file`
+        # loads our restricted agent definition (no Shell, no write tools,
+        # no network egress) — the only thing keeping the reviewer from
+        # mutating the working tree or exfiltrating data during diff
+        # investigation. Symmetric with `opencode --agent pre-commit-reviewer`
+        # and pairs with the write-tree/read-tree backstop in
+        # ~/.claude/git-hooks/pre-commit.
+        cmd = [
+            "kimi",
+            "--quiet",
+            "--model",
+            model,
+            "--agent-file",
+            _KIMI_AGENT_FILE,
+            "--prompt",
+            full_prompt,
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+
 def _build_registry(*backends: Backend) -> dict[str, Backend]:
     """Build the BACKENDS registry, rejecting duplicate ``name`` values.
 
@@ -165,4 +241,4 @@ def _build_registry(*backends: Backend) -> dict[str, Backend]:
 # owns its parser as a method (OpencodeBackend._parse_json) and the ABC
 # enforces the contract via test_backend_subclass_must_implement_run; a
 # Callable dict has no equivalent guard.
-BACKENDS: dict[str, Backend] = _build_registry(OpencodeBackend(), ClaudeBackend())
+BACKENDS: dict[str, Backend] = _build_registry(OpencodeBackend(), ClaudeBackend(), KimiBackend())

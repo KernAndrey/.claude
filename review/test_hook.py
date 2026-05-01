@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+from contextlib import AbstractContextManager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from backends import BACKENDS, Backend, ClaudeBackend, OpencodeBackend, _build_registry
-from config import FANOUT_THRESHOLD, MAX_PROD_LINES, RunnerConfig
+from backends import BACKENDS, Backend, ClaudeBackend, KimiBackend, OpencodeBackend, _build_registry
+from config import FANOUT_THRESHOLD, MAX_PROD_LINES, PRIMARIES, RunnerConfig
 from hook import (
     ARBITER,
     LENS_APPLICABILITY,
@@ -488,6 +489,101 @@ def test_claude_backend_forwards_timeout() -> None:
         ClaudeBackend().run("sys", "user", "sonnet", 333)
 
     assert mock_run.call_args.kwargs["timeout"] == 333
+
+
+def _patched_backends_subprocess(
+    stdout: str = "", stderr: str = "", returncode: int = 0
+) -> AbstractContextManager[MagicMock]:
+    """Patch backends.subprocess.run with a mock returning given values.
+
+    Replaces the four-line MagicMock+patch scaffold each KimiBackend test
+    would otherwise repeat. Yields the MagicMock for `with ... as mock_run`
+    so callers can inspect ``mock_run.call_args``.
+    """
+    mock_result = MagicMock()
+    mock_result.stdout = stdout
+    mock_result.stderr = stderr
+    mock_result.returncode = returncode
+    return patch("backends.subprocess.run", return_value=mock_result)
+
+
+def test_kimi_backend_builds_correct_command() -> None:
+    with _patched_backends_subprocess(stdout="kimi review body") as mock_run:
+        stdout, stderr, rc = KimiBackend().run("sys", "user", "kimi-for-coding", 600)
+
+    cmd = mock_run.call_args[0][0]
+    assert cmd[0] == "kimi"
+    # --quiet = --print --output-format text --final-message-only.
+    # The shortcut keeps stdout to just the final assistant message instead
+    # of the event-stream dump `--print` alone produces.
+    assert "--quiet" in cmd
+    model_idx = cmd.index("--model")
+    assert cmd[model_idx + 1] == "kimi-for-coding"
+    prompt_idx = cmd.index("--prompt")
+    # KimiBackend prepends _KIMI_PREAMBLE to the system prompt before
+    # concatenating with the user prompt — combined.md tells reviewers to
+    # use Read/Grep/Glob, but kimi runs from a directory that does not
+    # contain the diff's files, so the preamble must override that
+    # instruction or kimi will burn tokens chasing missing paths.
+    sent = cmd[prompt_idx + 1]
+    assert sent.endswith("\n\nsys\n\nuser")
+    assert "Do **not** call `ReadFile`" in sent
+    assert mock_run.call_args.kwargs["timeout"] == 600
+    assert (stdout, stderr, rc) == ("kimi review body", "", 0)
+
+
+def test_kimi_backend_pins_agent_file() -> None:
+    """The kimi invocation must pin --agent-file at our project-shipped YAML
+    so the LLM cannot reach Shell/WriteFile/StrReplaceFile/SearchWeb/FetchURL
+    and silently mutate the working tree during diff investigation. Kimi's
+    --print mode implicitly enables --yolo (auto-approve all tool calls), so
+    the agent-file is the only constraint keeping the reviewer read-only.
+    Pairs with the write-tree/read-tree backstop in
+    ~/.claude/git-hooks/pre-commit. The YAML file must also exist on disk —
+    a test-only mock would let a future refactor delete it without warning.
+    """
+    with _patched_backends_subprocess() as mock_run:
+        KimiBackend().run("sys", "user", "kimi-for-coding", 60)
+
+    cmd = mock_run.call_args[0][0]
+    agent_idx = cmd.index("--agent-file")
+    agent_path = cmd[agent_idx + 1]
+    assert Path(agent_path).is_absolute()
+    assert agent_path.endswith("review/agents/kimi-pre-commit-reviewer.yaml")
+    assert Path(agent_path).is_file()
+
+
+def test_kimi_backend_uses_preamble_when_system_prompt_empty() -> None:
+    """With an empty system_prompt KimiBackend still injects _KIMI_PREAMBLE
+    so the resulting --prompt arg starts with the preamble (not the user
+    prompt). The preamble is what stops kimi from chasing missing files
+    when invoked from a directory other than the user's repo."""
+    with _patched_backends_subprocess(stdout="ok") as mock_run:
+        KimiBackend().run("", "user", "kimi-for-coding", 60)
+
+    cmd = mock_run.call_args[0][0]
+    prompt_idx = cmd.index("--prompt")
+    sent = cmd[prompt_idx + 1]
+    assert "Do **not** call `ReadFile`" in sent
+    assert sent.endswith("\n\nuser")
+
+
+def test_kimi_backend_forwards_timeout() -> None:
+    with _patched_backends_subprocess(stdout="ok") as mock_run:
+        KimiBackend().run("sys", "user", "kimi-for-coding", 333)
+
+    assert mock_run.call_args.kwargs["timeout"] == 333
+
+
+def test_default_primaries_pin_opencode_and_kimi_in_order() -> None:
+    """The runtime composition of PRIMARIES is part of the user-facing
+    contract — every commit on the owner's machine sees this list. A
+    silent reorder, addition, or removal here would change real
+    pre-commit behavior without any failing test. Pin the default so
+    drift is caught at test time, not at commit time."""
+    assert len(PRIMARIES) == 2
+    assert (PRIMARIES[0].backend, PRIMARIES[0].model) == ("opencode", "github-copilot/gpt-5.4")
+    assert (PRIMARIES[1].backend, PRIMARIES[1].model) == ("kimi", "kimi-code/kimi-for-coding")
 
 
 # ---------------------------------------------------------------------------

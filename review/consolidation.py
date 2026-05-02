@@ -38,13 +38,24 @@ from orchestrator import BackendReviewResult
 
 @dataclass(frozen=True)
 class FindingCluster:
-    """One equivalence class of findings (one or more contributors)."""
+    """One equivalence class of findings (one or more contributors).
+
+    ``chunk_id`` is the chunk that owns every member (per-chunk reviewer
+    output) or ``None`` when the cluster mixes chunks, mixes a chunk with
+    a whole-diff lens finding, or comes from the legacy non-chunked path.
+
+    ``invariant_id`` is set only for synthetic clusters the arbiter raises
+    against a manifest's ``cross_chunk_invariants`` entry, in the form
+    ``arbiter-INV<n>``.
+    """
 
     cluster_id: str  # "C1", "C2", ...
     member_ids: tuple[str, ...]  # finding IDs that belong here, in input order
     contributors: tuple[str, ...]  # unique backend names (alphabetical)
     canonical_line: str  # the chosen "best" finding line for display
     upheld: bool
+    chunk_id: str | None = None
+    invariant_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,11 +164,15 @@ _CLUSTER_RE = re.compile(
     r"^\s*\[CLUSTER\s+(C\d+)\]\s*(.+?)\s*$",
     re.MULTILINE | re.IGNORECASE,
 )
-_VERDICT_RE = re.compile(
-    r"^\s*\[(UPHELD|OVERTURN)\]\s*(C\d+)\b",
-    re.MULTILINE | re.IGNORECASE,
+# Matches finding IDs in any of these grammars:
+#   <backend>-F<n>                       legacy / single-backend         (opencode-F1)
+#   <chunk>-<backend>-F<n>               chunked per-chunk reviewer      (models-opencode-F1)
+#   wholediff-<lens>-<backend>-F<n>      chunked whole-diff lens layer   (wholediff-bugs-claude-F2)
+#   arbiter-INV<n>                       synthetic invariant violation   (arbiter-INV1)
+_FINDING_ID_TOKEN_RE = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9_-]*-)?F\d+"
+    r"|arbiter-INV\d+"
 )
-_FINDING_ID_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]*-?F\d+")
 
 
 def _consolidate_multi_backend(
@@ -226,6 +241,86 @@ def _consolidate_multi_backend(
 # ---------------------------------------------------------------------------
 
 
+_VERDICT_LINE_RE = re.compile(
+    r"^\s*\[(UPHELD|OVERTURN)\]\s*(C\d+)\s*[—\-:]?\s*(.*?)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _ingest_cluster_token(
+    token: str,
+    finding_index: dict[str, dict],
+    synthetic_findings: dict[str, dict],
+    seen: set[str],
+) -> str | None:
+    """Decide whether ``token`` is a usable cluster member; register synthetic
+    invariant IDs on the fly. Returns the token when accepted, else None."""
+    if token in seen:
+        return None
+    if token in finding_index:
+        seen.add(token)
+        return token
+    if _INVARIANT_ID_RE.match(token):
+        synthetic_findings.setdefault(token, {"id": token, "line": f"[{token}] cross-chunk invariant violation"})
+        seen.add(token)
+        return token
+    return None
+
+
+def _parse_cluster_lines(
+    raw: str,
+    finding_index: dict[str, dict],
+    synthetic_findings: dict[str, dict],
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Walk every ``[CLUSTER C<n>] ...`` line and group accepted member IDs.
+
+    Returns (cluster_members, seen_ids). Last-writer wins on duplicate
+    cluster IDs.
+    """
+    cluster_members: dict[str, list[str]] = {}
+    seen: set[str] = set()
+    for m in _CLUSTER_RE.finditer(raw):
+        cid = m.group(1).upper()
+        # Un-see previous members when the arbiter re-emits a cluster so
+        # corrected / extended lists don't silently drop IDs.
+        if cid in cluster_members:
+            for old_id in cluster_members[cid]:
+                seen.discard(old_id)
+        ids: list[str] = []
+        for token in _FINDING_ID_TOKEN_RE.findall(m.group(2)):
+            accepted = _ingest_cluster_token(token, finding_index, synthetic_findings, seen)
+            if accepted:
+                ids.append(accepted)
+        if ids:
+            cluster_members[cid] = ids
+    return cluster_members, seen
+
+
+def _parse_verdict_lines(raw: str) -> dict[str, tuple[bool, str]]:
+    """Capture verdict + rationale for every ``[UPHELD|OVERTURN] C<n>`` line."""
+    verdicts: dict[str, tuple[bool, str]] = {}
+    for m in _VERDICT_LINE_RE.finditer(raw):
+        cid = m.group(2).upper()
+        verdicts[cid] = (m.group(1).upper() == "UPHELD", m.group(3).strip())
+    return verdicts
+
+
+def _enrich_synthetic_lines(
+    synthetic_findings: dict[str, dict],
+    cluster_members: dict[str, list[str]],
+    verdicts: dict[str, tuple[bool, str]],
+) -> None:
+    """Pull richer rationale text into synthetic placeholders so an invariant
+    cluster has an informative canonical line."""
+    for cid, member_ids in cluster_members.items():
+        rationale = verdicts.get(cid, (True, ""))[1]
+        if not rationale:
+            continue
+        for mid in member_ids:
+            if mid in synthetic_findings and len(rationale) > len(synthetic_findings[mid]["line"]):
+                synthetic_findings[mid]["line"] = f"[{mid}] {rationale}"
+
+
 def parse_multi_arbiter_output(
     raw: str,
     findings: list[dict],
@@ -235,50 +330,36 @@ def parse_multi_arbiter_output(
     Robust to malformed output:
 
     - A finding ID that the arbiter omitted from every cluster gets its
-      own singleton cluster with ``upheld=True`` (fail-open: better to
-      block than to silently drop a flagged defect).
+      own singleton cluster with ``upheld=True`` (fail-open).
     - A cluster with no verdict line is treated as ``UPHELD`` (same
       stance as the legacy single-backend arbiter parser).
     - Cluster IDs the arbiter invented but didn't ground in any
-      finding are dropped silently — they would have no member to
-      uphold.
+      finding are dropped silently.
+
+    Synthetic ``arbiter-INV<n>`` IDs (cross-chunk-invariant violations
+    raised by the arbiter itself in chunked mode) are accepted even
+    though they are not in the input findings list. A placeholder
+    finding entry is materialized so the cluster has a canonical line
+    sourced from the verdict's rationale.
     """
     finding_index: dict[str, dict] = {f["id"]: f for f in findings}
-    cluster_members: dict[str, list[str]] = {}
-    seen_in_some_cluster: set[str] = set()
+    synthetic_findings: dict[str, dict] = {}
 
-    for m in _CLUSTER_RE.finditer(raw):
-        cid = m.group(1).upper()
-        ids_part = m.group(2)
-        ids: list[str] = []
-        for token in _FINDING_ID_TOKEN_RE.findall(ids_part):
-            if token in finding_index and token not in seen_in_some_cluster:
-                ids.append(token)
-                seen_in_some_cluster.add(token)
-        if ids:
-            # Last writer wins on duplicate cluster IDs — pathological
-            # but harmless; we just take the latest grouping.
-            cluster_members[cid] = ids
+    cluster_members, seen = _parse_cluster_lines(raw, finding_index, synthetic_findings)
+    verdicts = _parse_verdict_lines(raw)
+    _enrich_synthetic_lines(synthetic_findings, cluster_members, verdicts)
 
-    verdicts: dict[str, bool] = {}
-    for m in _VERDICT_RE.finditer(raw):
-        verdict = m.group(1).upper()
-        cid = m.group(2).upper()
-        verdicts[cid] = verdict == "UPHELD"
+    merged_index = {**finding_index, **synthetic_findings}
+    clusters: list[FindingCluster] = [
+        _make_cluster(cid, member_ids, merged_index, upheld=verdicts.get(cid, (True, ""))[0])
+        for cid, member_ids in cluster_members.items()
+    ]
 
-    clusters: list[FindingCluster] = []
-    for cid, member_ids in cluster_members.items():
-        upheld = verdicts.get(cid, True)  # fail-open: missing verdict → UPHELD
-        clusters.append(_make_cluster(cid, member_ids, finding_index, upheld))
-
-    # Fail-open singleton for each finding the arbiter forgot to cluster.
     next_index = _next_cluster_index(cluster_members.keys())
     for finding in findings:
-        if finding["id"] not in seen_in_some_cluster:
-            cid = f"C{next_index}"
+        if finding["id"] not in seen:
+            clusters.append(_make_cluster(f"C{next_index}", [finding["id"]], merged_index, upheld=True))
             next_index += 1
-            clusters.append(_make_cluster(cid, [finding["id"]], finding_index, upheld=True))
-
     return clusters
 
 
@@ -296,11 +377,53 @@ def _gather_findings(results: list[BackendReviewResult]) -> list[dict]:
     return out
 
 
+_INVARIANT_ID_RE = re.compile(r"^arbiter-INV(\d+)$")
+_WHOLEDIFF_ID_RE = re.compile(r"^wholediff-(?P<lens>[A-Za-z][A-Za-z0-9_]*)-(?P<backend>[A-Za-z][A-Za-z0-9_-]*)-F\d+$")
+_CHUNKED_ID_RE = re.compile(r"^(?P<chunk>[A-Za-z][A-Za-z0-9_]*)-(?P<backend>[A-Za-z][A-Za-z0-9_-]*)-F\d+$")
+_LEGACY_ID_RE = re.compile(r"^(?P<backend>[A-Za-z][A-Za-z0-9_-]*)-F\d+$")
+
+
 def _backend_of(finding_id: str) -> str:
-    """Extract the backend prefix from a finding ID (or '' if unprefixed)."""
-    if "-F" in finding_id:
-        return finding_id.rsplit("-F", 1)[0]
+    """Extract the backend prefix from a finding ID (or '' if unprefixed).
+
+    Handles all four ID grammars: legacy ``<backend>-F<n>``, chunked
+    ``<chunk>-<backend>-F<n>``, whole-diff lens
+    ``wholediff-<lens>-<backend>-F<n>``, and synthetic
+    ``arbiter-INV<n>`` (returns ``"arbiter"``).
+    """
+    if _INVARIANT_ID_RE.match(finding_id):
+        return "arbiter"
+    m = _WHOLEDIFF_ID_RE.match(finding_id)
+    if m:
+        return m.group("backend")
+    m = _CHUNKED_ID_RE.match(finding_id)
+    if m:
+        return m.group("backend")
+    m = _LEGACY_ID_RE.match(finding_id)
+    if m:
+        return m.group("backend")
     return ""
+
+
+def _chunk_of(finding_id: str) -> str | None:
+    """Return the chunk id for chunked per-chunk findings, else None.
+
+    Whole-diff lens findings, legacy IDs, and synthetic invariant IDs
+    return None — they don't belong to any single chunk.
+    """
+    if _WHOLEDIFF_ID_RE.match(finding_id) or _INVARIANT_ID_RE.match(finding_id):
+        return None
+    m = _CHUNKED_ID_RE.match(finding_id)
+    if m:
+        return m.group("chunk")
+    return None
+
+
+def _invariant_of(finding_id: str) -> str | None:
+    """Return ``arbiter-INV<n>`` for synthetic invariant IDs, else None."""
+    if _INVARIANT_ID_RE.match(finding_id):
+        return finding_id
+    return None
 
 
 def _make_cluster(
@@ -314,18 +437,34 @@ def _make_cluster(
     ``canonical_line`` picks the longest finding line — a rough proxy
     for "most informative" without an LLM second-pass. The contributors
     tuple is alphabetical and deduped so equality / hashing is stable.
+
+    ``chunk_id`` is set when every member belongs to the same chunk;
+    mixing chunks (or mixing chunked / wholediff findings) leaves it
+    None. ``invariant_id`` is set when at least one member is a
+    synthetic ``arbiter-INV<n>`` ID.
     """
     members = [finding_index[mid] for mid in member_ids if mid in finding_index]
-    contributors = tuple(sorted({_backend_of(mid) for mid in member_ids}))
+    contributors = tuple(sorted({_backend_of(mid) for mid in member_ids if _backend_of(mid)}))
     canonical = ""
     if members:
         canonical = max(members, key=lambda f: len(f["line"]))["line"]
+
+    chunk_ids = {_chunk_of(mid) for mid in member_ids}
+    chunk_id = next(iter(chunk_ids)) if len(chunk_ids) == 1 and None not in chunk_ids else None
+
+    invariant_id = next(
+        (inv for mid in member_ids if (inv := _invariant_of(mid)) is not None),
+        None,
+    )
+
     return FindingCluster(
         cluster_id=cluster_id,
         member_ids=tuple(member_ids),
         contributors=contributors,
         canonical_line=canonical,
         upheld=upheld,
+        chunk_id=chunk_id,
+        invariant_id=invariant_id,
     )
 
 

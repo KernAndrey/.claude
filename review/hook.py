@@ -40,8 +40,10 @@ from pathlib import Path
 from backends import BACKENDS
 from config import (
     ARBITER,
+    CHUNKED_BACKENDS,
     FALLBACK,
     FANOUT_THRESHOLD,
+    MAX_CHUNKS,
     MAX_PROD_LINES,
     MIN_LINES_TO_REVIEW,
     PRIMARIES,
@@ -229,13 +231,22 @@ def check_diff_size(diff: str) -> str | None:
     (CODE_EXTS minus test files). Tests, docs, configs, removals, and
     context lines are intentionally exempt — reviewer recall scales
     with prod-code complexity, not with total text volume.
+
+    When the diff exceeds the limit, the writer must generate
+    ``.review/manifest.yaml`` so the chunked-review pipeline can fan
+    the commit out. The hint is part of the error so a developer seeing
+    this for the first time has a discoverable next step.
     """
     prod = count_added_production_lines(diff)
     if prod <= MAX_PROD_LINES:
         return None
     return (
-        f"Diff has {prod} added production-code lines (limit {MAX_PROD_LINES}). "
-        "Split this into smaller commits so each one can be fully reviewed. "
+        f"Diff has {prod} added production-code lines (limit {MAX_PROD_LINES}).\n"
+        "Write `.review/manifest.yaml` to split the commit into reviewable\n"
+        "chunks. Scaffold the file with:\n"
+        "    python3 ~/.claude/review/scripts/scaffold_manifest.py\n"
+        "Then edit it — you decide how to group files. The chunked-review\n"
+        "pipeline runs reviewers per chunk in parallel.\n"
         "Test, doc, config, and lock-file changes do not count toward the limit."
     )
 
@@ -357,6 +368,11 @@ def _verify_runner_configs() -> None:
     for label, cfg in (("FALLBACK", FALLBACK), ("ARBITER", ARBITER)):
         if cfg is None:
             continue
+        if cfg.backend not in BACKENDS:
+            raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {valid}")
+
+    for idx, cfg in enumerate(CHUNKED_BACKENDS, start=1):
+        label = f"CHUNKED_BACKENDS[{idx - 1}]"
         if cfg.backend not in BACKENDS:
             raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {valid}")
 
@@ -1472,6 +1488,105 @@ def _persist_run(
         save_stats(stats_obj, log_path, default_aggregate_path())
 
 
+_REVIEW_ARTIFACT_PREFIXES: tuple[str, ...] = ("state/", "raw/")
+_REVIEW_ARTIFACT_NAMES: frozenset[str] = frozenset(
+    {"arbiter_raw.txt", "findings.json", "blocking.txt", "metrics.json", "crash.log"}
+)
+
+
+def _is_accidental_review_artifact(path: str) -> bool:
+    """True for working artifacts under ``.review/`` that must never be committed."""
+    if not path.startswith(".review/"):
+        return False
+    inner = path[len(".review/") :]
+    if inner.startswith(_REVIEW_ARTIFACT_PREFIXES):
+        return True
+    return inner in _REVIEW_ARTIFACT_NAMES
+
+
+def _check_staged_review_guard() -> None:
+    """Exit 1 if any staged path is under ``.review/``.
+
+    Manifest is intentionally NOT committed (the chicken-and-egg with
+    ``diff_hash``). ``.review/`` should live in global gitignore
+    (``~/.config/git/ignore`` via ``core.excludesFile``); this guard
+    catches the misconfigured case where it isn't, before a stray
+    ``.review/manifest.yaml`` ends up in a commit.
+    """
+    try:
+        out = subprocess.check_output(["git", "diff", "--cached", "--name-only"], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return
+    bad = [p.strip() for p in out.splitlines() if _is_accidental_review_artifact(p.strip())]
+    if bad:
+        error(
+            "ERROR: .review/ paths are staged — these are working artifacts, "
+            "not commit content:\n  " + "\n  ".join(bad) + "\n"
+            "Run: git restore --staged .review/\n"
+            "Then add `.review/` to your global gitignore: "
+            "`echo .review/ >> ~/.config/git/ignore && "
+            "git config --global core.excludesFile ~/.config/git/ignore`"
+        )
+        save_log("BLOCK", error_msg=f"refused: staged .review/ paths: {bad}")
+        sys.exit(1)
+
+
+def _format_chunked_display(result: object) -> str:
+    """Render chunked-review result as text for stdout + log.
+
+    Annotated as ``object`` to avoid an import cycle with ``chunked.py``;
+    callers always pass a ``ChunkedResult`` and we only access named
+    attributes the dataclass defines."""
+    lines = []
+    if result.upheld_clusters:
+        lines.append(result.blocking_text)
+    else:
+        lines.append(f"chunked review: 0 BLOCKING (out of {len(result.clusters)} cluster(s)).")
+    lines.append("")
+    lines.append(
+        f"Reviewers: {len(result.job_results)} job(s) "
+        f"(chunk + wholediff layers); arbiter status: {result.arbiter_status}; "
+        f"wall-clock: {result.metrics.get('wall_clock_seconds', '?')}s."
+    )
+    return "\n".join(lines)
+
+
+def _run_chunked_path(diff: str, files: str, is_merge: bool) -> str:
+    """Drive the chunked-review pipeline + persist artifacts. Returns verdict."""
+    from chunked import run_chunked_review, write_artifacts
+
+    repo_root = Path.cwd()
+    info(f"chunked-review path: dispatching with manifest at {repo_root / '.review/manifest.yaml'}")
+    result = run_chunked_review(diff, files, repo_root, is_merge=is_merge)
+
+    if result.status == "manifest_invalid":
+        msg = result.blocking_text
+        error("Manifest validation failed — refusing chunked review:\n\n" + msg)
+        save_log("BLOCK", files=files, diff=diff, error_msg="manifest_invalid", review=msg)
+        # Still write the validation output to .review/ for forensics; archive.py
+        # will move it to .git/review-archive/ if a commit later lands. Here we
+        # block so no commit happens — leave .review/ in place for the writer.
+        return "BLOCK"
+
+    try:
+        write_artifacts(result, repo_root)
+    except OSError as exc:
+        warn(f"Failed to write review artifacts: {exc} — continuing with verdict")
+    display = _format_chunked_display(result)
+
+    if result.upheld_clusters:
+        verdict = "BLOCK"
+        error(f"Chunked review BLOCKED this commit:\n\n{display}")
+        info(_BLOCK_FIX_DIRECTIVE)
+        info(_BLOCK_TRADEOFF_DIRECTIVE)
+    else:
+        verdict = "OK"
+        info(display)
+
+    save_log(verdict, files=files, diff=diff, review=display)
+    return verdict
+
+
 def _run_multi_backend_pipeline(diff: str, files: str, is_merge: bool) -> str:
     """Run orchestrator → consolidation → log + stats. Returns verdict."""
     from consolidation import consolidate
@@ -1499,9 +1614,74 @@ def _run_multi_backend_pipeline(diff: str, files: str, is_merge: bool) -> str:
     return verdict
 
 
+def _auto_scaffold_manifest(repo_root: Path, n_prod: int) -> None:
+    """Auto-create ``.review/manifest.yaml`` scaffold when the diff is large
+    and no manifest exists. Exits 1 with a message asking the writer to fill
+    in chunks and retry.
+
+    The scaffolder doesn't auto-classify — it just lays out empty templates
+    plus a comment listing every staged file. The writer fills them in.
+    """
+    from scripts.scaffold_manifest import build_scaffold, write_scaffold
+
+    text = build_scaffold(num_chunks=3, max_chunks=MAX_CHUNKS, max_prod=MAX_PROD_LINES)
+    path = write_scaffold(text, repo_root)
+    error(
+        f"Diff has {n_prod} added prod lines (limit {MAX_PROD_LINES}).\n"
+        f"Scaffolded {path} — please:\n"
+        "  1. Open the file and fill in `chunks:` (group files by meaning,\n"
+        "     keep each chunk ≤300 prod lines; split big files via line_ranges).\n"
+        "  2. Re-run `git commit` — the chunked pipeline will run reviewers\n"
+        "     in parallel.\n"
+        "Tests, docs, .yaml/.json, and .sh do not count toward the prod limit."
+    )
+    save_log(
+        "BLOCK",
+        diff="<auto-scaffold>",
+        error_msg=f"manifest auto-scaffolded; writer must fill in chunks ({n_prod} prod lines)",
+    )
+    sys.exit(1)
+
+
+def _maybe_dispatch_chunked() -> None:
+    """Branch on diff-size + manifest presence:
+
+    * ``N < MAX_PROD_LINES`` → return; ``main()`` falls through to the
+      legacy single-call path.
+    * ``N >= MAX_PROD_LINES`` and no manifest → auto-scaffold one and
+      exit 1, asking the writer to fill it in.
+    * ``N >= MAX_PROD_LINES`` and manifest present → run chunked path
+      and exit with its verdict.
+
+    Calling ``get_staged_diff`` here costs one extra subprocess but lets
+    the rest of ``main()`` keep its existing contract.
+    """
+    from chunked import manifest_present
+
+    diff, _git_err = get_staged_diff()
+    if not diff:
+        return  # let collect_diff produce the existing SKIP log
+    n_prod = count_added_production_lines(diff)
+    if n_prod < MAX_PROD_LINES:
+        return
+
+    repo_root = Path.cwd()
+    if not manifest_present(repo_root):
+        _auto_scaffold_manifest(repo_root, n_prod)  # exits 1
+        return  # unreachable; keeps the function shape obvious
+
+    files = get_staged_files()
+    is_merge = Path(".git/MERGE_HEAD").is_file()
+    info(f"Reviewing {len(files.splitlines())} file(s), +{n_prod} added prod line(s), mode=chunked (manifest detected)")
+    verdict = _run_chunked_path(diff, files, is_merge)
+    sys.exit(1 if verdict == "BLOCK" else 0)
+
+
 def main() -> None:
     try:
         _verify_runner_configs()
+        _check_staged_review_guard()
+        _maybe_dispatch_chunked()
 
         context = collect_diff()
         if not context:

@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Global post-commit hook — archive .review/ artifacts produced by the
+# chunked-review path during pre-commit.
+#
+# Invariant:
+#   We only archive when .review/ was produced by the CURRENT commit's
+#   pre-commit run.  A stale .review/ left behind by a failed prior commit
+#   must NOT be archived (it would be mis-attributed to the wrong SHA).
+#   We enforce this by verifying .review/manifest.yaml exists and its
+#   diff_hash matches HEAD's diff.  If the check fails we leave .review/
+#   untouched so the developer can inspect it.
+#
+# Worktree-safe: archives land in the shared `.git/` parent.
+# Skip with: git commit --no-verify (which also bypasses pre-commit).
+
+set -uo pipefail
+
+# Guard against accidental recursion (post-commit doesn't usually trigger
+# anything that would call back, but match pre-commit's pattern).
+[ "${_CLAUDE_POST_HOOK_RUNNING:-}" = "1" ] && exit 0
+export _CLAUDE_POST_HOOK_RUNNING=1
+
+# Step 1: Run repo-local post-commit hook if it exists, so user repos can
+# add their own behavior alongside the global one.
+COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null)"
+if [ -n "$COMMON_DIR" ]; then
+    LOCAL_HOOK="$COMMON_DIR/hooks/post-commit"
+    if [ -x "$LOCAL_HOOK" ]; then
+        "$LOCAL_HOOK" "$@" || true
+    fi
+fi
+
+# Step 2: Archive .review/ artifacts via chunked-review's archive.py.
+# Failure here must not break anything — the commit is already done.
+if [ -d ".review" ]; then
+    MANIFEST=".review/manifest.yaml"
+    if [ -f "$MANIFEST" ]; then
+        # Verify the manifest belongs to the current commit (not a stale
+        # leftover from a previously-failed commit).
+        if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            EXPECTED_HASH=$(git diff HEAD~1 HEAD | python3 -c "import sys, hashlib; print(hashlib.sha256(sys.stdin.read().strip().encode()).hexdigest())")
+            ACTUAL_HASH=$(python3 -c "
+import sys
+with open(sys.argv[1]) as f:
+    for line in f:
+        if line.strip().startswith('diff_hash:'):
+            print(line.split(':', 1)[1].split('#')[0].strip())
+            break
+" "$MANIFEST")
+            if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+                echo "post-commit: stale .review/ detected (diff_hash mismatch) — leaving in place" >&2
+                exit 0
+            fi
+        fi
+        python3 -B "$HOME/.claude/review/archive.py" || true
+    else
+        echo "post-commit: stale .review/ detected (no manifest.yaml) — leaving in place" >&2
+    fi
+fi
+
+exit 0

@@ -7,13 +7,15 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from backends import BACKENDS, Backend, ClaudeBackend, KimiBackend, OpencodeBackend, _build_registry
-from config import FANOUT_THRESHOLD, MAX_PROD_LINES, PRIMARIES, RunnerConfig
+from config import CHUNKED_BACKENDS, FANOUT_THRESHOLD, MAX_PROD_LINES, PRIMARIES, RunnerConfig
 from hook import (
     ARBITER,
     LENS_APPLICABILITY,
     LENS_NAMES,
     _aggregate_lens_outputs,
+    _check_staged_review_guard,
     _render_fanout_output,
+    _run_chunked_path,
     _run_single_call,
     _verify_runner_configs,
     applicable_lenses,
@@ -238,6 +240,20 @@ def test_verify_runner_configs_allows_none_fallback() -> None:
     """FALLBACK = None is a supported configuration (no fallback)."""
     with patch("hook.FALLBACK", None):
         _verify_runner_configs()  # must not raise
+
+
+def test_verify_runner_configs_raises_on_invalid_chunked_backend() -> None:
+    """A typo in CHUNKED_BACKENDS must be caught at startup, not when a large
+    commit finally takes the chunked path."""
+    bogus = RunnerConfig("typo-backend", "x")
+    with patch("hook.CHUNKED_BACKENDS", [bogus]):
+        try:
+            _verify_runner_configs()
+        except ValueError as exc:
+            assert "CHUNKED_BACKENDS" in str(exc)
+            assert "typo-backend" in str(exc)
+            return
+    raise AssertionError("expected ValueError on invalid CHUNKED_BACKENDS entry")
 
 
 def test_lens_names_derived_from_lens_applicability() -> None:
@@ -575,15 +591,29 @@ def test_kimi_backend_forwards_timeout() -> None:
     assert mock_run.call_args.kwargs["timeout"] == 333
 
 
-def test_default_primaries_pin_opencode_and_kimi_in_order() -> None:
+def test_default_primaries_pin_opencode_only() -> None:
     """The runtime composition of PRIMARIES is part of the user-facing
     contract — every commit on the owner's machine sees this list. A
     silent reorder, addition, or removal here would change real
     pre-commit behavior without any failing test. Pin the default so
-    drift is caught at test time, not at commit time."""
-    assert len(PRIMARIES) == 2
+    drift is caught at test time, not at commit time.
+
+    Current default: opencode only (kimi/claude commented out in config.py
+    by the owner — kimi to avoid the kimi-login dependency, claude to keep
+    a single-backend baseline for the chunked-path rollout)."""
+    assert len(PRIMARIES) == 1
     assert (PRIMARIES[0].backend, PRIMARIES[0].model) == ("opencode", "github-copilot/gpt-5.4")
-    assert (PRIMARIES[1].backend, PRIMARIES[1].model) == ("kimi", "kimi-code/kimi-for-coding")
+
+
+def test_config_defaults_pinned() -> None:
+    """ALLOWED_LENSES and CHUNKED_BACKENDS are part of the runtime contract;
+    drift changes real behavior without any failing test."""
+    from config import ALLOWED_LENSES
+
+    assert ALLOWED_LENSES == frozenset({"bugs", "architecture", "tests"})
+    assert CHUNKED_BACKENDS
+    for cfg in CHUNKED_BACKENDS:
+        assert cfg.backend in BACKENDS
 
 
 # ---------------------------------------------------------------------------
@@ -1030,9 +1060,11 @@ def test_under_limit_returns_none() -> None:
 def test_over_limit_returns_message() -> None:
     result = check_diff_size(_build_prod_diff(MAX_PROD_LINES + 1))
     assert result is not None
-    assert "Split" in result
     assert str(MAX_PROD_LINES) in result
     assert "production-code" in result
+    # The message must point the writer at the chunked-review escape hatch.
+    assert "manifest.yaml" in result
+    assert "scaffold_manifest.py" in result
 
 
 def test_test_file_diff_does_not_trip_cap() -> None:
@@ -1098,6 +1130,7 @@ def test_opencode_backend_builds_correct_command() -> None:
         stdout, stderr, rc = OpencodeBackend().run("sys", "user", "github-copilot/gpt-5.4", 1200)
 
     cmd = mock_run.call_args[0][0]
+    kwargs = mock_run.call_args.kwargs
     assert cmd[0] == "opencode"
     assert "run" in cmd
     assert "--pure" in cmd
@@ -1105,7 +1138,10 @@ def test_opencode_backend_builds_correct_command() -> None:
     assert "json" in cmd
     assert "--model" in cmd
     assert "github-copilot/gpt-5.4" in cmd
-    assert cmd[-1] == "sys\n\nuser"
+    # Prompt must be piped via stdin, not argv — chunked-path prompts
+    # routinely exceed Linux ARG_MAX (~128KB).
+    assert "sys\n\nuser" not in cmd
+    assert kwargs["input"] == "sys\n\nuser"
     assert stdout == "done"
     assert rc == 0
 
@@ -1120,8 +1156,8 @@ def test_opencode_backend_empty_system_prompt() -> None:
     with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
         OpencodeBackend().run("", "user only", "github-copilot/gpt-5.4", 1200)
 
-    cmd = mock_run.call_args[0][0]
-    assert cmd[-1] == "user only"
+    kwargs = mock_run.call_args.kwargs
+    assert kwargs["input"] == "user only"
 
 
 def test_opencode_backend_run_empty_stdout_short_circuits_parser() -> None:
@@ -1313,7 +1349,13 @@ def test_save_log_diff_stats_includes_prod_count(tmp_path: Path) -> None:
 
 
 def test_fanout_threshold_sane_default() -> None:
-    assert FANOUT_THRESHOLD == 100
+    # Fan-out has been moved to the chunked path (chunked review of large
+    # commits). The small-commit path (N < MAX_PROD_LINES) now runs a single
+    # combined-prompt reviewer per backend — no fan-out. Setting the
+    # threshold equal to MAX_PROD_LINES neutralizes fan-out for small
+    # commits while keeping the run_fanout function reusable from chunked.py
+    # for the whole-diff lens layer.
+    assert FANOUT_THRESHOLD == MAX_PROD_LINES
     # Three lenses: bugs, architecture, tests. Types was removed (ruff ANN
     # covers it); security/perf/rootcause folded into bugs; duplication/
     # complexity folded into architecture.
@@ -1894,6 +1936,11 @@ def _invoke_main_on_block(
         return "BLOCK"
 
     with (
+        # Skip the chunked dispatch — these tests pin the legacy small-commit
+        # main() path. The chunked path has its own coverage in test_chunked.py
+        # and the dispatch helpers are tested separately.
+        patch("hook._maybe_dispatch_chunked", return_value=None),
+        patch("hook._check_staged_review_guard", return_value=None),
         patch("hook.collect_diff", return_value=("diff-body", "foo.py", False)),
         patch("hook._run_multi_backend_pipeline", side_effect=fake_pipeline),
         patch("hook.applicable_lenses", return_value=["bugs"]),
@@ -2063,6 +2110,8 @@ def _invoke_main_on_ok(review_text: str) -> str:
         return "OK"
 
     with (
+        patch("hook._maybe_dispatch_chunked", return_value=None),
+        patch("hook._check_staged_review_guard", return_value=None),
         patch("hook.collect_diff", return_value=("diff-body", "foo.py", False)),
         patch("hook._run_multi_backend_pipeline", side_effect=fake_pipeline),
         patch("hook.applicable_lenses", return_value=["bugs"]),
@@ -2373,6 +2422,107 @@ def test_parse_multi_arbiter_output_fail_open_for_missing_finding() -> None:
     assert forgotten[0].upheld is True
 
 
+def test_parse_multi_arbiter_chunked_id_grammars() -> None:
+    """Chunk-prefixed and whole-diff lens IDs cluster into the same shape as
+    legacy IDs; chunk_id is set when every member shares the same chunk and
+    None when the cluster mixes layers."""
+    from consolidation import parse_multi_arbiter_output
+
+    findings = [
+        {"id": "models-opencode-F1", "line": "[models-opencode-F1] [CRITICAL] sale_order.py:142"},
+        {"id": "models-claude-F1", "line": "[models-claude-F1] [CRITICAL] sale_order.py:142"},
+        {"id": "wholediff-bugs-kimi-F1", "line": "[wholediff-bugs-kimi-F1] [CRITICAL] across files"},
+    ]
+    raw = (
+        "[CLUSTER C1] models-opencode-F1, models-claude-F1\n"
+        "[CLUSTER C2] wholediff-bugs-kimi-F1\n"
+        "[UPHELD] C1 — chunked agreement\n"
+        "[OVERTURN] C2 — theoretical\n"
+        "Summary: 1 UPHELD, 1 OVERTURN, 2 clusters total."
+    )
+    clusters = parse_multi_arbiter_output(raw, findings)
+
+    by_id = {c.cluster_id: c for c in clusters}
+    assert by_id["C1"].chunk_id == "models"
+    assert set(by_id["C1"].contributors) == {"opencode", "claude"}
+    assert by_id["C1"].upheld is True
+    assert by_id["C2"].chunk_id is None  # whole-diff layer is not chunked
+    assert by_id["C2"].contributors == ("kimi",)
+    assert by_id["C2"].upheld is False
+
+
+def test_parse_multi_arbiter_synthetic_invariant() -> None:
+    """Cross-chunk invariants the arbiter raises itself land as synthetic
+    clusters with invariant_id set and a rationale-derived canonical line."""
+    from consolidation import parse_multi_arbiter_output
+
+    findings = [
+        {"id": "models-opencode-F1", "line": "[models-opencode-F1] [CRITICAL] x"},
+    ]
+    raw = (
+        "[CLUSTER C1] models-opencode-F1\n"
+        "[CLUSTER C2] arbiter-INV1\n"
+        "[UPHELD] C1 — real bug\n"
+        "[UPHELD] C2 — invariant violated: every new field needs an ACL row\n"
+        "Summary: 2 UPHELD, 0 OVERTURN, 2 clusters total.\n"
+        "Chunked: 1 invariant-violations, 0 cross-chunk-overturns."
+    )
+    clusters = parse_multi_arbiter_output(raw, findings)
+
+    by_id = {c.cluster_id: c for c in clusters}
+    assert by_id["C2"].invariant_id == "arbiter-INV1"
+    assert by_id["C2"].upheld is True
+    # Rationale gets pulled into canonical_line so display is informative.
+    assert "every new field needs an ACL row" in by_id["C2"].canonical_line
+    # Synthetic IDs report "arbiter" as the contributor.
+    assert by_id["C2"].contributors == ("arbiter",)
+
+
+def test_parse_multi_arbiter_mixed_chunk_cluster_has_no_chunk_id() -> None:
+    """If reviewers in different chunks both flag the same defect, the
+    cluster's chunk_id is None — it spans chunks."""
+    from consolidation import parse_multi_arbiter_output
+
+    findings = [
+        {"id": "models-opencode-F1", "line": "[models-opencode-F1] [CRITICAL] x"},
+        {"id": "security-claude-F1", "line": "[security-claude-F1] [CRITICAL] y"},
+    ]
+    raw = (
+        "[CLUSTER C1] models-opencode-F1, security-claude-F1\n"
+        "[UPHELD] C1 — same mechanism in both chunks\n"
+        "Summary: 1 UPHELD, 0 OVERTURN, 1 clusters total."
+    )
+    clusters = parse_multi_arbiter_output(raw, findings)
+    assert len(clusters) == 1
+    assert clusters[0].chunk_id is None
+    assert set(clusters[0].contributors) == {"opencode", "claude"}
+
+
+def test_parse_multi_arbiter_output_duplicate_cluster_last_writer_wins() -> None:
+    """Repeated [CLUSTER C<n>] lines: the LAST membership list wins and
+    previous-list IDs are removed from the cluster (seen.discard)."""
+    from consolidation import parse_multi_arbiter_output
+
+    findings = [
+        {"id": "F1", "line": "[F1] [CRITICAL] a.py:1 — bug"},
+        {"id": "F2", "line": "[F2] [CRITICAL] a.py:2 — bug"},
+        {"id": "F3", "line": "[F3] [CRITICAL] a.py:3 — bug"},
+    ]
+    raw = (
+        "[CLUSTER C1] F1, F2\n"
+        "[CLUSTER C1] F2, F3\n"
+        "[UPHELD] C1 — real bug\n"
+        "Summary: 1 UPHELD, 0 OVERTURN, 1 clusters total."
+    )
+    clusters = parse_multi_arbiter_output(raw, findings)
+    by_id = {c.cluster_id: c for c in clusters}
+    assert set(by_id["C1"].member_ids) == {"F2", "F3"}
+    # F1 was discarded from C1 and gets its own singleton fail-open cluster.
+    singletons = [c for c in clusters if "F1" in c.member_ids]
+    assert len(singletons) == 1
+    assert singletons[0].upheld is True
+
+
 def test_consolidate_arbiter_failure_upholds_everything() -> None:
     """Arbiter timeout/missing prompt must fail-open: every finding is
     upheld in a singleton cluster (consistent with legacy behavior)."""
@@ -2644,3 +2794,270 @@ def test_aggregate_per_backend_computes_consensus_and_solo_rates() -> None:
     assert m["overturned_total"] == 2
     # 3/(3+1)=0.75, plus prior run 1/(1+1)=0.5 → combined upheld_rate = 4/6 ≈ 0.667
     assert abs(m["upheld_rate"] - 4 / 6) < 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Chunked-path dispatch in main()
+# ---------------------------------------------------------------------------
+
+
+def test_check_staged_review_guard_blocks_when_review_is_staged() -> None:
+    """A staged ``.review/`` path is a writer mistake — block the commit
+    before anything else."""
+    with (
+        patch("hook.subprocess.check_output", return_value=".review/findings.json\nsrc/foo.py\n"),
+        patch("hook.error") as mock_err,
+        patch("hook.save_log") as mock_log,
+    ):
+        try:
+            _check_staged_review_guard()
+        except SystemExit as e:
+            assert e.code == 1
+        else:
+            raise AssertionError("expected SystemExit")
+    assert mock_err.called
+    assert ".review/" in mock_err.call_args[0][0]
+    assert mock_log.call_args[0][0] == "BLOCK"
+
+
+def test_check_staged_review_guard_passes_clean_diff() -> None:
+    with patch("hook.subprocess.check_output", return_value="src/foo.py\nsrc/bar.py\n"):
+        # Should NOT raise / exit.
+        _check_staged_review_guard()
+
+
+def test_maybe_dispatch_chunked_skips_when_below_threshold() -> None:
+    """Below threshold, the chunked path is bypassed and ``main()`` falls
+    through to the existing flow regardless of manifest presence."""
+    from hook import _maybe_dispatch_chunked
+
+    small_diff = "diff --git a/x.py b/x.py\n+++ b/x.py\n@@ -0,0 +1,5 @@\n+a\n+b\n+c\n+d\n+e\n"
+    with (
+        patch("hook.get_staged_diff", return_value=(small_diff, None)),
+        patch("hook.count_added_production_lines", return_value=50),
+        patch("chunked.manifest_present", return_value=False),
+    ):
+        _maybe_dispatch_chunked()  # returns, no SystemExit
+
+
+def test_maybe_dispatch_chunked_auto_scaffolds_when_no_manifest_and_big() -> None:
+    """At/above threshold without a manifest the hook auto-scaffolds and exits 1."""
+    from hook import _maybe_dispatch_chunked
+
+    big_diff = "diff --git a/x.py b/x.py\n+++ b/x.py\n@@ -0,0 +1,400 @@\n" + "\n".join(f"+line_{i}" for i in range(400))
+    with (
+        patch("hook.get_staged_diff", return_value=(big_diff, None)),
+        patch("hook.count_added_production_lines", return_value=400),
+        patch("chunked.manifest_present", return_value=False),
+        patch("scripts.scaffold_manifest.build_scaffold", return_value="scaffold-yaml"),
+        patch("scripts.scaffold_manifest.write_scaffold", return_value=Path("/tmp/.review/manifest.yaml")),
+        patch("hook.save_log"),
+        patch("hook.error"),
+    ):
+        try:
+            _maybe_dispatch_chunked()
+        except SystemExit as e:
+            assert e.code == 1
+        else:
+            raise AssertionError("expected SystemExit=1 from auto-scaffold")
+
+
+def test_maybe_dispatch_chunked_takes_chunked_path_at_exact_threshold() -> None:
+    """n_prod == MAX_PROD_LINES must reach the manifest check (chunked path),
+    not return early."""
+    from hook import _maybe_dispatch_chunked
+
+    diff = "diff --git a/x.py b/x.py\n+++ b/x.py\n@@ -0,0 +1,300 @@\n" + "\n".join(f"+line_{i}" for i in range(300))
+    with (
+        patch("hook.get_staged_diff", return_value=(diff, None)),
+        patch("hook.count_added_production_lines", return_value=MAX_PROD_LINES),
+        patch("chunked.manifest_present", return_value=False),
+        patch("scripts.scaffold_manifest.build_scaffold", return_value="scaffold-yaml"),
+        patch("scripts.scaffold_manifest.write_scaffold", return_value=Path("/tmp/.review/manifest.yaml")),
+        patch("hook.save_log"),
+        patch("hook.error"),
+    ):
+        try:
+            _maybe_dispatch_chunked()
+        except SystemExit as e:
+            assert e.code == 1
+        else:
+            raise AssertionError("expected SystemExit=1 from auto-scaffold at exact threshold")
+
+
+def test_maybe_dispatch_chunked_runs_chunked_when_threshold_and_manifest() -> None:
+    from hook import _maybe_dispatch_chunked
+
+    big_diff = "diff --git a/x.py b/x.py\n"
+    fake_result = MagicMock()
+    fake_result.status = "ok"
+    fake_result.upheld_clusters = []
+    fake_result.clusters = []
+    fake_result.job_results = []
+    fake_result.metrics = {"wall_clock_seconds": 1.5}
+    fake_result.arbiter_status = "ran"
+    fake_result.blocking_text = "ok"
+
+    with (
+        patch("hook.get_staged_diff", return_value=(big_diff, None)),
+        patch("hook.count_added_production_lines", return_value=350),
+        patch("chunked.manifest_present", return_value=True),
+        patch("hook.get_staged_files", return_value="x.py"),
+        patch("chunked.run_chunked_review", return_value=fake_result),
+        patch("chunked.write_artifacts", return_value=Path("/tmp/.review")),
+        patch("hook.save_log"),
+    ):
+        try:
+            _maybe_dispatch_chunked()
+        except SystemExit as e:
+            # Empty upheld → exit 0
+            assert e.code == 0
+        else:
+            raise AssertionError("expected SystemExit from chunked path")
+
+
+def test_maybe_dispatch_chunked_blocks_on_upheld_clusters() -> None:
+    from hook import _maybe_dispatch_chunked
+
+    fake_result = MagicMock()
+    fake_result.status = "ok"
+    fake_result.upheld_clusters = [MagicMock()]
+    fake_result.clusters = [MagicMock()]
+    fake_result.job_results = []
+    fake_result.metrics = {"wall_clock_seconds": 1.0}
+    fake_result.arbiter_status = "ran"
+    fake_result.blocking_text = "BLOCK"
+
+    with (
+        patch("hook.get_staged_diff", return_value=("diff --git a/x.py b/x.py\n", None)),
+        patch("hook.count_added_production_lines", return_value=500),
+        patch("chunked.manifest_present", return_value=True),
+        patch("hook.get_staged_files", return_value="x.py"),
+        patch("chunked.run_chunked_review", return_value=fake_result),
+        patch("chunked.write_artifacts", return_value=Path("/tmp/.review")),
+        patch("hook.save_log"),
+        patch("hook.error"),
+    ):
+        try:
+            _maybe_dispatch_chunked()
+        except SystemExit as e:
+            assert e.code == 1
+        else:
+            raise AssertionError("expected SystemExit=1 on BLOCK")
+
+
+def test_maybe_dispatch_chunked_blocks_on_invalid_manifest() -> None:
+    from hook import _maybe_dispatch_chunked
+
+    fake_result = MagicMock()
+    fake_result.status = "manifest_invalid"
+    fake_result.blocking_text = "manifest validation failed (1 error(s)):\n  - stale_hash..."
+    fake_result.validation = MagicMock()
+
+    with (
+        patch("hook.get_staged_diff", return_value=("diff", None)),
+        patch("hook.count_added_production_lines", return_value=500),
+        patch("chunked.manifest_present", return_value=True),
+        patch("hook.get_staged_files", return_value="x.py"),
+        patch("chunked.run_chunked_review", return_value=fake_result),
+        patch("chunked.write_artifacts"),
+        patch("hook.save_log"),
+        patch("hook.error"),
+    ):
+        try:
+            _maybe_dispatch_chunked()
+        except SystemExit as e:
+            assert e.code == 1
+        else:
+            raise AssertionError("expected SystemExit=1 on manifest_invalid")
+
+
+# ---------------------------------------------------------------------------
+# C7 — OSError during write_artifacts must not fail-open
+# ---------------------------------------------------------------------------
+
+
+def test_chunked_path_blocks_even_when_write_artifacts_fails() -> None:
+    """C7: OSError during write_artifacts must not prevent BLOCK verdict."""
+    import chunked as chunked_mod
+    import consolidation as cons_mod
+
+    cluster = cons_mod.FindingCluster(
+        cluster_id="C1",
+        member_ids=("F1",),
+        contributors=("fake",),
+        canonical_line="- [F1] [CRITICAL] x",
+        upheld=True,
+        chunk_id=None,
+        invariant_id=None,
+    )
+    result = chunked_mod.ChunkedResult(
+        status="ok",
+        validation=chunked_mod.ValidationResult(),
+        job_results=[],
+        arbiter_raw="",
+        arbiter_status="ran",
+        arbiter_error=None,
+        clusters=[cluster],
+        upheld_clusters=[cluster],
+        blocking_text="1 BLOCKING",
+        findings_json_text="{}",
+        metrics={},
+        started_at=0.0,
+        ended_at=1.0,
+    )
+
+    with (
+        patch("chunked.run_chunked_review", return_value=result),
+        patch("chunked.write_artifacts", side_effect=OSError("disk full")),
+        patch("hook.info"),
+        patch("hook.error"),
+        patch("hook.save_log"),
+    ):
+        verdict = _run_chunked_path("diff", "files", False)
+
+    assert verdict == "BLOCK"
+
+
+# ---------------------------------------------------------------------------
+# C13 — tighten .review/ guard to only accidental working artifacts
+# ---------------------------------------------------------------------------
+
+
+def test_check_staged_review_guard_allows_manifest_yaml() -> None:
+    """C13: manifest.yaml is intentional and must be allowed."""
+    out = ".review/manifest.yaml\n"
+    with patch("subprocess.check_output", return_value=out):
+        _check_staged_review_guard()
+
+
+def test_check_staged_review_guard_rejects_findings_json() -> None:
+    """C13: findings.json is a working artifact and must be rejected."""
+    out = ".review/findings.json\n"
+    with (
+        patch("subprocess.check_output", return_value=out),
+        patch("hook.error"),
+        patch("hook.save_log"),
+    ):
+        try:
+            _check_staged_review_guard()
+        except SystemExit as exc:
+            assert exc.code == 1
+            return
+    raise AssertionError("findings.json should be rejected")
+
+
+def test_check_staged_review_guard_rejects_state_files() -> None:
+    """C13: state/ artifacts are working files and must be rejected."""
+    out = ".review/state/00_validation.json\n"
+    with (
+        patch("subprocess.check_output", return_value=out),
+        patch("hook.error"),
+        patch("hook.save_log"),
+    ):
+        try:
+            _check_staged_review_guard()
+        except SystemExit as exc:
+            assert exc.code == 1
+            return
+    raise AssertionError("state/ files should be rejected")

@@ -45,9 +45,9 @@ class RunnerConfig:
 #     ]
 PRIMARIES: list[RunnerConfig] = [
     RunnerConfig("opencode", "github-copilot/gpt-5.4"),
-    RunnerConfig(
-        "kimi", "kimi-code/kimi-for-coding"
-    ),  # Kimi K2; requires `kimi login`. Model alias must match ~/.kimi/config.toml [models.*] key. KimiBackend pins review/agents/kimi-pre-commit-reviewer.yaml automatically. review-note: no startup capability probe by design — this hook only runs on the owner's machine (~/.claude is single-user config), the reviewer fail-opens on backend errors (hook.py:1525+, fallback to claude/sonnet on total primary failure), and a probe per commit would burn ~1-2s for no real safety on a misconfigured machine the user would notice immediately anyway.
+    # RunnerConfig(
+    #     "kimi", "kimi-code/kimi-for-coding"
+    # ),  # Kimi K2; requires `kimi login`. Model alias must match ~/.kimi/config.toml [models.*] key. KimiBackend pins review/agents/kimi-pre-commit-reviewer.yaml automatically. review-note: no startup capability probe by design — this hook only runs on the owner's machine (~/.claude is single-user config), the reviewer fail-opens on backend errors (hook.py:1525+, fallback to claude/sonnet on total primary failure), and a probe per commit would burn ~1-2s for no real safety on a misconfigured machine the user would notice immediately anyway.
     # RunnerConfig("claude", "sonnet"),  # uncomment to enable parallel triple-review
 ]
 
@@ -70,9 +70,41 @@ ARBITER: RunnerConfig = RunnerConfig(
 # (count_added_production_lines) — total diff length is no longer
 # considered. Tests, docs, configs, lock-files, removals, context lines
 # do not consume the budget.
-MAX_PROD_LINES = 300  # commits with more added prod lines are rejected
+#
+# Routing rules (after chunked-review introduction):
+#   N < MAX_PROD_LINES               → small-commit path: single combined.md call
+#                                        per backend (PRIMARIES). No fan-out.
+#   N >= MAX_PROD_LINES, manifest    → chunked path (chunked.py). Fan-out lives
+#                                        here as the whole-diff lens layer.
+#   N >= MAX_PROD_LINES, no manifest → exit 1, ask writer to generate manifest.
+MAX_PROD_LINES = 300  # also used as per-chunk line cap (single source of truth)
 MIN_LINES_TO_REVIEW = 1  # commits smaller than this (total) skip review
-FANOUT_THRESHOLD = 100  # at or above this added prod line count, fan out per-lens
+
+# Fan-out is now scoped to chunked path only. Setting the threshold equal to
+# MAX_PROD_LINES guarantees the small-commit path never triggers fan-out:
+# the moment N reaches MAX_PROD_LINES the dispatch routes to chunked path
+# instead. The fan-out *code* in hook.py / orchestrator.py is still used —
+# chunked path reuses it for the whole-diff lens layer.
+FANOUT_THRESHOLD = MAX_PROD_LINES
+
+# Chunked-review limits.
+MAX_CHUNKS = 12  # validator rejects manifests with more chunks. Effective
+# upper bound on a chunked commit ≈ MAX_CHUNKS * MAX_PROD_LINES.
+
+# Lens whitelist used by the manifest validator. Must match the prompt files
+# under review/prompts/ (bugs.md, architecture.md, tests.md). Adding a lens
+# means dropping a new prompt file AND updating LENS_APPLICABILITY in hook.py.
+ALLOWED_LENSES: frozenset[str] = frozenset({"bugs", "architecture", "tests"})
+
+# Backends that run inside the chunked path. Each chunk gets one reviewer per
+# entry, plus the whole-diff lens layer fans out across these same backends.
+# Total parallel jobs ≤ MAX_CHUNKS * len(CHUNKED_BACKENDS) +
+#                       len(ALLOWED_LENSES) * len(CHUNKED_BACKENDS).
+CHUNKED_BACKENDS: list[RunnerConfig] = [
+    RunnerConfig("opencode", "github-copilot/gpt-5.4"),
+    # RunnerConfig("kimi", "kimi-code/kimi-for-coding"),
+    # RunnerConfig("claude", "sonnet"),
+]
 
 # NOTE: LENS_NAMES is intentionally not in this file. The lens registry
 # (LENS_APPLICABILITY in hook.py) owns the order; LENS_NAMES is derived

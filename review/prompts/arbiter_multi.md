@@ -161,3 +161,108 @@ text. The hook parses these lines mechanically.
 - Reviewers disagreed (one says bug, another says non-issue, both
   cite the same line): cluster them anyway (same mechanism), then
   apply the general UPHOLD/OVERTURN rules to the canonical claim.
+
+---
+
+## Chunked-review mode (large commits)
+
+When the commit was reviewed via the chunked pipeline (writer-supplied
+`.review/manifest.yaml`), the input shape changes in three ways:
+
+1. **Two reviewer layers**: per-chunk reviewers (one per chunk × per
+   backend) and whole-diff lens reviewers (bugs/architecture/tests on
+   the entire diff × per backend). Findings from both layers arrive
+   together.
+2. **Chunk-prefixed finding IDs**: per-chunk findings carry IDs like
+   `<chunk_id>-<backend>-F<n>` (e.g. `models-opencode-F1`,
+   `security-claude-F2`); whole-diff lens findings carry
+   `wholediff-<lens>-<backend>-F<n>` (e.g.
+   `wholediff-bugs-kimi-F3`). The prefix is informational — your
+   clustering and verdict format do **not** change.
+3. **A `manifest:` block** is appended after the finding list,
+   containing the chunks (`id`, `files`, `rationale`) and the
+   `cross_chunk_invariants:` list. Use it for the four extra tasks
+   below.
+
+### Extra task 1 — chunk-aware dedup
+
+Two findings cluster together when they describe the same defect
+mechanism on the same code, regardless of which layer raised them.
+Cross-layer pairs are common and expected:
+
+- A per-chunk reviewer flags `models-opencode-F1` on
+  `addons/foo/models/sale_order.py:142` and a whole-diff lens
+  reviewer flags `wholediff-bugs-claude-F2` on the same line — same
+  cluster.
+- Two per-chunk reviewers in **different** chunks both flag the same
+  cross-chunk symptom (e.g. an undefined name resolved in chunk B
+  flagged by the chunk-A reviewer and vice versa) — same cluster.
+
+Same exclusions as before: do **not** merge findings on the same
+file but different defect mechanisms.
+
+### Extra task 2 — cross-chunk invariants check
+
+For each entry in `manifest.cross_chunk_invariants`, decide whether
+the staged diff violates it. The reviewers may have missed it
+because each only sees its own chunk in detail — you see the full
+diff in context.
+
+When you find a violation that **no input cluster already names**,
+emit a synthetic cluster:
+
+```
+[CLUSTER C<n>] arbiter-INV<m>
+[UPHELD] C<n> — invariant violated: <invariant text>; <one-sentence trigger and evidence>
+```
+
+Use `arbiter-INV<m>` as the synthetic finding ID (`m` is sequential).
+Synthetic clusters always start as singletons. Mark severity blocking
+by default (UPHELD); use OVERTURN only if you decide on second look
+that the invariant does not actually apply to this diff.
+
+If an existing cluster already covers the invariant, do **not** add a
+synthetic — just include the invariant id in your verdict rationale:
+
+```
+[UPHELD] C3 — opencode-F1 already names the violation of
+cross_chunk_invariants[1]: <invariant text>
+```
+
+### Extra task 3 — false-positive filter (full-diff visibility)
+
+Per-chunk reviewers cannot see code outside their chunk. They will
+sometimes raise findings that fall apart once you read the whole
+diff:
+
+- "Function X is undefined" — but X is defined in another chunk.
+- "Field Y has no ACL row" — but the ACL row appears in the
+  `security` chunk.
+- "Compute is missing depends on Z" — but Z is in another chunk's
+  field that was added in this same commit.
+
+For each such finding, OVERTURN the cluster with rationale citing
+the **other chunk's file:line** that resolves the concern.
+
+### Extra task 4 — ranking
+
+After clustering and verdicts are assigned, order the verdict lines
+to surface blocking findings first, then warning-tier overturns,
+then info. Within each tier, order by `(file, line)`. The pipeline
+shows the verdict list to the developer in this order — readability
+matters.
+
+### Output addendum for chunked mode
+
+After the existing `Summary: X UPHELD, Y OVERTURN, Z clusters total.`
+line, append one more line with cross-chunk-specific counters and
+stop:
+
+```
+Chunked: A invariant-violations, B cross-chunk-overturns.
+```
+
+Where `A` is the count of `arbiter-INV*` clusters that ended UPHELD,
+and `B` is the count of clusters OVERTURN'd specifically because the
+defect was already addressed in another chunk's diff. Both may be
+zero. The pipeline parses both lines mechanically.

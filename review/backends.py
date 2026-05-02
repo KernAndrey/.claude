@@ -70,6 +70,12 @@ class OpencodeBackend(Backend):
         # `git stash` round-trips that leave missing-blob refs) during diff
         # investigation. See ~/.claude/git-hooks/pre-commit for the corresponding
         # write-tree/read-tree backstop.
+        #
+        # Prompt is piped via stdin, not argv: chunked-path prompts (cached
+        # block + manifest + diff) routinely exceed Linux ARG_MAX (~128KB)
+        # and would fail with `[Errno 7] Argument list too long`. opencode
+        # treats stdin as the user message when no positional `message` is
+        # given.
         cmd = [
             "opencode",
             "run",
@@ -80,13 +86,13 @@ class OpencodeBackend(Backend):
             model,
             "--format",
             "json",
-            full_prompt,
         ]
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
+            input=full_prompt,
         )
         review = self._parse_json(result.stdout) if result.stdout else ""
         return review, result.stderr.strip(), result.returncode

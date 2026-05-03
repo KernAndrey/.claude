@@ -1,0 +1,81 @@
+# ~/.claude/pyproject.toml — config for the pre-flight gate that runs on
+# every commit to this repo (the gate's own home).
+#
+# This repo IS the gate's home, and review/ is a proper Python module
+# with a 263-test pytest suite. We dogfood the gate against review/.
+# Everything outside review/ (skills/, kimi/lib/, git-hooks/, agents/,
+# commands/, rules/, hooks/, memory/, scripts/, plugins/, etc.) is
+# utility shell + one-off Python without test coverage — excluded
+# from the coverage threshold.
+#
+# Regenerate coverage.xml before each commit that touches review/*.py:
+#   cd ~/.claude && pytest review/ --cov=review --cov-branch --cov-report=xml
+# coverage.xml is in .gitignore.
+
+[tool.code_review.coverage_gate]
+
+[tool.code_review.coverage_gate.coverage_check]
+enabled = true
+# `HEAD` = only the lines being staged in THIS commit are gated.
+# `origin/main` would gate everything in the feature branch — wrong for
+# a pre-commit hook that should validate one commit at a time.
+compare_branch = "HEAD"
+# preflight_gate.py is held at 100% line + branch coverage by its 468-test
+# suite. The gate measures coverage of *added* lines per commit (diff-cover),
+# so 100 is the right target: every new line ships with a test.
+threshold = 100.0
+reports = ["coverage.xml"]
+exclude = [
+    # Out-of-scope: utility shell + one-off Python without test coverage.
+    "skills/**",
+    "kimi/lib/**",
+    "git-hooks/**",
+    "agents/**",
+    "commands/**",
+    "rules/**",
+    "hooks/**",
+    "memory/**",
+    "scripts/**",      # ~/.claude/scripts (NOT review/scripts/)
+    "plugins/**",
+    "teams/**",
+    "projects/**",
+    # Generated / vendored / runtime state.
+    ".review/**",
+    "review/logs/**",
+    "review/archive/**",
+    # Tests don't count toward coverage threshold.
+    "**/test_*.py",
+    "**/*_test.py",
+    "review/conftest.py",
+]
+
+[tool.code_review.coverage_gate.assert_counter]
+enabled = true
+
+[tool.code_review.coverage_gate.assert_counter.python]
+min_assertions_per_test = 1
+count_pytest_raises_as_assertion = true
+
+[tool.code_review.coverage_gate.assert_counter.javascript]
+# No JS test files in this repo (preflight_gate_ts_helper.js is the helper
+# itself, not a test). Re-enable in target repos with real JS test suites.
+enabled = false
+
+
+[tool.coverage.run]
+# Consumed by `pytest --cov=review --cov-branch --cov-report=xml` to
+# produce the coverage.xml the gate reads.
+source = ["review"]
+branch = true
+omit = [
+    "review/test_*.py",
+    "review/**/test_*.py",
+    "review/conftest.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]

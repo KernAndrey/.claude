@@ -6,6 +6,8 @@ from contextlib import AbstractContextManager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from backends import BACKENDS, Backend, ClaudeBackend, KimiBackend, OpencodeBackend, _build_registry
 from config import CHUNKED_BACKENDS, FANOUT_THRESHOLD, MAX_PROD_LINES, PRIMARIES, RunnerConfig
 from hook import (
@@ -1941,6 +1943,7 @@ def _invoke_main_on_block(
         # and the dispatch helpers are tested separately.
         patch("hook._maybe_dispatch_chunked", return_value=None),
         patch("hook._check_staged_review_guard", return_value=None),
+        patch("hook.run_gate", return_value=0),
         patch("hook.collect_diff", return_value=("diff-body", "foo.py", False)),
         patch("hook._run_multi_backend_pipeline", side_effect=fake_pipeline),
         patch("hook.applicable_lenses", return_value=["bugs"]),
@@ -2035,6 +2038,110 @@ def test_main_calls_verify_runner_configs_before_diff_collection() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight gate integration
+# ---------------------------------------------------------------------------
+
+
+def test_main_preflight_gate_zero_proceeds() -> None:
+    """Gate returns 0 → main() proceeds to _maybe_dispatch_chunked."""
+    from hook import main as hook_main
+
+    with (
+        patch("hook._verify_runner_configs"),
+        patch("hook._check_staged_review_guard"),
+        patch("hook.COVERAGE_GATE", MagicMock(enabled=True)),
+        patch("hook.run_gate", return_value=0),
+        patch("hook._maybe_dispatch_chunked") as m_chunked,
+        patch("hook.collect_diff", return_value=None),
+    ):
+        try:
+            hook_main()
+        except SystemExit as exc:
+            assert exc.code == 0
+        else:
+            pass
+    m_chunked.assert_called_once()
+
+
+def test_main_preflight_gate_one_blocks() -> None:
+    """Gate returns 1 → main() exits 1, _maybe_dispatch_chunked not called."""
+    from hook import main as hook_main
+
+    with (
+        patch("hook._verify_runner_configs"),
+        patch("hook._check_staged_review_guard"),
+        patch("hook.COVERAGE_GATE", MagicMock(enabled=True)),
+        patch("hook.run_gate", return_value=1),
+        patch("hook._maybe_dispatch_chunked") as m_chunked,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            hook_main()
+        assert exc_info.value.code == 1
+    m_chunked.assert_not_called()
+
+
+def test_main_preflight_gate_crash_exits_three() -> None:
+    """Gate raises Exception → caught by inner try/except, exits 3 (not 0)."""
+    from hook import main as hook_main
+
+    with (
+        patch("hook._verify_runner_configs"),
+        patch("hook._check_staged_review_guard"),
+        patch("hook.COVERAGE_GATE", MagicMock(enabled=True)),
+        patch("hook.run_gate", side_effect=RuntimeError("boom")),
+        patch("hook._maybe_dispatch_chunked") as m_chunked,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            hook_main()
+        assert exc_info.value.code == 3
+    m_chunked.assert_not_called()
+
+
+def test_main_preflight_gate_disabled_skips_run_gate() -> None:
+    """Gate disabled → run_gate NOT called, control proceeds."""
+    from dataclasses import dataclass
+    from hook import main as hook_main
+
+    @dataclass(frozen=True)
+    class FrozenGate:
+        enabled: bool = False
+
+    with (
+        patch("hook._verify_runner_configs"),
+        patch("hook._check_staged_review_guard"),
+        patch("hook.COVERAGE_GATE", FrozenGate()),
+        patch("hook.run_gate") as m_gate,
+        patch("hook._maybe_dispatch_chunked") as m_chunked,
+        patch("hook.collect_diff", return_value=None),
+    ):
+        try:
+            hook_main()
+        except SystemExit as exc:
+            assert exc.code == 0
+        else:
+            pass
+    m_gate.assert_not_called()
+    m_chunked.assert_called_once()
+
+
+def test_main_preflight_gate_setup_error_exits_two() -> None:
+    """run_gate returns 2 → main() exits 2, _maybe_dispatch_chunked not called."""
+    from hook import main as hook_main
+
+    with (
+        patch("hook._verify_runner_configs"),
+        patch("hook._check_staged_review_guard"),
+        patch("hook.COVERAGE_GATE", MagicMock(enabled=True)),
+        patch("hook.run_gate", return_value=2),
+        patch("hook._maybe_dispatch_chunked") as m_chunked,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            hook_main()
+        assert exc_info.value.code == 2
+    m_chunked.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # extract_warning_lines — surface [WARNING] detail to stderr, not just count
 # ---------------------------------------------------------------------------
 
@@ -2112,6 +2219,7 @@ def _invoke_main_on_ok(review_text: str) -> str:
     with (
         patch("hook._maybe_dispatch_chunked", return_value=None),
         patch("hook._check_staged_review_guard", return_value=None),
+        patch("hook.run_gate", return_value=0),
         patch("hook.collect_diff", return_value=("diff-body", "foo.py", False)),
         patch("hook._run_multi_backend_pipeline", side_effect=fake_pipeline),
         patch("hook.applicable_lenses", return_value=["bugs"]),
@@ -3061,3 +3169,19 @@ def test_check_staged_review_guard_rejects_state_files() -> None:
             assert exc.code == 1
             return
     raise AssertionError("state/ files should be rejected")
+
+
+def test_coverage_gate_config_default_enabled() -> None:
+    """`CoverageGateConfig` is the kill-switch dataclass for the gate.
+    Default state is enabled=True (opt-out semantics).
+    """
+    from config import CoverageGateConfig
+
+    assert CoverageGateConfig().enabled is True
+
+
+def test_coverage_gate_config_can_be_disabled() -> None:
+    from config import CoverageGateConfig
+
+    cfg = CoverageGateConfig(enabled=False)
+    assert cfg.enabled is False

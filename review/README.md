@@ -290,6 +290,50 @@ jq -r '[.timestamp, (.backends[] | .config.backend + ":" + (.duration_seconds|to
   ~/.claude/review/logs/stats.jsonl
 ```
 
+## Pre-flight gate
+
+Before any LLM call, `hook.py` runs a deterministic pre-flight gate that checks two things on the staged diff:
+
+1. **Coverage gate** — every new line/branch must be covered by a test (`diff-cover` against the compare branch).
+2. **Assert gate** — every new or modified test function must contain at least one assertion (Python `ast` + JS/TS `@typescript-eslint/parser`).
+
+If either check fails, the commit is blocked with an actionable report and **no AI reviewer is invoked**, saving tokens and wall-clock time.
+
+### Opt-out
+
+The gate is **enabled by default** (opt-out). To disable it for a target repo, add to that repo's `pyproject.toml`:
+
+```toml
+[tool.code_review.coverage_gate]
+enabled = false
+```
+
+### Dependencies
+
+- **Python**: `diff-cover` (`pip install diff-cover`)
+- **JS/TS assert detection**: Node ≥ 18 + `@typescript-eslint/parser` (`npm install --save-dev @typescript-eslint/parser`)
+
+If the dependencies are missing, the gate exits with a setup-error (exit 2) and a concrete install hint.
+
+### Environment overrides
+
+| Variable | Effect |
+|---|---|
+| `CODE_REVIEW_SKIP_GATE=1` | Skip the entire gate |
+| `CODE_REVIEW_SKIP_COVERAGE=1` | Skip only the coverage check |
+| `CODE_REVIEW_SKIP_ASSERT=1` | Skip only the assert check |
+| `CODE_REVIEW_COVERAGE_THRESHOLD=80` | Override coverage threshold |
+| `CODE_REVIEW_GATE_FAIL_OPEN=1` | Convert internal crashes to warnings (exit 0) |
+| `CODE_REVIEW_GATE_VERBOSE=1` | Emit extra diagnostic output |
+
+### Rollout warning
+
+Because the gate is opt-out, the **next commit in every target repo using this hook will be gated** until the repo either:
+- generates a fresh `coverage.xml` / `lcov.info`, or
+- explicitly opts out via `pyproject.toml`.
+
+Coordinate the rollout with your team to avoid surprise commit blocks.
+
 ## Logs
 
 Every review writes a markdown log to

@@ -109,3 +109,14 @@ CHUNKED_BACKENDS: list[RunnerConfig] = [
 # NOTE: LENS_NAMES is intentionally not in this file. The lens registry
 # (LENS_APPLICABILITY in hook.py) owns the order; LENS_NAMES is derived
 # from it via tuple(LENS_APPLICABILITY.keys()) so the two cannot drift.
+
+
+@dataclass(frozen=True)
+class CoverageGateConfig:
+    """Master kill-switch for the pre-flight gate. Per-repo opt-out lives
+    in target pyproject.toml [tool.code_review.coverage_gate].enabled."""
+
+    enabled: bool = True
+
+
+COVERAGE_GATE: CoverageGateConfig = CoverageGateConfig()

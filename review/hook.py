@@ -41,6 +41,7 @@ from backends import BACKENDS
 from config import (
     ARBITER,
     CHUNKED_BACKENDS,
+    COVERAGE_GATE,
     FALLBACK,
     FANOUT_THRESHOLD,
     MAX_CHUNKS,
@@ -49,6 +50,7 @@ from config import (
     PRIMARIES,
     RunnerConfig,
 )
+from scripts.preflight_gate import run_gate
 
 # --- Path configuration (derived/fixed locations, not user-tunable) ---
 REVIEW_ROOT = Path.home() / ".claude" / "review"
@@ -1681,6 +1683,16 @@ def main() -> None:
     try:
         _verify_runner_configs()
         _check_staged_review_guard()
+
+        if COVERAGE_GATE.enabled:
+            try:
+                rc = run_gate()
+            except Exception as exc:
+                error(f"Pre-flight gate crashed: {type(exc).__name__}: {exc}")
+                sys.exit(3)
+            if rc != 0:
+                sys.exit(rc)
+
         _maybe_dispatch_chunked()
 
         context = collect_diff()

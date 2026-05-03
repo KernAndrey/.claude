@@ -7,12 +7,15 @@ description: Smart commit — security scan, logical split, branch safety checks
 - Omit all Co-Authored-By and AI attribution from commit messages
 - Write commit messages in English
 - Use conventional commits
-- **Preflight test coverage before every commit.** The AI review hook
-  blocks commits with untested new public behavior. Walk the staged
-  diff in Phase 3.5, map each new-behavior unit to a same-diff test
-  that asserts on it, and write the missing tests before `git commit`.
-  Skipping this turns a 30-second local check into a 10-minute
-  hook-review round trip.
+- **Run Phase 3.5 before every `git commit`.** The hook's deterministic preflight enforces 100% coverage of new prod lines and ≥1 real assertion per new test. Then `mutmut-analyst` hardens those tests against weak assertions. Skipping these turns a 30-second local check into a 10-minute hook-review round trip.
+
+# What the pre-commit hook does
+
+1. Per-repo lint hook (ruff/pylint/xmllint where present) → gitleaks → semgrep → `python3 ~/.claude/review/hook.py`.
+2. `review/hook.py` runs the deterministic preflight (`scripts/preflight_gate.py`): coverage gate (diff-cover, 100% of new prod lines) + assert gate (every new/changed test has ≥1 real assertion; no patching the unit under test). No LLM at this stage.
+3. If the diff adds >300 production-code lines (`MAX_PROD_LINES`), the hook routes to the chunked-review pipeline and needs `.review/manifest.yaml` (auto-scaffolded on first hit).
+4. AI reviewers from `review/config.py:PRIMARIES` run in parallel; arbiter (`claude/sonnet`) UPHOLDs CRITICAL clusters → commit BLOCKed. WARNINGs are non-blocking but addressed in the next commit.
+5. Crashes fail-open. The global hook snapshots the index via `git write-tree` and restores it on exit if any sub-tool mutates it.
 
 # Smart Commit
 
@@ -73,133 +76,21 @@ Proceed only after explicit user approval for each detected secret.
 
 ## Phase 3.5: Test Coverage Gate
 
-The AI reviewer (`tests` lens) enforces 100% coverage of new public
-branches. A commit with new behavior and no matching test is blocked.
-This phase catches the gap **before** the review runs, saving a ~10
-minute round trip per missed unit.
+The hook runs two checks before any LLM. Pass both locally before `git commit`.
 
-The lens's canonical rules are in
-`/home/kern/.claude/review/prompts/tests.md`. This phase applies the
-same rules locally; any mismatch means the review will block.
+### Step 1 — Cover new behavior
 
-**Procedure — do this in one pass, in order.**
+Run the project's test suite with coverage in XML form (e.g. `pytest --cov=. --cov-report=xml`). Every added production-code line must be exercised by a same-diff test; every new or modified test must contain ≥1 real assertion. Without a fresh `coverage.xml` the gate exits 2 and BLOCKs.
 
-### Step 1 — Enumerate every new-behavior unit
+For bug-fix commits: the regression test must fail on the diff before the fix and pass after.
 
-Walk the staged diff end-to-end. For each `+` line, classify it. The
-following are new-behavior units:
+### Step 2 — Harden tests with mutation analysis
 
-- New public (not `_prefixed`) `def` / `class` / method with business
-  logic.
-- New branch (`if` / `elif` / `else` / `match` arm) with distinct
-  runtime effect a caller can observe (return value, state write,
-  response code, exception).
-- New `raise`, new exception type, new failure return value.
-- Changed public function signature that alters behavior.
+Invoke the `mutmut-analyst` skill on the changed production files. For every surviving non-equivalent mutant, add or strengthen a test until it dies. This catches assertion gaps the line-coverage gate cannot see.
 
-List them by name. This list is the contract you will fulfil with
-tests.
+### Step 3 — Stage and commit
 
-### Step 2 — Apply the exclusion categories
-
-For each listed unit, check whether it falls into one of these
-exclusion categories (same as the review lens, same phrasing). If
-yes, cross it off the list.
-
-1. **Non-production file** — `.md`, config, CI, migration, `.json`,
-   lockfile, shell script.
-2. **Pure rename** — identical signature and body.
-3. **Test file edit only** — tests don't test tests.
-4. **Private `_prefixed` helper** with no new public entry point.
-5. **Declarative / metadata change** — `@api.depends` path expansion,
-   field kwargs (`tracking=`, `index=`, `copy=`), class-level
-   declarative attrs, `_()` wrappers, defensive branch behind a
-   declared invariant (`required=True`, `@api.constrains`, NOT NULL).
-6. **Stdlib/framework-delegated error handler** *(category A)* — ALL
-   FOUR: `try` body is exactly one stdlib call (`Path.read_text`,
-   `Path.mkdir`, `Path.unlink`, `os.replace`, `shutil.copy2`,
-   `input()`, HTTP-client `raise_for_status`); `except` body is
-   `return` / `pass` / `continue` / `die(msg)` / `_logger.<level>`
-   only (no state write, no exception-type change); exception class
-   is hard-to-fixture (`OSError`, `FileNotFoundError`,
-   `PermissionError`, `EOFError`, `KeyboardInterrupt` — NOT
-   `JSONDecodeError` / `UnicodeDecodeError` / `ValueError` / `KeyError`,
-   which are fixture-testable); the enclosing function is called by
-   at least one test in the diff.
-7. **Log-only observer branch** *(category B)* — `if` / `elif` / `else`
-   branch body is only `_logger.<level>(...)` calls, no return, no
-   state write, no raise, no response-code change, no counter. Does
-   NOT apply to `except` blocks or to branches that fall through to
-   a state-writing path.
-8. **Idempotent bootstrap wrapper** *(category C)* — whole function
-   body is one idempotent stdlib setup call (`mkdir(exist_ok=True)`,
-   `Path.touch`, `logging.getLogger`) plus optional category-A
-   handler.
-9. **Declarative view/XML conditional** *(category D)* —
-   single-attribute `invisible=` / `readonly=` / `required=` /
-   `decoration-*` / `attrs=` in Odoo XML, Jinja `{% if %}` show/hide.
-   Does NOT apply when the attribute wires `context=` or
-   `button type="object"` that reshapes state.
-10. **Cosmetic-only outbound kwarg** *(category E)* — one kwarg at
-    one call site; the kwarg is purely cosmetic (formatting strings,
-    log labels, descriptions); the kwarg is NOT `audience=` /
-    `issuer=` / `verify=` / `algorithms=` / `scope=` / `client_id=`
-    (security), NOT `identity_key=` / `dedupe_key=` /
-    `idempotency_key=` (idempotency), NOT `channel=` / `queue=` /
-    `topic=` / `routing_key=` (routing), NOT `sudo=` /
-    `allowed_company_ids=` / `uid=` (authz scope).
-
-For borderline cases (3-of-4 category-A conditions; unclear kwarg
-class; audit-trail log-only branch), **write the test** rather than
-claim the exclusion. A `[WARNING]` from the hook is cheaper than
-arguing.
-
-### Step 3 — For each remaining unit, verify a matching test exists
-
-`Glob` for test files: `tests/**`, `test_*.py`, `*_test.py`,
-`*.test.ts`, `*.test.tsx`, `*.test.js`, `*_test.go`, `*Spec.*`,
-`*_spec.rb`.
-
-Confirm the staged diff adds or modifies a test that **exercises**
-the unit. A test exercises a unit when it both:
-
-- Triggers execution of the unit — either calls the new function/
-  method by name, or supplies input that makes the new branch fire.
-- Makes an assertion about the resulting behavior — return value,
-  state change, raised exception, response code.
-
-A test that does only one of these does NOT exercise the unit.
-Disqualifiers:
-
-- `assert True` / `pass` body.
-- Mocks the thing under test (patching `new_fn` itself, then calling
-  `new_fn` — you asserted against the mock, not the code).
-- Reference to the unit in a comment or docstring but no call.
-- Adds a fixture that uses the unit but no assertion about it.
-
-For bug-fix commits: the regression test must fail on the diff before
-the fix and pass after. Run the test locally before committing.
-
-### Step 4 — Decide
-
-- Every remaining unit has a matching exercising test → pass silently,
-  continue to Phase 4.
-- At least one unit has no matching exercising test → BLOCK:
-
-> ❌ Commit blocked — test coverage required:
-> - `path/to/mod.py::new_fn` (new public function, no matching test)
-> - `path/to/mod.py:142` (new `elif ctx.role == "admin"` branch, no assertion)
->
-> Add tests in the same commit. 100% coverage is enforced; tests cannot be deferred. The AI reviewer (`tests` lens) will block this commit anyway — catching it here saves a round trip.
-
-The only legal escape is an inline comment on or immediately above
-the new unit:
-```python
-# review-note: covered by tests/integration/test_foo.py::test_bar
-```
-Where the referenced test path actually exists AND contains an
-assertion on the new behavior. Verify with `Read` before honoring.
-Unverifiable references do not unblock the commit.
+The deterministic preflight then passes; the AI `tests` lens audits behavioral coverage and surfaces anything the first two steps missed. If it BLOCKs, write the missing tests in the next commit — never disable, mock around the unit under test, or split the production code out to land it bare.
 
 ### When the AI review hook blocks for missing tests
 
@@ -230,9 +121,7 @@ Review all changes and group them into logical commits. A logical commit is a co
 - Wait for the user to confirm or adjust the split before proceeding.
 - Each commit contains one logical change — unrelated changes in one commit make bisect and revert impossible.
 - Keep production code and its tests in the same commit. Splitting into "all code" + "all tests" is forbidden: the first commit hits the `tests` lens with no coverage and gets blocked.
-- If a change exceeds 3000 lines (the hook rejects it wholesale), split by **vertical slice**: each commit = a portion of the feature + its tests.
-  - ✅ Commit 1: `feat(auth): user model + model tests` / Commit 2: `feat(auth): login endpoint + endpoint tests` / Commit 3: `feat(auth): middleware + middleware tests`
-  - ❌ Commit 1: all production code / Commit 2: all tests
+- If `git diff --cached` adds >300 production-code lines (`MAX_PROD_LINES`), the hook routes to the chunked-review pipeline and needs `.review/manifest.yaml`. The hook auto-scaffolds it on first hit; fill in `chunks:` (group files by meaning, ≤300 prod lines per chunk, ≤12 chunks) and re-run `git commit`. Tests, docs, configs, lock-files, and removals do not count toward the limit.
 - Valid standalone `test:` commits: test refactoring, adding coverage for previously untested existing code, migrating to a new test framework or fixtures.
 
 ## Phase 5: Lint Check
@@ -247,6 +136,7 @@ If any `.py` files are in the changeset:
 For each logical commit, run these steps **in order, per commit** (not once for the whole phase):
 
 1. **Stage specific files**: `git add <file1> <file2>` — blanket staging (`-A`, `.`) risks including secrets and binaries.
+   - `.review/` paths must never be staged. The hook hard-blocks. Add `.review/` to `~/.config/git/ignore` and set `git config --global core.excludesFile ~/.config/git/ignore`.
 2. **Stash-guard the unstaged tail** — gives linters and security scanners a working tree that matches the index exactly, so the commit captures only what was reviewed:
    ```bash
    git stash push -u -k -m "commit-skill-wip-$(date +%s)"
@@ -319,7 +209,7 @@ If `git fsck` still reports missing blobs after `git reset`, stop and report to 
 - Create new commits rather than amending, unless the user explicitly asks.
 - Use standard push (no `--force`).
 - If a pre-commit hook fails or the AI review BLOCKs the commit, fix the reported issues, re-stage, and create a new commit.
-- If the diff exceeds 3000 lines, the hook rejects it — split into smaller commits.
-- The AI reviewer `tests` lens blocks any commit with new public behavior and no matching test. Phase 3.5 catches this early — keep code and tests in the same commit.
+- Diffs over 300 added prod lines route to the chunked path and require `.review/manifest.yaml`.
+- Two stages run before BLOCK: deterministic preflight (line coverage + asserts, no LLM), then AI lens. Pass both by writing real tests, not by trimming scope.
 - When splitting a large feature, slice by **vertical** (each slice = code + its tests), never by layer (all code → all tests).
 - Before `git commit` the working tree must contain only staged changes. The skill stashes the unstaged tail in Phase 6 — do not skip that step: it keeps linters and re-stages from leaking unstaged or untracked content into the commit.

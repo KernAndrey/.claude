@@ -182,14 +182,23 @@ unreachable on a commit, the orchestrator fails open to the
 `claude`/`sonnet` fallback, so a broken kimi never blocks a commit on
 its own.
 
-The backend invokes `kimi --print --model <m> --output-format text
---agent-file <path> --prompt <combined>`. `--print` implicitly enables
-`--yolo` (auto-approve all tool calls), so the project-shipped agent file at
-`review/agents/kimi-pre-commit-reviewer.yaml` is the only thing keeping the
-reviewer from writing to the working tree during diff investigation. The
-YAML denies `Shell`, `WriteFile`, `StrReplaceFile`, `SearchWeb`, `FetchURL`
-via `exclude_tools`, leaving the read-only tools (`ReadFile`, `Glob`,
-`Grep`) the reviewer needs.
+The backend invokes `kimi --quiet --model <m> --agent-file <path>
+--input-format text` and pipes the combined system+user prompt on
+**stdin** (`--input-format text` makes kimi read the prompt from stdin
+under `--print`). Stdin rather than a `--prompt` argv argument because
+chunked-path prompts exceed Linux `MAX_ARG_STRLEN` (~128KB per single
+arg) and `--prompt <huge>` fails instantly with `[Errno 7] Argument list
+too long` — the same reason `OpencodeBackend`/`ClaudeBackend` pipe via
+stdin. `--quiet` expands to `--print --output-format text
+--final-message-only`; `--print` implicitly enables `--yolo`
+(auto-approve all tool calls), so the project-shipped agent file at
+`review/agents/kimi-pre-commit-reviewer.yaml` is the only thing keeping
+the reviewer from writing to the working tree during diff investigation.
+The YAML narrows the parent's `tools:` allowlist to the read-only set
+(`ReadFile`, `Glob`, `Grep`) and locks the dispatch sub-agents down the
+same way, so `Shell`, `WriteFile`, `StrReplaceFile`, `SearchWeb`,
+`FetchURL` stay unreachable (kimi 1.40 ignores top-level `exclude_tools`,
+so the allowlist is the real guard).
 
 If the kimi CLI rejects the YAML on first run (the schema is only partially
 documented — `exclude_tools` may need to land on a sub-agent rather than the

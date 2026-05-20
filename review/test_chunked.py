@@ -211,15 +211,20 @@ def test_reviewer_timeout_emits_synthetic_critical() -> None:
     def boom(*a: object, **kw: object) -> tuple[str, str, int]:
         raise subprocess.TimeoutExpired(cmd="kimi", timeout=5)
 
+    # boom raises for every run_reviewer call, so the primary AND the claude
+    # fallback both time out — only then does the synthetic CRITICAL fire.
     with patch("hook.run_reviewer", side_effect=boom):
         jr = chunked._run_chunk_job(chunk, backend_cfg, "system", "cached", Path("/tmp"))
 
     assert jr.status == "timeout"
     # The synthetic CRITICAL must still flow through assign_finding_ids and
-    # carry a chunk-prefixed ID so the arbiter sees a blocking placeholder.
+    # carry a chunk-prefixed ID (primary's name, regex-clean) so the arbiter
+    # sees a blocking placeholder.
     assert len(jr.findings) == 1
     assert jr.findings[0]["id"] == "c1-kimi-F1"
-    assert "reviewer did not return" in jr.findings[0]["line"]
+    assert "<reviewer timeout>" in jr.findings[0]["line"]
+    # message names both backends so a debugger knows the fallback also failed
+    assert "fallback" in jr.findings[0]["line"]
 
 
 def test_reviewer_file_not_found_emits_synthetic_critical() -> None:
@@ -238,6 +243,33 @@ def test_reviewer_file_not_found_emits_synthetic_critical() -> None:
     assert jr.findings[0]["id"] == "c1-missing-F1"
     assert "reviewer unreachable" in jr.findings[0]["line"]
     assert "no such binary" in jr.findings[0]["line"]
+
+
+def test_chunk_job_falls_back_to_claude_when_primary_fails() -> None:
+    """Chunked-path gap closure: a primary (kimi) that fails with rc!=0
+    (quota/error) must fall back to FALLBACK (claude) instead of silently
+    contributing zero findings. The review is attributed to the backend that
+    actually produced it (claude), so the finding ID prefix and stats are
+    correct."""
+    chunk = {"id": "c1", "files": [{"path": "a.py", "line_ranges": "all"}], "review_lenses": ["bugs"]}
+    backend_cfg = RunnerConfig("kimi", "kimi-x")
+
+    def fake_run_reviewer(cfg: RunnerConfig, sys_p: str, usr_p: str) -> tuple[str, str, int]:
+        if cfg.backend == "kimi":
+            return "quota exceeded", "rate limited", 1  # primary fails (rc!=0)
+        return "- [CRITICAL] a.py:1 — `x` — real bug from claude\n", "", 0  # fallback succeeds
+
+    with (
+        patch("hook.run_reviewer", side_effect=fake_run_reviewer),
+        patch("chunked.FALLBACK", RunnerConfig("claude", "sonnet")),
+    ):
+        jr = chunked._run_chunk_job(chunk, backend_cfg, "system", "cached", Path("/tmp"))
+
+    assert jr.status == "ok"
+    assert jr.backend == "claude"  # attributed to the fallback, not kimi
+    assert len(jr.findings) == 1
+    assert jr.findings[0]["id"] == "c1-claude-F1"  # regex-clean prefix from used_backend
+    assert "real bug from claude" in jr.findings[0]["line"]
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +609,10 @@ def test_all_error_jobs_go_to_arbiter_not_infrastructure_failure(tmp_path: Path)
         patch("hook.run_reviewer", side_effect=fake_run_reviewer),
         patch("validators.manifest._default_git_runner", side_effect=runner),
         patch("chunked.CHUNKED_BACKENDS", [RunnerConfig("fake", "m")]),
+        # FALLBACK=None isolates the rc!=0-handling path: this test asserts a
+        # real review error (rc!=0 + parseable findings) reaches the arbiter,
+        # which is the primary's behavior before any fallback kicks in.
+        patch("chunked.FALLBACK", None),
         patch("chunked.config.ALLOWED_LENSES", frozenset()),
         patch("chunked._read_text", side_effect=fake_read_text),
     ):
@@ -629,6 +665,9 @@ def test_mixed_error_and_timeout_falls_through_to_arbiter(tmp_path: Path) -> Non
             "chunked.CHUNKED_BACKENDS",
             [RunnerConfig("fake1", "m1"), RunnerConfig("fake2", "m2")],
         ),
+        # FALLBACK=None: exercise per-job error/timeout handling directly,
+        # without the safety net redirecting failed jobs to claude.
+        patch("chunked.FALLBACK", None),
         patch("chunked.config.ALLOWED_LENSES", frozenset()),
         patch("chunked._read_text", side_effect=fake_read_text),
     ):
@@ -737,6 +776,10 @@ def test_all_heterogeneous_infra_statuses_is_infrastructure_failure(tmp_path: Pa
                 RunnerConfig("fake3", "m3"),
             ],
         ),
+        # FALLBACK=None: with a fallback every infra failure would be retried
+        # on claude and stop being infra-only; this test pins the all-infra
+        # detection that fires when there is no safety net.
+        patch("chunked.FALLBACK", None),
         patch("chunked.config.ALLOWED_LENSES", frozenset()),
         patch("chunked._read_text", side_effect=fake_read_text),
     ):
@@ -970,19 +1013,20 @@ def test_run_with_retry_succeeds_second_attempt_after_timeout(tmp_path: Path) ->
     p.reset_state_dirs()
     sequence = iter(
         [
-            ("", "", -1, "timeout"),
-            ("review body", "", 0, "ok"),
+            ("", "", -1, "timeout", "fake"),
+            ("review body", "", 0, "ok", "fake"),
         ]
     )
 
-    def invoke() -> tuple[str, str, int, str]:
+    def invoke() -> tuple[str, str, int, str, str]:
         return next(sequence)
 
-    review, stderr, rc, status, attempts = chunked._run_with_retry(invoke, "j1", "fake", p)
+    review, stderr, rc, status, attempts, used_backend = chunked._run_with_retry(invoke, "j1", "fake", p)
 
     assert review == "review body"
     assert status == "ok"
     assert attempts == 2
+    assert used_backend == "fake"
     jsonl = (tmp_path / ".review" / "state" / "retries.jsonl").read_text().splitlines()
     assert len(jsonl) == 2
     assert json.loads(jsonl[0])["outcome"] == "timeout"
@@ -995,11 +1039,11 @@ def test_run_with_retry_empty_stdout_eligible_for_retry(tmp_path: Path) -> None:
     p.reset_state_dirs()
     calls = {"n": 0}
 
-    def invoke() -> tuple[str, str, int, str]:
+    def invoke() -> tuple[str, str, int, str, str]:
         calls["n"] += 1
-        return ("", "", 0, "empty_stdout")
+        return ("", "", 0, "empty_stdout", "fake")
 
-    review, stderr, rc, status, attempts = chunked._run_with_retry(invoke, "j1", "fake", p)
+    review, stderr, rc, status, attempts, used_backend = chunked._run_with_retry(invoke, "j1", "fake", p)
 
     assert calls["n"] == 2
     assert status == "empty_stdout"
@@ -1012,11 +1056,11 @@ def test_run_with_retry_does_not_retry_real_review_failure(tmp_path: Path) -> No
     p.reset_state_dirs()
     calls = {"n": 0}
 
-    def invoke() -> tuple[str, str, int, str]:
+    def invoke() -> tuple[str, str, int, str, str]:
         calls["n"] += 1
-        return ("partial output", "stderr", 1, "error_rc")
+        return ("partial output", "stderr", 1, "error_rc", "fake")
 
-    review, stderr, rc, status, attempts = chunked._run_with_retry(invoke, "j1", "fake", p)
+    review, stderr, rc, status, attempts, used_backend = chunked._run_with_retry(invoke, "j1", "fake", p)
 
     assert calls["n"] == 1
     assert attempts == 1

@@ -36,7 +36,7 @@ from typing import Any
 import yaml
 
 import config
-from config import ARBITER, CHUNKED_BACKENDS, RunnerConfig
+from config import ARBITER, CHUNKED_BACKENDS, FALLBACK, RunnerConfig
 from consolidation import FindingCluster, parse_multi_arbiter_output
 from validators.manifest import ValidationResult
 from validators.manifest import validate as validate_manifest
@@ -277,38 +277,46 @@ _NULL_PERSISTER = _RunPersister()
 
 
 def _run_with_retry(
-    invoke: Callable[[], tuple[str, str, int, str]],
+    invoke: Callable[[], tuple[str, str, int, str, str]],
     job_id: str,
     backend: str,
     persister: _RunPersister,
-) -> tuple[str, str, int, str, int]:
+) -> tuple[str, str, int, str, int, str]:
     """Wrap one reviewer/arbiter invocation with up to one retry on infra-style failures.
 
     Each attempt is logged to ``state/retries.jsonl`` (so the writer can
     later analyze which backends fail most often and reduce the failure
-    rate). ``invoke`` must return ``(output, stderr, rc, status)``.
+    rate). ``invoke`` must return ``(output, stderr, rc, status, used_backend)``;
+    this returns the same plus the attempt count: ``(output, stderr, rc,
+    status, attempt, used_backend)``. ``backend`` is the *configured* backend
+    for retry-log attribution ("which job was retried"); ``used_backend`` is
+    the backend that actually produced the output and may differ when the
+    reviewer fell back.
 
     Retries on:
       - ``status == "timeout"`` (subprocess.TimeoutExpired upstream)
       - ``status == "unreachable"`` (FileNotFoundError / OSError upstream)
       - ``status == "empty_stdout"`` (rc=0 but no usable output)
 
-    Does NOT retry rc!=0 with non-empty stdout — that is a real review
-    failure, retrying just burns tokens.
+    For reviewer jobs these statuses now mean *both* the primary and the
+    fallback failed that way (a single primary failure is absorbed by
+    ``_run_one_reviewer``'s ``run_with_fallback``), so a retry re-runs the
+    whole pair. Does NOT retry rc!=0 with non-empty stdout — a real review
+    failure; retrying just burns tokens.
     """
     retry_eligible = {"timeout", "unreachable", "empty_stdout"}
-    review, stderr, rc, status = "", "", -1, "unreachable"
+    review, stderr, rc, status, used_backend = "", "", -1, "unreachable", backend
     for attempt in (1, 2):
         started = time.monotonic()
-        review, stderr, rc, status = invoke()
+        review, stderr, rc, status, used_backend = invoke()
         duration = time.monotonic() - started
         persister.record_retry_attempt(job_id, backend, attempt, status, duration, stderr)
         if status not in retry_eligible:
-            return review, stderr, rc, status, attempt
+            return review, stderr, rc, status, attempt, used_backend
         if attempt == 2:
-            return review, stderr, rc, status, attempt
+            return review, stderr, rc, status, attempt, used_backend
     # unreachable in practice; defensive fall-through for type checker
-    return review, stderr, rc, status, 2
+    return review, stderr, rc, status, 2, used_backend  # pragma: no cover
 
 
 # ---------------------------------------------------------------------------
@@ -395,28 +403,40 @@ def _run_one_reviewer(
     system_prompt: str,
     user_prompt: str,
     job_id: str,
-) -> tuple[str, str, int, str]:
-    """Wrap ``hook.run_reviewer`` so timeout/unreachable failures become
-    one-line synthetic CRITICAL findings instead of crashing the executor."""
-    from hook import run_reviewer  # late import — avoids hook ↔ chunked cycle
+) -> tuple[str, str, int, str, str]:
+    """Run one chunk/lens job with config.FALLBACK as the safety net.
 
+    Returns ``(review, stderr, rc, status, used_backend)``. ``used_backend``
+    is the backend that actually produced the returned text (so findings get
+    attributed correctly when the primary fell back), always a clean single
+    name — never a composite — so it is safe as a finding-ID prefix.
+
+    Delegates to ``hook.run_with_fallback`` so a primary that quota-limits,
+    errors (rc!=0), returns empty, times out, or is unreachable transparently
+    falls back to FALLBACK (claude/sonnet) instead of silently contributing
+    zero findings. Only when BOTH the primary and the fallback time out (or
+    both are unreachable) does this surface a one-line synthetic CRITICAL —
+    the message names both backends for debugging, but ``used_backend`` stays
+    the primary's name to keep the finding-ID prefix regex-clean.
+    """
+    from hook import run_with_fallback  # late import — avoids hook ↔ chunked cycle
+
+    both = f"{backend_cfg.backend} (+ {FALLBACK.backend} fallback)" if FALLBACK else backend_cfg.backend
     try:
         if not system_prompt.strip():
             raise FileNotFoundError("missing or empty system prompt")
-        review, stderr, rc = run_reviewer(backend_cfg, system_prompt, user_prompt)
+        review, stderr, rc, used_backend = run_with_fallback(backend_cfg, FALLBACK, system_prompt, user_prompt)
         if rc == 0 and not review.strip():
-            return review, stderr, rc, "empty_stdout"
-        return review, stderr, rc, "ok"
+            return review, stderr, rc, "empty_stdout", used_backend
+        return review, stderr, rc, "ok", used_backend
     except subprocess.TimeoutExpired:
         synthetic = (
-            f"- [CRITICAL] {job_id}:0 — `<reviewer timeout>` — reviewer did not return within {backend_cfg.timeout}s"
+            f"- [CRITICAL] {job_id}:0 — `<reviewer timeout>` — {both} did not return within {backend_cfg.timeout}s"
         )
-        return synthetic, "", -1, "timeout"
+        return synthetic, "", -1, "timeout", backend_cfg.backend
     except (FileNotFoundError, OSError) as exc:
-        synthetic = (
-            f"- [CRITICAL] {job_id}:0 — `<reviewer unreachable>` — backend {backend_cfg.backend!r} unavailable: {exc}"
-        )
-        return synthetic, "", -1, "unreachable"
+        synthetic = f"- [CRITICAL] {job_id}:0 — `<reviewer unreachable>` — {both} unavailable: {exc}"
+        return synthetic, "", -1, "unreachable", backend_cfg.backend
 
 
 def _run_chunk_job(
@@ -431,7 +451,7 @@ def _run_chunk_job(
     job_id = f"chunk:{cid}:{backend_cfg.backend}"
     user_prompt = cached_block + _build_chunk_variable_block(chunk, repo_root)
     started = time.monotonic()
-    review, stderr, rc, status, attempts = _run_with_retry(
+    review, stderr, rc, status, attempts, used_backend = _run_with_retry(
         lambda: _run_one_reviewer(backend_cfg, system_prompt, user_prompt, job_id),
         job_id=job_id,
         backend=backend_cfg.backend,
@@ -441,14 +461,16 @@ def _run_chunk_job(
 
     from hook import assign_finding_ids
 
-    prefix = f"{cid}-{backend_cfg.backend}"
+    # used_backend reflects who actually produced the review (the fallback
+    # when the primary failed), so findings and stats are attributed correctly.
+    prefix = f"{cid}-{used_backend}"
     tagged, findings = assign_finding_ids(review, prefix=prefix)
     jr = ReviewerJobResult(
         job_id=job_id,
         layer="chunk",
         chunk_id=cid,
         lens=None,
-        backend=backend_cfg.backend,
+        backend=used_backend,
         status=status if rc == 0 or status != "ok" else "error",
         raw_text=review,
         tagged_text=tagged,
@@ -476,7 +498,7 @@ def _run_wholediff_job(
     system_prompt = build_lens_system_prompt(lens) or ""
     user_prompt = build_user_prompt(diff, files, is_merge)
     started = time.monotonic()
-    review, stderr, rc, status, attempts = _run_with_retry(
+    review, stderr, rc, status, attempts, used_backend = _run_with_retry(
         lambda: _run_one_reviewer(backend_cfg, system_prompt, user_prompt, job_id),
         job_id=job_id,
         backend=backend_cfg.backend,
@@ -484,14 +506,14 @@ def _run_wholediff_job(
     )
     duration = time.monotonic() - started
 
-    prefix = f"wholediff-{lens}-{backend_cfg.backend}"
+    prefix = f"wholediff-{lens}-{used_backend}"
     tagged, findings = assign_finding_ids(review, prefix=prefix)
     jr = ReviewerJobResult(
         job_id=job_id,
         layer="wholediff",
         chunk_id=None,
         lens=lens,
-        backend=backend_cfg.backend,
+        backend=used_backend,
         status=status if rc == 0 or status != "ok" else "error",
         raw_text=review,
         tagged_text=tagged,
@@ -595,8 +617,16 @@ def _run_chunked_arbiter(
             return raw or "", stderr, rc, "error_rc"
         return raw, stderr, rc, "ran"
 
-    raw, stderr, rc, status, attempts = _run_with_retry(
-        _invoke,
+    # _run_with_retry's invoke contract is now 5-tuple (used_backend last).
+    # The arbiter has no fallback (no "ARBITER fallback" concept), so its
+    # used_backend is always ARBITER.backend — wrap the 4-tuple _invoke once
+    # rather than threading the constant through every return branch, which
+    # also keeps those branches identical to HEAD (no diff-coverage churn).
+    def _invoke_with_used_backend() -> tuple[str, str, int, str, str]:
+        return (*_invoke(), ARBITER.backend)
+
+    raw, stderr, rc, status, attempts, _used_backend = _run_with_retry(
+        _invoke_with_used_backend,
         job_id=f"arbiter:{ARBITER.backend}",
         backend=ARBITER.backend,
         persister=persister,

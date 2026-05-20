@@ -20,7 +20,14 @@ class RunnerConfig:
 
     backend: str
     model: str
-    timeout: int = 1800
+    # 2400s (40 min) per single backend invocation. Chunked-path jobs run
+    # fully in parallel (chunked.py: max_workers=len(jobs)), so each kimi job
+    # is independently bounded by this; the slowest observed single job is
+    # ~1200-1300s and climbs under API concurrency. A timed-out chunk job
+    # emits a synthetic [CRITICAL] (no fallback on the chunked path) → false
+    # BLOCK, so the headroom matters. Not higher: a genuinely hung job should
+    # not hold a commit hostage for an hour.
+    timeout: int = 2400
 
 
 # Reviewer roles. Available backend names live in review/backends.py
@@ -62,8 +69,8 @@ FALLBACK: RunnerConfig | None = RunnerConfig("claude", "sonnet")
 # primaries. Single source of arbitration regardless of how many
 # primaries ran.
 ARBITER: RunnerConfig = RunnerConfig(
-    "claude", "sonnet", timeout=1800
-)  # review-note: user explicitly swapped arbiter from sonnet to Sonnet earlier in this session (commit 31e7575); deliberate cost/latency trade-off owned by the user
+    "claude", "sonnet", timeout=2400
+)  # review-note: user explicitly swapped arbiter from sonnet to Sonnet earlier in this session (commit 31e7575); deliberate cost/latency trade-off owned by the user. timeout=2400 matches the reviewer budget (see RunnerConfig.timeout).
 
 # Diff-size routing. Both gates use added-prod-line count
 # (count_added_production_lines) — total diff length is no longer

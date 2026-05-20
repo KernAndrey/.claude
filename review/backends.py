@@ -149,20 +149,6 @@ class ClaudeBackend(Backend):
         return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
-_KIMI_PREAMBLE = (
-    "**Important context for this review run.** kimi is invoked from a "
-    "directory that does not contain the diff's source files. The diff in "
-    "the user prompt below is the complete, authoritative artefact to "
-    "review — its hunks already include surrounding context lines. Do "
-    "**not** call `ReadFile`, `Glob`, `Grep`, or `Shell` to look up the "
-    "diff's files; they are not on this filesystem and the resulting tool "
-    "calls will return empty/wrong results and waste your token budget. "
-    "Treat the diff as the entire source of truth and produce the full "
-    "review (Section 1, Section 2 across all lenses, Section 3) in a "
-    "single response."
-)
-
-
 class KimiBackend(Backend):
     name = "kimi"
 
@@ -173,26 +159,24 @@ class KimiBackend(Backend):
         model: str,
         timeout: int,
     ) -> tuple[str, str, int]:
-        # Kimi has no --system-prompt flag → concatenate (same way
-        # OpencodeBackend does). Stdin is not a documented path for --prompt,
-        # so the combined prompt rides on argv; combined size is well under
-        # ARG_MAX even at FANOUT_THRESHOLD.
-        # Prepend a kimi-specific preamble that overrides the generic
-        # "use Read/Grep/Glob" instruction in prompts/combined.md — kimi
-        # runs from ~/.claude, not the user's repo, so filesystem lookups
-        # are wrong-tree and a previous live smoke had kimi spend 768s
-        # chasing missing files before truncating mid-review.
-        # review-note: keeping the preamble in prompt text is a deliberate
-        # kimi-specific cost optimization. Passing `cwd=<repo>` to subprocess
-        # would let kimi reach the files, but combined.md tells reviewers to
-        # use Read/Grep/Glob — kimi would then spend tokens browsing instead
-        # of reviewing the diff (the 768s smoke incident above). The "shared
-        # prompt contract" refactor across backends is out of scope here.
-        system_prompt = f"{_KIMI_PREAMBLE}\n\n{system_prompt}" if system_prompt else _KIMI_PREAMBLE
-        # `system_prompt` is non-empty after the line above (either the
-        # original prefixed with the preamble, or the bare preamble), so an
-        # `else user_prompt` branch here would be unreachable.
-        full_prompt = f"{system_prompt}\n\n{user_prompt}"
+        # Kimi has no --system-prompt flag → concatenate system + user the
+        # same way OpencodeBackend does. The combined prompt is delivered on
+        # STDIN (`--input-format text` makes kimi read the user prompt from
+        # stdin under --print), NOT on argv: chunked-path prompts (cached
+        # block + manifest + full diff) routinely exceed Linux MAX_ARG_STRLEN
+        # (~128KB per single argv arg) and `--prompt <huge>` fails instantly
+        # with `[Errno 7] Argument list too long`. Symmetric with how
+        # OpencodeBackend and ClaudeBackend pipe the prompt via stdin.
+        #
+        # No anti-browsing preamble: kimi reviews with full read-only file
+        # access, mirroring ClaudeBackend (--tools Read,Grep,Glob) and
+        # OpencodeBackend (--agent pre-commit-reviewer). The hook runs from
+        # the repo root (git invokes it there; neither the hook nor this
+        # backend overrides cwd), so combined.md's "ground every finding in
+        # real code — use Read/Grep/Glob" instruction resolves repo-relative
+        # paths and kimi can pull context beyond the diff, like Sonnet did.
+        # Read-only containment still holds via --agent-file (see below).
+        full_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
         # `--quiet` is `--print --output-format text --final-message-only` —
         # gives clean stdout (just the final assistant reply) instead of the
         # event-stream dump `--print` alone produces. `--print` implicitly
@@ -210,11 +194,12 @@ class KimiBackend(Backend):
             model,
             "--agent-file",
             _KIMI_AGENT_FILE,
-            "--prompt",
-            full_prompt,
+            "--input-format",
+            "text",
         ]
         result = subprocess.run(
             cmd,
+            input=full_prompt,
             capture_output=True,
             text=True,
             timeout=timeout,

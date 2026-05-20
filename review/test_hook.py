@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from backends import BACKENDS, Backend, ClaudeBackend, KimiBackend, OpencodeBackend, _build_registry
-from config import CHUNKED_BACKENDS, FANOUT_THRESHOLD, MAX_PROD_LINES, PRIMARIES, RunnerConfig
+from config import CHUNKED_BACKENDS, FALLBACK, FANOUT_THRESHOLD, MAX_PROD_LINES, PRIMARIES, RunnerConfig
 from hook import (
     ARBITER,
     LENS_APPLICABILITY,
@@ -537,15 +537,18 @@ def test_kimi_backend_builds_correct_command() -> None:
     assert "--quiet" in cmd
     model_idx = cmd.index("--model")
     assert cmd[model_idx + 1] == "kimi-for-coding"
-    prompt_idx = cmd.index("--prompt")
-    # KimiBackend prepends _KIMI_PREAMBLE to the system prompt before
-    # concatenating with the user prompt — combined.md tells reviewers to
-    # use Read/Grep/Glob, but kimi runs from a directory that does not
-    # contain the diff's files, so the preamble must override that
-    # instruction or kimi will burn tokens chasing missing paths.
-    sent = cmd[prompt_idx + 1]
-    assert sent.endswith("\n\nsys\n\nuser")
-    assert "Do **not** call `ReadFile`" in sent
+    # Prompt is delivered on STDIN, not argv — `--input-format text` + a
+    # piped `input=`. argv `--prompt <huge>` hit MAX_ARG_STRLEN (~128KB) and
+    # failed with `[Errno 7] Argument list too long` on chunked-path prompts.
+    assert "--prompt" not in cmd
+    assert cmd[cmd.index("--input-format") + 1] == "text"
+    # KimiBackend concatenates system + user prompt verbatim (no anti-browsing
+    # preamble) so kimi follows combined.md just like ClaudeBackend — full
+    # read-only file access, ground findings in real code. The sent prompt is
+    # exactly "<system>\n\n<user>".
+    sent = mock_run.call_args.kwargs["input"]
+    assert sent == "sys\n\nuser"
+    assert "Do **not** call `ReadFile`" not in sent
     assert mock_run.call_args.kwargs["timeout"] == 600
     assert (stdout, stderr, rc) == ("kimi review body", "", 0)
 
@@ -571,19 +574,16 @@ def test_kimi_backend_pins_agent_file() -> None:
     assert Path(agent_path).is_file()
 
 
-def test_kimi_backend_uses_preamble_when_system_prompt_empty() -> None:
-    """With an empty system_prompt KimiBackend still injects _KIMI_PREAMBLE
-    so the resulting --prompt arg starts with the preamble (not the user
-    prompt). The preamble is what stops kimi from chasing missing files
-    when invoked from a directory other than the user's repo."""
+def test_kimi_backend_empty_system_prompt_sends_user_prompt_only() -> None:
+    """With an empty system_prompt KimiBackend sends just the user prompt
+    (no preamble, mirroring OpencodeBackend's `... if system_prompt else
+    user_prompt` branch). Guards against a regression that re-introduces a
+    bare preamble or an empty-leading-separator artefact."""
     with _patched_backends_subprocess(stdout="ok") as mock_run:
         KimiBackend().run("", "user", "kimi-for-coding", 60)
 
-    cmd = mock_run.call_args[0][0]
-    prompt_idx = cmd.index("--prompt")
-    sent = cmd[prompt_idx + 1]
-    assert "Do **not** call `ReadFile`" in sent
-    assert sent.endswith("\n\nuser")
+    sent = mock_run.call_args.kwargs["input"]
+    assert sent == "user"
 
 
 def test_kimi_backend_forwards_timeout() -> None:
@@ -593,18 +593,18 @@ def test_kimi_backend_forwards_timeout() -> None:
     assert mock_run.call_args.kwargs["timeout"] == 333
 
 
-def test_default_primaries_pin_opencode_only() -> None:
+def test_default_primaries_pin_kimi_only() -> None:
     """The runtime composition of PRIMARIES is part of the user-facing
     contract — every commit on the owner's machine sees this list. A
     silent reorder, addition, or removal here would change real
     pre-commit behavior without any failing test. Pin the default so
     drift is caught at test time, not at commit time.
 
-    Current default: opencode only (kimi/claude commented out in config.py
-    by the owner — kimi to avoid the kimi-login dependency, claude to keep
-    a single-backend baseline for the chunked-path rollout)."""
+    Current default: kimi only (the owner uses Kimi K2 as the sole primary
+    reviewer; requires `kimi login`). The arbiter and total-failure fallback
+    remain claude/sonnet."""
     assert len(PRIMARIES) == 1
-    assert (PRIMARIES[0].backend, PRIMARIES[0].model) == ("opencode", "github-copilot/gpt-5.4")
+    assert (PRIMARIES[0].backend, PRIMARIES[0].model) == ("kimi", "kimi-code/kimi-for-coding")
 
 
 def test_config_defaults_pinned() -> None:
@@ -804,9 +804,11 @@ def test_run_single_lens_timeout_returns_timeout_status() -> None:
         result = run_single_lens("bugs", "diff", "src/foo.py", False)
     assert result["status"] == "timeout"
     assert "timeout" in result["error"]
-    # Default config has FALLBACK=claude/sonnet, so the timeout label points
-    # at the backend that finally timed out — claude.
-    assert result["reviewer"] == "claude"
+    # FALLBACK is configured (not None), so the timeout label points at the
+    # backend that finally timed out — the fallback. Derived from config so a
+    # backend swap in config.py does not break this behavioral assertion.
+    assert FALLBACK is not None
+    assert result["reviewer"] == FALLBACK.backend
 
 
 def test_run_single_lens_timeout_with_no_fallback_labels_primary() -> None:
@@ -827,9 +829,11 @@ def test_run_single_lens_timeout_with_no_fallback_labels_primary() -> None:
         result = run_single_lens("bugs", "diff", "src/foo.py", False)
 
     assert result["status"] == "timeout"
-    # PRIMARY.backend (default config: opencode), since FALLBACK is None.
-    assert result["reviewer"] == "opencode"
-    assert "opencode" in result["error"]
+    # PRIMARIES[0].backend, since FALLBACK is patched to None. Derived from
+    # config so a backend swap in config.py does not break this behavioral
+    # assertion.
+    assert result["reviewer"] == PRIMARIES[0].backend
+    assert PRIMARIES[0].backend in result["error"]
 
 
 def test_run_single_lens_filenotfound_returns_error_status() -> None:
@@ -2942,10 +2946,13 @@ def test_maybe_dispatch_chunked_skips_when_below_threshold() -> None:
     small_diff = "diff --git a/x.py b/x.py\n+++ b/x.py\n@@ -0,0 +1,5 @@\n+a\n+b\n+c\n+d\n+e\n"
     with (
         patch("hook.get_staged_diff", return_value=(small_diff, None)),
-        patch("hook.count_added_production_lines", return_value=50),
+        patch("hook.count_added_production_lines", return_value=MAX_PROD_LINES - 1),
         patch("chunked.manifest_present", return_value=False),
     ):
-        _maybe_dispatch_chunked()  # returns, no SystemExit
+        # Below threshold the function returns None (no sys.exit) so main()
+        # falls through to the single-call path. A regression that routed to
+        # the chunked path here would raise SystemExit instead.
+        assert _maybe_dispatch_chunked() is None
 
 
 def test_maybe_dispatch_chunked_auto_scaffolds_when_no_manifest_and_big() -> None:
@@ -2955,7 +2962,7 @@ def test_maybe_dispatch_chunked_auto_scaffolds_when_no_manifest_and_big() -> Non
     big_diff = "diff --git a/x.py b/x.py\n+++ b/x.py\n@@ -0,0 +1,400 @@\n" + "\n".join(f"+line_{i}" for i in range(400))
     with (
         patch("hook.get_staged_diff", return_value=(big_diff, None)),
-        patch("hook.count_added_production_lines", return_value=400),
+        patch("hook.count_added_production_lines", return_value=MAX_PROD_LINES + 100),
         patch("chunked.manifest_present", return_value=False),
         patch("scripts.scaffold_manifest.build_scaffold", return_value="scaffold-yaml"),
         patch("scripts.scaffold_manifest.write_scaffold", return_value=Path("/tmp/.review/manifest.yaml")),
@@ -3008,7 +3015,7 @@ def test_maybe_dispatch_chunked_runs_chunked_when_threshold_and_manifest() -> No
 
     with (
         patch("hook.get_staged_diff", return_value=(big_diff, None)),
-        patch("hook.count_added_production_lines", return_value=350),
+        patch("hook.count_added_production_lines", return_value=MAX_PROD_LINES + 50),
         patch("chunked.manifest_present", return_value=True),
         patch("hook.get_staged_files", return_value="x.py"),
         patch("chunked.run_chunked_review", return_value=fake_result),
@@ -3038,7 +3045,7 @@ def test_maybe_dispatch_chunked_blocks_on_upheld_clusters() -> None:
 
     with (
         patch("hook.get_staged_diff", return_value=("diff --git a/x.py b/x.py\n", None)),
-        patch("hook.count_added_production_lines", return_value=500),
+        patch("hook.count_added_production_lines", return_value=MAX_PROD_LINES + 100),
         patch("chunked.manifest_present", return_value=True),
         patch("hook.get_staged_files", return_value="x.py"),
         patch("chunked.run_chunked_review", return_value=fake_result),
@@ -3064,7 +3071,7 @@ def test_maybe_dispatch_chunked_blocks_on_invalid_manifest() -> None:
 
     with (
         patch("hook.get_staged_diff", return_value=("diff", None)),
-        patch("hook.count_added_production_lines", return_value=500),
+        patch("hook.count_added_production_lines", return_value=MAX_PROD_LINES + 100),
         patch("chunked.manifest_present", return_value=True),
         patch("hook.get_staged_files", return_value="x.py"),
         patch("chunked.run_chunked_review", return_value=fake_result),

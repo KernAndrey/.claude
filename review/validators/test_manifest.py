@@ -214,8 +214,10 @@ def test_validate_too_many_chunks(tmp_path: Path) -> None:
 
 
 def test_validate_oversized_chunk(tmp_path: Path) -> None:
-    # 301 added prod lines in one chunk
-    lines = [f"line_{i}" for i in range(301)]
+    # one chunk one line over the per-chunk cap (derived from config, not a
+    # hardcoded literal, so it tracks MAX_PROD_LINES instead of breaking on a
+    # retune — mirrors test_validate_too_many_chunks using config.MAX_CHUNKS).
+    lines = [f"line_{i}" for i in range(config.MAX_PROD_LINES + 1)]
     diff = _diff_for_new_file("big.py", lines)
     runner = _runner_factory("A\tbig.py\n", f"{len(lines)}\t0\tbig.py\n")
     manifest = textwrap.dedent(f"""

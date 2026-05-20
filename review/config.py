@@ -20,7 +20,7 @@ class RunnerConfig:
 
     backend: str
     model: str
-    timeout: int = 1200
+    timeout: int = 1800
 
 
 # Reviewer roles. Available backend names live in review/backends.py
@@ -44,11 +44,10 @@ class RunnerConfig:
 #         RunnerConfig("claude", "sonnet"),
 #     ]
 PRIMARIES: list[RunnerConfig] = [
-    RunnerConfig("opencode", "github-copilot/gpt-5.4"),
-    # RunnerConfig(
-    #     "kimi", "kimi-code/kimi-for-coding"
-    # ),  # Kimi K2; requires `kimi login`. Model alias must match ~/.kimi/config.toml [models.*] key. KimiBackend pins review/agents/kimi-pre-commit-reviewer.yaml automatically. review-note: no startup capability probe by design — this hook only runs on the owner's machine (~/.claude is single-user config), the reviewer fail-opens on backend errors (hook.py:1525+, fallback to claude/sonnet on total primary failure), and a probe per commit would burn ~1-2s for no real safety on a misconfigured machine the user would notice immediately anyway.
-    # RunnerConfig("claude", "sonnet"),  # uncomment to enable parallel triple-review
+    RunnerConfig(
+        "kimi", "kimi-code/kimi-for-coding"
+    ),  # Kimi K2 is the sole primary reviewer; requires `kimi login`. Model alias must match ~/.kimi/config.toml [models.*] key. KimiBackend pins review/agents/kimi-pre-commit-reviewer.yaml automatically. review-note: no startup capability probe by design — this hook only runs on the owner's machine (~/.claude is single-user config), the reviewer fail-opens on backend errors (hook.py:1525+, fallback to claude/sonnet on total primary failure), and a probe per commit would burn ~1-2s for no real safety on a misconfigured machine the user would notice immediately anyway.
+    # RunnerConfig("claude", "sonnet"),  # uncomment to add a parallel second reviewer
 ]
 
 # Safety-net reviewer used ONLY if every primary fails (timeout / rc!=0
@@ -63,8 +62,8 @@ FALLBACK: RunnerConfig | None = RunnerConfig("claude", "sonnet")
 # primaries. Single source of arbitration regardless of how many
 # primaries ran.
 ARBITER: RunnerConfig = RunnerConfig(
-    "claude", "sonnet", timeout=900
-)  # review-note: user explicitly swapped arbiter from Opus to Sonnet earlier in this session (commit 31e7575); deliberate cost/latency trade-off owned by the user
+    "claude", "sonnet", timeout=1800
+)  # review-note: user explicitly swapped arbiter from sonnet to Sonnet earlier in this session (commit 31e7575); deliberate cost/latency trade-off owned by the user
 
 # Diff-size routing. Both gates use added-prod-line count
 # (count_added_production_lines) — total diff length is no longer
@@ -77,7 +76,7 @@ ARBITER: RunnerConfig = RunnerConfig(
 #   N >= MAX_PROD_LINES, manifest    → chunked path (chunked.py). Fan-out lives
 #                                        here as the whole-diff lens layer.
 #   N >= MAX_PROD_LINES, no manifest → exit 1, ask writer to generate manifest.
-MAX_PROD_LINES = 300  # also used as per-chunk line cap (single source of truth)
+MAX_PROD_LINES = 400  # also used as per-chunk line cap (single source of truth)
 MIN_LINES_TO_REVIEW = 1  # commits smaller than this (total) skip review
 
 # Fan-out is now scoped to chunked path only. Setting the threshold equal to
@@ -88,7 +87,7 @@ MIN_LINES_TO_REVIEW = 1  # commits smaller than this (total) skip review
 FANOUT_THRESHOLD = MAX_PROD_LINES
 
 # Chunked-review limits.
-MAX_CHUNKS = 12  # validator rejects manifests with more chunks. Effective
+MAX_CHUNKS = 6  # validator rejects manifests with more chunks. Effective
 # upper bound on a chunked commit ≈ MAX_CHUNKS * MAX_PROD_LINES.
 
 # Lens whitelist used by the manifest validator. Must match the prompt files
@@ -101,8 +100,7 @@ ALLOWED_LENSES: frozenset[str] = frozenset({"bugs", "architecture", "tests"})
 # Total parallel jobs ≤ MAX_CHUNKS * len(CHUNKED_BACKENDS) +
 #                       len(ALLOWED_LENSES) * len(CHUNKED_BACKENDS).
 CHUNKED_BACKENDS: list[RunnerConfig] = [
-    RunnerConfig("opencode", "github-copilot/gpt-5.4"),
-    # RunnerConfig("kimi", "kimi-code/kimi-for-coding"),
+    RunnerConfig("kimi", "kimi-code/kimi-for-coding"),
     # RunnerConfig("claude", "sonnet"),
 ]
 

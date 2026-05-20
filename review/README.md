@@ -38,7 +38,7 @@ Three slots:
 ```python
 PRIMARIES: list[RunnerConfig]  = [RunnerConfig("opencode", "github-copilot/gpt-5.4")]
 FALLBACK:  RunnerConfig | None = RunnerConfig("claude", "sonnet")
-ARBITER:   RunnerConfig        = RunnerConfig("claude", "sonnet", timeout=900)
+ARBITER:   RunnerConfig        = RunnerConfig("claude", "sonnet", timeout=1800)
 ```
 
 Common edits:
@@ -61,7 +61,7 @@ Common edits:
   below for full semantics and stats.
 - **Disable the fallback** — `FALLBACK = None`. Then a total-failure
   run (every primary down) goes fail-open with a warn log.
-- **Run the arbiter on OpenCode** — `ARBITER = RunnerConfig("opencode", "github-copilot/gpt-5.4", timeout=900)`.
+- **Run the arbiter on OpenCode** — `ARBITER = RunnerConfig("opencode", "github-copilot/gpt-5.4", timeout=1800)`.
 - **Cap commit prod-surface** — `MAX_PROD_LINES = 300`. Commits with
   more added production-code lines are rejected outright. Tests, docs,
   configs, lock-files, removals, and context lines do not count — only
@@ -166,15 +166,21 @@ Add a new lens by:
    `LENS_APPLICABILITY` in `hook.py`. `LENS_NAMES` is derived from
    the dict, so order is the dict's insertion order.
 
-## Enabling Kimi K2
+## Kimi K2 (current primary reviewer)
 
-`KimiBackend` is registered out of the box but not enabled. To turn it on:
+`KimiBackend` is the sole primary reviewer in `config.py` (both
+`PRIMARIES` and `CHUNKED_BACKENDS`). The arbiter and the total-failure
+fallback stay on `claude`/`sonnet`. Requirements to keep it working:
 
 1. Install the kimi CLI per <https://www.kimi.com/code/docs/en/>.
 2. `kimi login` once for OAuth (no API-key env var is documented).
 3. Active Kimi membership subscription is required — Kimi Code is paywalled.
-4. Uncomment `RunnerConfig("kimi", "kimi-for-coding")` in `config.py`'s
-   `PRIMARIES` block.
+
+The configured model alias is `kimi-code/kimi-for-coding`, which must
+match a `[models."…"]` key in `~/.kimi/config.toml`. If kimi is ever
+unreachable on a commit, the orchestrator fails open to the
+`claude`/`sonnet` fallback, so a broken kimi never blocks a commit on
+its own.
 
 The backend invokes `kimi --print --model <m> --output-format text
 --agent-file <path> --prompt <combined>`. `--print` implicitly enables

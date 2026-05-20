@@ -29,7 +29,7 @@ import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -252,7 +252,7 @@ class _RunPersister:
         path = self.state_dir / "retries.jsonl"
         line = json.dumps(
             {
-                "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "job_id": job_id,
                 "backend": backend,
                 "attempt": attempt,
@@ -933,11 +933,7 @@ def _run_chunked_review_impl(
         )
 
     # C3: every reviewer failed and produced zero findings → block.
-    if (
-        job_results
-        and all(jr.status != "ok" for jr in job_results)
-        and all(not jr.findings for jr in job_results)
-    ):
+    if job_results and all(jr.status != "ok" for jr in job_results) and all(not jr.findings for jr in job_results):
         return _build_infrastructure_failure_result(
             validation=inputs.validation,
             job_results=job_results,

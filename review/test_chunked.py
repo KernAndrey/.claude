@@ -213,7 +213,13 @@ def test_reviewer_timeout_emits_synthetic_critical() -> None:
 
     # boom raises for every run_reviewer call, so the primary AND the claude
     # fallback both time out — only then does the synthetic CRITICAL fire.
-    with patch("hook.run_reviewer", side_effect=boom):
+    # Pin FALLBACK to a known RunnerConfig so the assertion on the "fallback"
+    # substring is self-contained (a config.FALLBACK=None install would otherwise
+    # produce a message without that word and silently break this test).
+    with (
+        patch("hook.run_reviewer", side_effect=boom),
+        patch("chunked.FALLBACK", RunnerConfig("claude", "sonnet")),
+    ):
         jr = chunked._run_chunk_job(chunk, backend_cfg, "system", "cached", Path("/tmp"))
 
     assert jr.status == "timeout"
@@ -719,6 +725,12 @@ def test_mixed_ok_and_error_falls_through_to_arbiter(tmp_path: Path) -> None:
             "chunked.CHUNKED_BACKENDS",
             [RunnerConfig("fake1", "m1"), RunnerConfig("fake2", "m2")],
         ),
+        # FALLBACK=None: without it, fake2's rc!=0 would be absorbed by the
+        # claude fallback (which the fake routes to its arbiter else-branch),
+        # leaving the chunk with zero findings and the test passing for the
+        # wrong reason. Pin no-fallback to genuinely exercise the mixed
+        # ok+error path the test name claims.
+        patch("chunked.FALLBACK", None),
         patch("chunked.config.ALLOWED_LENSES", frozenset()),
         patch("chunked._read_text", side_effect=fake_read_text),
     ):

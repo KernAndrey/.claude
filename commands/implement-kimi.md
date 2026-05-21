@@ -1,25 +1,15 @@
-Implement an approved specification using Kimi CLI for code & tests, with the standard SDD reviewer team.
+Implement an approved specification using Kimi CLI for code & tests, with the standard SDD reviewers.
 
-Sibling of `/implement`. The flow is identical except: all production code and test code is written by the Kimi CLI via the kimi skill (`~/.claude/skills/kimi/SKILL.md`), not by Coder/Tester teammates. Reviewers are unchanged — same `claudecode` or `opencode` modes, same agents, same fix loop.
+Sibling of `/implement`. The flow is identical except: all production code and test code is written by the Kimi CLI via the kimi skill (`~/.claude/skills/kimi/SKILL.md`), not by Coder/Tester agents. Reviewers are Claude Code background agents — same agents, same fix loop as `/implement`.
 
-Begin by saying to the user: **"I will run kimi for code and tests, then spawn the standard reviewer team. I am the lead — I dispatch kimi runs, monitor them, and coordinate reviews. I do not code or review."**
+Begin by saying to the user: **"I will run kimi for code and tests, then spawn the standard reviewers as background agents. I am the lead — I dispatch kimi runs, monitor them, and coordinate reviews. I do not code or review."**
 
 <critical>
 Three rules govern everything below:
 1. Every kimi invocation uses the kimi skill spawn block (`~/.claude/skills/kimi/SKILL.md` §Procedure) — always background, always via `build_context.py`.
 2. Every spawned kimi run is watchdogged from spawn to `=== KIMI_DONE` (see §Watchdog). Passive waiting masks silent crashes.
-3. Reviewers and the fix loop follow `/implement.md` exactly — same agents, same severity rules, same iteration cap.
+3. Reviewers and the fix loop follow `/implement.md` exactly — same agents, same severity rules, same iteration cap. Record the `agentId` from every reviewer spawn; a completed reviewer is reachable only by `agentId`, not by name.
 </critical>
-
-## Reviewer mode (required)
-
-`$ARGUMENTS` must include `--reviewers claudecode` or `--reviewers opencode`. If missing — **ask the user before proceeding:**
-
-> Which reviewer mode?
-> - `claudecode` — Claude Code teammates (full coordination, re-review with context, UI review supported)
-> - `opencode` — OpenCode `--pure` via GitHub Copilot (stateless, cheaper)
-
-Parse `$ARGUMENTS` to extract both the task identifier and `--reviewers {mode}`. Store `{reviewer_mode}` for Phase 2 and 3.
 
 ## Quality mandate
 
@@ -28,17 +18,17 @@ Thoroughness over speed. A single kimi run takes 20–60 minutes (longer for big
 ## Setup
 
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
-2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`.
+2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`. `$ARGUMENTS` is just the task identifier.
 3. Read the full specification.
 4. Branch and worktree setup:
    - If `auto_branch = true`: fetch latest `dev` (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All kimi runs and reviewers operate inside the worktree.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root.
-5. **Review prompt setup** (run inside `{worktree_path}`): if the project has `.claude/review_prompt.md`, reviewers will apply it as project-specific rules. In opencode mode, run the symlink setup from `~/.claude/review/guides/opencode-runner.md` inside the worktree.
+5. **Review prompt setup:** if the project has `.claude/review_prompt.md`, reviewers will apply it as project-specific rules. Note its path to pass to reviewers.
 6. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
 7. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers need it.
 8. **Scan project rules** (run inside `{worktree_path}`): `ls .claude/rules/*.md 2>/dev/null` and remember the filename list. You will match these against each kimi scope below. If the directory is empty/missing, note "no project rules directory" — `build_context.py` will still inject `CLAUDE.md`.
 9. **Detect project type** for rule heuristics: presence of `__manifest__.py` anywhere → Odoo project; `package.json` with `react`/`vue`/`svelte` → frontend project; etc. Used in the rule-matching table below.
-10. **Create the team:** `TeamCreate` with `team_name: "impl-kimi-{ID}"`. You are the lead. Reviewers (in claudecode mode) will be teammates; kimi runs are NOT teammates — they are background bash processes.
+10. **Initialize a reviewer registry** (`name | agentId | role`). You append a row per reviewer spawn in Phase 2. Kimi runs are NOT agents — they are background bash processes tracked separately by the watchdog.
 
 ## Kimi invocation
 
@@ -131,7 +121,7 @@ The spec's `## Architecture & Implementation Plan → Work breakdown → Coders`
 
 ### Sanity check (lead, ~30 seconds)
 
-Same as `/implement`: union of `files:` lists matches "Files to create/modify"? Paths real? Scopes coherent? If broken — stop, report, ask whether to (a) patch the breakdown manually, or (b) send the spec back to `tasks/2-spec/`. If (b): move the spec back, reset `status: awaiting-approval`, remove the worktree, shut down the team.
+Same as `/implement`: union of `files:` lists matches "Files to create/modify"? Paths real? Scopes coherent? If broken — stop, report, ask whether to (a) patch the breakdown manually, or (b) send the spec back to `tasks/2-spec/`. If (b): move the spec back, reset `status: awaiting-approval`, and remove the worktree (no reviewers spawned yet at this phase).
 
 ### Fire kimi runs from the breakdown
 
@@ -269,7 +259,7 @@ Phase 1b is complete when the tester run has emitted `TESTER DONE.` with all tes
 
 Say: **"Kimi finished code and tests. Spawning 4–5 reviewers in parallel. I will wait for all reports before proceeding."**
 
-Phase 2 mirrors `/implement` exactly — same agents, same DEPTH-block rule, same runner guides. It runs after Phase 1 regardless of time spent or perceived code quality; hooks, linters, CI, and prior review rounds do not substitute.
+Phase 2 mirrors `/implement` exactly — same agents, same DEPTH-block rule, same background-agent spawning. It runs after Phase 1 regardless of time spent or perceived code quality; hooks, linters, CI, and prior review rounds do not substitute.
 
 Start only after Phase 1b is complete.
 
@@ -279,21 +269,42 @@ Same rules as `/implement`: if any changed file matches `.xml`/`.html`/`.css`/`.
 
 ### Reviewer list
 
-- **Code-Reviewer** — production code quality
-- **Test-Reviewer** — test quality and coverage
-- **Spec-Auditor** — spec compliance
-- **Security-Reviewer** — security and architecture
-- **UI-Reviewer** — visual verification *(only if frontend files changed)*
+| Reviewer | subagent_type | name | scope |
+|---|---|---|---|
+| Code-Reviewer | `Code-Reviewer` | `code-reviewer` | production code quality |
+| Test-Reviewer | `Test-Reviewer` | `test-reviewer` | test quality and coverage |
+| Spec-Auditor | `Spec-Auditor` | `spec-auditor` | spec compliance |
+| Security-Reviewer | `Security-Reviewer` | `security-reviewer` | security and architecture |
+| UI-Reviewer | `UI-Reviewer` | `ui-reviewer` | visual verification *(only if frontend files changed)* |
 
-Each reviewer reports with the standard `REVIEWER:`/`VERDICT:`/`DEPTH:`/`FINDINGS:`/`SUMMARY:` block. Reject reports without a DEPTH block — re-run that reviewer. Same rule if DEPTH counts look implausibly low for the diff.
+### Spawn reviewers in parallel
 
-### Mode A: `--reviewers claudecode`
+Spawn all reviewers in one batch (multiple `Agent` calls in a single response). Record each `agentId` in your reviewer registry. Each spawn uses:
 
-Read and follow `~/.claude/review/guides/claudecode-runner.md` — Phase 2 section. Reviewers are teammates of `impl-kimi-{ID}`.
+```
+Agent(
+  subagent_type: "{type}",
+  name: "{name}",
+  run_in_background: true,
+  prompt: "Read your instructions: ~/.claude/agents/{agent-file}.md
+Spec file: {spec_path}
+Working directory: {worktree_path}
+Base branch for diff: {base_branch}
+Review prompts: if `.claude/review_prompt.md` exists, read it — project-specific review rules (severity overrides, design decisions to treat as intentional). Apply them during your review.
+Report findings in the format from your agent file."
+)
+```
 
-### Mode B: `--reviewers opencode`
+UI-Reviewer gets two extra lines in its prompt:
 
-Read and follow `~/.claude/review/guides/opencode-runner.md` — Phase 2 section.
+> Changed files: {combined_changed_files}
+> URL hints: {any relevant URLs or pages you can identify from the spec}
+
+The completion notification is your done signal — do not poll for it. Each reviewer reports with the standard `REVIEWER:`/`VERDICT:`/`DEPTH:`/`FINDINGS:`/`SUMMARY:` block. Reject reports without a DEPTH block — re-run that reviewer (resume by `agentId` or spawn a fresh instance). Same rule if DEPTH counts look implausibly low for the diff.
+
+If UI-Reviewer reports `VERDICT: BLOCKED` (cannot start dev server, browser unavailable): spawn a replacement with a troubleshooting hint (check port, install deps, alternative start command). Retry up to 3 times. After 3 failures: document the reason in Known Concerns, add a manual UI check to Steps for Manual Review, and continue.
+
+Phase 2 is complete when every spawned reviewer has reported with a valid DEPTH block.
 
 ## Phase 3: Fix & Verify (lead-orchestrated, kimi-driven fixes)
 
@@ -374,9 +385,16 @@ For test fixes, fire one kimi run:
 
 ### Step 3: Verification (re-review)
 
-Follow the re-review procedure from the active reviewer runner guide:
-- **claudecode**: `~/.claude/review/guides/claudecode-runner.md` — Phase 3 Step 3
-- **opencode**: `~/.claude/review/guides/opencode-runner.md` — Phase 3 Step 3
+Resume — by `agentId` — every reviewer that had `MUST FIX` or `CRITICAL` findings (their preserved context means they remember their findings):
+
+> This is a **re-review** after fixes.
+>
+> **Primary:** verify each of your previous MUST FIX / CRITICAL items is resolved.
+> **Secondary (mandatory):** fixes may have introduced new issues in the modified files. Run your full audit procedure again on those files. Treat new methods, new error paths, and regressions in previously-clean code as in scope.
+>
+> Report `PASS` only if BOTH the primary items are resolved AND the secondary pass finds nothing new. Otherwise list all outstanding issues.
+
+The lead spot-checks fixes directly (Read/Grep affected lines) before re-review. Skip re-review for trivially confirmed fixes. If a reviewer's `agentId` is unresponsive after one status check — spawn a fresh instance with the same instructions.
 
 ### Step 4: Fix loop and escalation
 
@@ -389,7 +407,7 @@ After 7 iterations with findings unresolved:
 - If lead cannot fix — ask user: "These findings remain after 7 fix rounds and my own attempt. Options:
   (A) Continue to manual review — remaining issues documented in Known Concerns.
   (B) Abort — return spec to `tasks/3-ready/` with findings attached as implementation notes."
-- If (B): revert worktree changes, move spec back, shut down teammates.
+- If (B): revert worktree changes, move spec back.
 
 ## Finalization (Lead)
 
@@ -446,7 +464,7 @@ Run inside the worktree directory when `auto_branch = true`:
 
 6. If `auto_branch = true`: `wt remove task/{ID}-{slug}`.
 
-7. Shut down all teammates (only reviewers exist as teammates; no Coder/Tester teammates to shut down): send `{type: "shutdown_request"}` to each.
+7. Background agents complete on their own — no shutdown step needed.
 
 8. Output:
    - Implementation Summary (brief)
@@ -457,8 +475,9 @@ Run inside the worktree directory when `auto_branch = true`:
 ## Compact instructions
 
 This command can run for several hours. On compaction, preserve:
-- `{ID}`, `{spec_path}`, `{worktree_path}`, `{reviewer_mode}`, `{base_branch}`.
+- `{ID}`, `{spec_path}`, `{worktree_path}`, `{base_branch}`.
 - For each active kimi run: `{purpose, log_path, bash_shell_id, strikes, retries}`.
+- The reviewer registry (`name | agentId | role`) — needed to resume completed reviewers in Phase 3.
 - Per-phase status: which Coder scopes are DONE, whether Tester is DONE, which reviewers reported (with verbatim VERDICT/SUMMARY), current Phase 3 iteration count.
 - Combined `{combined_changed_files}` once Phase 1a is complete.
 - Last failing test output, if any.

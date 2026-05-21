@@ -1,18 +1,37 @@
-Implement an approved specification using an agent team.
+Implement an approved specification using addressable background agents.
 
-All agents in this workflow are **teammates** spawned via `TeamCreate` + `Agent` with `team_name`. Never use the `Agent` tool without `team_name` — standalone subagents break coordination, messaging, and idle tracking.
+All agents in this workflow are spawned via the `Agent` tool with `run_in_background: true` and a `name`. You are the lead — you coordinate, you don't code or review.
 
-Begin by saying to the user: **"I will spawn an agent team to implement this spec. I am the lead — I coordinate, I don't code or review."**
+Begin by saying to the user: **"I will spawn background agents to implement this spec. I am the lead — I coordinate, I don't code or review."**
 
-## Reviewer mode (required)
+<critical>
+Record the `agentId` (format `a...-...`) returned by every `Agent` spawn into your registry. A `name` addresses an agent **only while it is running**; once an agent completes, it is reachable only by `agentId`. Coders and the Tester complete before Phase 3 fix rounds — so you resume them there by `agentId`. Lose the id and the fix loop silently breaks.
+</critical>
 
-`$ARGUMENTS` must include `--reviewers claudecode` or `--reviewers opencode`. If missing — **ask the user before proceeding:**
+## Coordination model
 
-> Which reviewer mode?
-> - `claudecode` — Claude Code teammates (full coordination, re-review with context, UI review supported)
-> - `opencode` — OpenCode `--pure` via GitHub Copilot (stateless, cheaper)
+- **Spawn** with `Agent(subagent_type: "...", name: "...", run_in_background: true, prompt: "...")`. The call returns immediately with an `agentId`; the agent runs asynchronously.
+- **Completion** arrives as a notification carrying the agent's final message. The notification is your done signal — you do not poll for it.
+- **Address a running agent** by `name`: `SendMessage(to: "coder-1", ...)`.
+- **Resume a completed agent** by `agentId`: `SendMessage(to: "{agentId}", ...)` — its context is preserved, so it remembers its prior work.
+- **Done conventions** (`CODER DONE.`, `TESTER DONE.`, `REVIEWER: ...`) are a *content* convention for the final message so you can parse role and result. The completion notification is the *detection* mechanism.
 
-Parse `$ARGUMENTS` to extract both the task identifier and `--reviewers {mode}`. Store `{reviewer_mode}` for Phase 2 and 3.
+### Agent registry
+
+Maintain a small table in your working context, one row per spawn:
+
+```
+name        | agentId      | role          | files_owned
+coder-1     | a1b2-...     | Coder         | models/order.py, ...
+tester      | a3c4-...     | Tester        | tests/
+code-review | a5d6-...     | Code-Reviewer | —
+```
+
+Append a row immediately after each spawn. This table is how you reach completed agents in later phases.
+
+### Liveness backstop
+
+Completion notifications cover the normal case. If an agent produces no completion notification after ~15 minutes, send `STATUS CHECK: progress? blockers?` by `name`. If still no response after one more interval, the lead investigates directly: read the agent's last output and the relevant files, then either resume it with a specific hint or take over the task. Max **3 restart attempts** per role; after that the lead does the work directly.
 
 ## Quality mandate
 
@@ -21,50 +40,19 @@ Thoroughness over speed. This task may run for hours — that is expected and ac
 ## Setup
 
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
-2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`.
+2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`. `$ARGUMENTS` is just the task identifier.
 3. Read the full specification.
 4. Branch and worktree setup:
-   - If `auto_branch = true`: fetch latest `dev` branch (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All teammates work inside the worktree directory.
+   - If `auto_branch = true`: fetch latest `dev` branch (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All agents work inside the worktree directory.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
-5. **Review prompt setup** (run inside `{worktree_path}`): if the project has `.claude/review_prompt.md`, reviewers will apply it as project-specific rules (severity overrides, design decisions to treat as intentional). In opencode mode, run the symlink setup from `~/.claude/review/guides/opencode-runner.md` inside the worktree to create agent symlinks under `.claude/agents-global/` (required because `opencode --pure` rejects paths outside the project).
+5. **Review prompt setup:** if the project has `.claude/review_prompt.md`, reviewers will apply it as project-specific rules (severity overrides, design decisions to treat as intentional). Note its path to pass to reviewers.
 6. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
 7. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers will need it.
-8. **Create the team:** `TeamCreate` with `team_name: "impl-{ID}"`. You are the lead.
+8. Initialize an empty agent registry (`name | agentId | role | files_owned`). You append a row per spawn.
 
-## Team & Communication
+## Agents — sequential phases
 
-All agents are spawned as **teammates** (`team_name: "impl-{ID}"`). The lead has:
-- **Live messaging** — SendMessage to any teammate, including idle ones.
-- **Automatic delivery** — teammate messages arrive as conversation turns.
-- **Idle notifications** — system notifies when a teammate goes idle.
-
-**Done signals are mandatory.** Only `CODER DONE`, `TESTER DONE`, or `REVIEWER: ...` confirms completion. `idle_notification` alone is NOT a status update — it is the default post-turn state and carries no information about progress.
-
-### Watchdog Protocol (mandatory)
-
-Teammates that go idle may be genuinely waiting OR silently stuck. Never rely on passive waiting. For every teammate you spawn:
-
-1. **On spawn**, start a 10-minute background timer:
-   ```
-   Bash(run_in_background=true, command="sleep 600 && echo watchdog:{teammate_name}")
-   ```
-2. **When the timer fires**, check the teammate's activity signal. The signal depends on role:
-   - **Coder** — mtimes of files in its Work breakdown `files:` list (`stat -c '%Y %n' {files} | sort -n`). Fresh = any file modified <5 min ago.
-   - **Tester** — mtimes of any file under `tests/` or matching `*test*` in the worktree. Fresh = any such file modified <5 min ago.
-   - **Code-Reviewer / Test-Reviewer / Spec-Auditor / Security-Reviewer** — reviewers don't write files. Activity signal is teammate message count since last tick (check your conversation). Fresh = ≥1 message from the reviewer in the last 10 min (including PROGRESS heartbeats).
-   - **UI-Reviewer** — either a message in the last 10 min OR new files under `/tmp/` / worktree matching `*.png` (screenshots).
-3. **Classify the tick:**
-   - Fresh signal → teammate is working. Restart the timer, reset strike counter.
-   - Stale signal → send `STATUS CHECK: progress? blockers?`, restart the timer, add 1 strike.
-4. **Strike escalation** (strikes are consecutive stale ticks):
-   - **2 strikes** (~20 min no activity) → final ping: "No progress detected. Reply within the next turn or you will be replaced."
-   - **3 strikes** (~30 min) → kill the teammate (`{type: "shutdown_request"}`; `tmux kill-pane` if unresponsive), spawn a replacement with narrower scope and a summary of completed work.
-5. **Unstick loopers.** If a teammate reports the same error repeatedly — intervene with a specific hint (code pointer, alternative approach, spec clarification) instead of waiting.
-6. **Crash recovery.** If a teammate's process terminates (pane closes, context overflow), read their last output, then spawn a replacement with (a) narrowed context, (b) summary of completed work, (c) specific remaining tasks. Max **3 restart attempts** per teammate; after that the lead takes over directly.
-
-## Agent Team — 6 teammates, sequential phases
-
-Each teammate reads their agent file for full instructions.
+Each agent reads its agent file for full instructions.
 Complete every phase in sequence. All phases are mandatory.
 
 ---
@@ -82,26 +70,30 @@ Before spawning, verify the breakdown isn't broken:
 - Are file paths real (or explicitly noted as new)?
 - Does each coder's scope make sense given the file list?
 
-If the breakdown is broken (gaps, overlaps, nonsense scopes): **do not silently fix it**. Stop, report the issue to the user, and ask whether to (a) patch the breakdown manually before continuing, or (b) send the spec back to `tasks/2-spec/` for the Architect to redo. If (b): move the spec file back from `tasks/4-in-progress/` to `tasks/2-spec/`, reset frontmatter `status` from `in-progress` to `awaiting-approval`, remove the worktree if one was created (`wt remove task/{ID}-{slug}`), and shut down any teammates already spawned. The Critic should have caught this — flag it as a Critic miss too.
+If the breakdown is broken (gaps, overlaps, nonsense scopes): **do not silently fix it**. Stop, report the issue to the user, and ask whether to (a) patch the breakdown manually before continuing, or (b) send the spec back to `tasks/2-spec/` for the Architect to redo. If (b): move the spec file back from `tasks/4-in-progress/` to `tasks/2-spec/`, reset frontmatter `status` from `in-progress` to `awaiting-approval`, remove the worktree if one was created (`wt remove task/{ID}-{slug}`), and stop any agents already spawned. The Critic should have caught this — flag it as a Critic miss too.
 
 #### Spawn Coders from the breakdown
 
-For each Coder listed in Work breakdown, spawn it as a teammate (`name: "coder-N"`, `team_name: "impl-{ID}"`). Send the task via message:
+For each Coder listed in Work breakdown, spawn it as a background agent and record its `agentId`:
 
-> Read your instructions: `~/.claude/agents/coder.md`
-> Spec file: `{spec_path}`
-> Working directory: `{worktree_path}`
-> **Your scope** (from spec → Work breakdown → coder-N): {scope text from spec}
-> **Files you own:** {files list from spec}
-> **Do not touch any other files in the spec** — they belong to other coders.
-> Implement your scope. Message me when done with `CODER DONE.` and list of changed files.
-> **Heartbeat:** every 10 min of work OR 5 file edits, send a one-line `PROGRESS: [just finished] → [doing next]`. If blocked for more than 5 min, send `BLOCKED: [reason]`. Silent idling is not acceptable — you are watchdogged on 10-min intervals.
+```
+Agent(
+  subagent_type: "Coder",
+  name: "coder-N",
+  run_in_background: true,
+  prompt: "Read your instructions: ~/.claude/agents/coder.md
+Spec file: {spec_path}
+Working directory: {worktree_path}
+Your scope (from spec → Work breakdown → coder-N): {scope text from spec}
+Files you own: {files list from spec}
+Do not touch any other files in the spec — they belong to other coders.
+Implement your scope. Your final message must be `CODER DONE.` with the list of changed files."
+)
+```
 
-For single-coder tasks (one entry in Work breakdown), the message is the same — just one teammate, scope and file list copied from the spec.
+For single-coder tasks (one entry in Work breakdown), the spawn is the same — just one agent, scope and file list copied from the spec.
 
-Monitor: if any Coder goes idle without a done signal — send a status check.
-
-**Phase 1a is complete when all Coders from the breakdown have messaged:** `CODER DONE.` with changed files lists.
+**Phase 1a is complete when every Coder has sent its completion notification with `CODER DONE.`** and a changed-files list.
 
 ---
 
@@ -113,27 +105,30 @@ Start only after Phase 1a is complete.
 
 There is always exactly **one** Tester, regardless of how many Coders ran. Parallel testers are intentionally excluded — they conflict on shared test infrastructure (DBs, fixtures, ports). One Tester sees all the code and writes tests for the full implementation.
 
-Spawn **Tester** as a teammate (`name: "tester"`, `team_name: "impl-{ID}"`).
-Send the task via message:
+Spawn the Tester as a background agent and record its `agentId`:
 
-> Read your instructions: `~/.claude/agents/tester.md`
-> Spec file: `{spec_path}`
-> Working directory: `{worktree_path}`
-> Coding is done. Changed files: {combined changed files from all coders}
-> Write tests for the implementation. Message me when done with `TESTER DONE.` and test results.
-> If you find a production bug, message me with `PRODUCTION BUG FOUND` and details, including the affected file path so I can route the fix to the right coder.
-> **Heartbeat:** every 10 min of work OR 5 file edits, send a one-line `PROGRESS: [just finished] → [doing next]`. If blocked for more than 5 min, send `BLOCKED: [reason]`. Silent idling is not acceptable — you are watchdogged on 10-min intervals.
+```
+Agent(
+  subagent_type: "Tester",
+  name: "tester",
+  run_in_background: true,
+  prompt: "Read your instructions: ~/.claude/agents/tester.md
+Spec file: {spec_path}
+Working directory: {worktree_path}
+Coding is done. Changed files: {combined changed files from all coders}
+Write tests for the implementation. Your final message must be `TESTER DONE.` with the test count and results.
+If you find a production bug, message me with `PRODUCTION BUG FOUND` and details, including the affected file path so I can route the fix to the right coder."
+)
+```
 
-If Tester reports `PRODUCTION BUG FOUND`:
-- Map the affected file → owning Coder via Work breakdown's `files:` lists. Message that Coder.
-- Wait for Coder's `CODER FIX APPLIED` message.
-- Message Tester to re-run affected tests.
+If the Tester reports `PRODUCTION BUG FOUND`:
+- Map the affected file → owning Coder via the registry's `files_owned`. Resume that Coder by `agentId` with the bug details.
+- Wait for the Coder's `CODER FIX APPLIED` message.
+- Resume the Tester by `agentId` to re-run affected tests.
 - Repeat until all bugs resolved.
 - Maximum **7 bug-fix rounds**. If bugs persist after 7 rounds — lead investigates directly: read the failing test, read the production code, diagnose and fix.
 
-Monitor: if Tester goes idle without a done signal — send a status check.
-
-**Phase 1b is complete when Tester messages:** `TESTER DONE.` with test count and results.
+**Phase 1b is complete when the Tester sends `TESTER DONE.`** with test count and results.
 
 ---
 
@@ -147,7 +142,7 @@ This phase runs after Phase 1 regardless of time spent or code quality. All revi
 
 #### Determine if UI review is needed
 
-Check the changed files list from Coder. If ANY file matches a frontend pattern — spawn the UI-Reviewer:
+Check the changed files list from the Coders. If ANY file matches a frontend pattern — spawn the UI-Reviewer:
 - `.xml`, `.html`, `.css`, `.scss`, `.less` — always
 - `.js`, `.jsx`, `.ts`, `.tsx`, `.vue`, `.svelte` — always
 - `.qweb`, `.mako`, `.jinja2` — template files
@@ -156,13 +151,40 @@ If all changes are purely backend (`.py`, `.sql`, config `.json`) — skip UI-Re
 
 #### Reviewer list
 
-- **Code-Reviewer** — production code quality
-- **Test-Reviewer** — test quality and coverage
-- **Spec-Auditor** — spec compliance
-- **Security-Reviewer** — security and architecture
-- **UI-Reviewer** — visual verification *(only if frontend files changed)*
+| Reviewer | subagent_type | name | scope |
+|---|---|---|---|
+| Code-Reviewer | `Code-Reviewer` | `code-reviewer` | production code quality |
+| Test-Reviewer | `Test-Reviewer` | `test-reviewer` | test quality and coverage |
+| Spec-Auditor | `Spec-Auditor` | `spec-auditor` | spec compliance |
+| Security-Reviewer | `Security-Reviewer` | `security-reviewer` | security and architecture |
+| UI-Reviewer | `UI-Reviewer` | `ui-reviewer` | visual verification *(only if frontend files changed)* |
 
-Each reviewer will report in this format (defined in their agent file):
+#### Spawn reviewers in parallel
+
+Spawn all reviewers in one batch (multiple `Agent` calls in a single response). Record each `agentId`. Each spawn uses:
+
+```
+Agent(
+  subagent_type: "{type}",
+  name: "{name}",
+  run_in_background: true,
+  prompt: "Read your instructions: ~/.claude/agents/{agent-file}.md
+Spec file: {spec_path}
+Working directory: {worktree_path}
+Base branch for diff: {base_branch}
+Review prompts: if `.claude/review_prompt.md` exists, read it — it contains project-specific review rules (severity overrides, design decisions to treat as intentional). Apply them during your review.
+Report findings in the format from your agent file."
+)
+```
+
+UI-Reviewer gets two extra lines in its prompt:
+
+> Changed files: {combined changed files from all coders}
+> URL hints: {any relevant URLs or pages you can identify from the spec}
+
+#### Report format
+
+Each reviewer reports in this format (defined in its agent file):
 ```
 REVIEWER: {role}
 VERDICT: CLEAN/SECURE/COMPLIANT | HAS FINDINGS
@@ -175,17 +197,16 @@ FINDINGS: ...
 SUMMARY: X findings (Y MUST FIX, Z NIT/CONCERN)
 ```
 
-**Reject reports without a DEPTH block.** The DEPTH counts are how you detect shallow reviews. If a reviewer reports `VERDICT` and `FINDINGS` but omits `DEPTH`, re-run that reviewer. Same rule if counts look implausibly low for the diff (e.g. "Methods audited: 2" on a 20-method diff).
+**Reject reports without a DEPTH block.** The DEPTH counts are how you detect shallow reviews. If a reviewer reports `VERDICT` and `FINDINGS` but omits `DEPTH`, re-run that reviewer. Same rule if counts look implausibly low for the diff (e.g. "Methods audited: 2" on a 20-method diff). To re-run, resume the reviewer by `agentId` and ask for the missing DEPTH block, or spawn a fresh instance.
 
----
+#### UI-Reviewer troubleshooting
 
-#### Mode A: `--reviewers claudecode`
+If UI-Reviewer reports `VERDICT: BLOCKED` (cannot start dev server, browser unavailable):
+- Spawn a replacement with a troubleshooting hint (check port, install deps, try alternative start command).
+- Retry up to **3 times**, each with a different hint.
+- After 3 failed attempts: document the reason in Known Concerns, add a manual UI check to Steps for Manual Review, and continue.
 
-Read and follow `~/.claude/review/guides/claudecode-runner.md` — Phase 2 section.
-
-#### Mode B: `--reviewers opencode`
-
-Read and follow `~/.claude/review/guides/opencode-runner.md` — Phase 2 section.
+**Phase 2 is complete when every spawned reviewer has reported with a valid DEPTH block.**
 
 ---
 
@@ -207,21 +228,30 @@ If zero `MUST FIX` / `CRITICAL` across all reviewers — skip to Finalization.
 
 #### Step 2: Fix round
 
-Group production fixes by owning Coder (use Work breakdown's `files:` lists to map file → coder). Message each affected Coder only with their fixes:
+Group production fixes by owning Coder (use the registry's `files_owned` to map file → coder). Resume each affected Coder **by its `agentId`** — these Coders completed in Phase 1a, so `name` no longer reaches them:
+
 > These findings need to be fixed. For each item: severity, source reviewer, file:line, description.
-> After fixing, message me: `CODER FIX ROUND DONE.` Include a note if any API or behavior changed.
+> After fixing, your message must be `CODER FIX ROUND DONE.` Include a note if any API or behavior changed.
 
 If any Coder reports API/behavior changes — forward those to the Tester.
 
-Message Tester with all test fixes (if any):
+Resume the Tester by `agentId` with all test fixes (if any):
+
 > These test findings need to be fixed. For each item: severity, source reviewer, test file, description.
-> Re-run all tests after fixes. Then message me: `TESTER FIX ROUND DONE.`
+> Re-run all tests after fixes. Then your message must be `TESTER FIX ROUND DONE.`
 
-#### Step 3: Verification
+#### Step 3: Verification (re-review)
 
-Follow the re-review procedure from the active reviewer runner guide:
-- **claudecode:** `~/.claude/review/guides/claudecode-runner.md` — Phase 3 Step 3
-- **opencode:** `~/.claude/review/guides/opencode-runner.md` — Phase 3 Step 3
+Resume — by `agentId` — every reviewer that had `MUST FIX` or `CRITICAL` findings (their preserved context means they remember their findings):
+
+> This is a **re-review** after fixes.
+>
+> **Primary:** verify each of your previous MUST FIX / CRITICAL items is resolved.
+> **Secondary (mandatory):** fixes may have introduced new issues in the modified files. Run your full audit procedure again on those files. Treat new methods, new error paths, and regressions in previously-clean code as in scope.
+>
+> Report `PASS` only if BOTH the primary items are resolved AND the secondary pass finds nothing new. Otherwise list all outstanding issues.
+
+The lead spot-checks fixes directly (Read/Grep affected lines) before re-review. Skip re-review for trivially confirmed fixes. If a reviewer's `agentId` is unresponsive after one status check — spawn a fresh instance with the same instructions (primary verification + full secondary audit).
 
 #### Step 4: Fix loop and escalation
 
@@ -234,7 +264,7 @@ After 7 iterations with findings still unresolved:
 - If lead cannot fix — **ask user**: "These findings remain after 7 fix rounds and my own attempt. Options:
   (A) Continue to manual review — remaining issues documented in Known Concerns.
   (B) Abort — return spec to `tasks/3-ready/` with findings attached as implementation notes."
-- If user picks B: revert worktree changes, move spec back, shutdown teammates.
+- If user picks B: revert worktree changes, move spec back.
 
 ---
 
@@ -244,18 +274,18 @@ Say: **"Fix rounds complete. Running gate check, final test suite, then committi
 
 ### Gate check — verify before continuing:
 
-- Phase 1a — **every** Coder from Work breakdown sent `CODER DONE`? If NO → message the missing one(s) NOW.
-- Phase 1b — Tester sent `TESTER DONE` with test count? If NO → message Tester NOW.
-- Phase 2 — Code-Reviewer reported? If NO → message or spawn NOW.
-- Phase 2 — Test-Reviewer reported? If NO → message or spawn NOW.
-- Phase 2 — Spec-Auditor reported? If NO → message or spawn NOW.
-- Phase 2 — Security-Reviewer reported? If NO → message or spawn NOW.
-- Phase 2 — UI-Reviewer reported? (only if spawned) If NO → message or spawn NOW.
+- Phase 1a — **every** Coder from Work breakdown sent `CODER DONE`? If NO → resume the missing one(s) by `agentId` NOW.
+- Phase 1b — Tester sent `TESTER DONE` with test count? If NO → resume Tester NOW.
+- Phase 2 — Code-Reviewer reported? If NO → spawn NOW.
+- Phase 2 — Test-Reviewer reported? If NO → spawn NOW.
+- Phase 2 — Spec-Auditor reported? If NO → spawn NOW.
+- Phase 2 — Security-Reviewer reported? If NO → spawn NOW.
+- Phase 2 — UI-Reviewer reported? (only if spawned) If NO → spawn NOW.
 - Phase 3 — Fix iterations completed (or no MUST FIX items)? If NO → run NOW.
 
 ### Final test run
 
-Message Tester: "Run the full test suite and report results."
+Resume the Tester by `agentId`: "Run the full test suite and report results."
 All tests pass → proceed to Steps. Tests fail → back to Phase 3 Step 2 for one more fix round.
 
 ### Steps
@@ -284,7 +314,7 @@ Run inside the worktree directory when `auto_branch = true`:
 
 6. If `auto_branch = true`: `wt remove task/{ID}-{slug}`.
 
-7. Shutdown all teammates: send `{type: "shutdown_request"}` to each.
+7. Background agents complete on their own — no shutdown step needed.
 
 8. Output:
    - Implementation Summary (brief)

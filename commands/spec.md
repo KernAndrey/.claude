@@ -1,4 +1,4 @@
-Generate a specification from a draft task using an agent team. This command is orchestration-only — the Analyst, Architect, and Critic bodies live in `~/.claude/agents/spec-{analyst,architect,critic}.md`.
+Generate a specification from a draft task using addressable background agents. This command is orchestration-only — the Analyst, Architect, and Critic bodies live in `~/.claude/agents/spec-{analyst,architect,critic}.md`.
 
 ## 0. Setup
 
@@ -99,22 +99,28 @@ When a blocker is later resolved, update the same entry in place:
 4. For each open blocker, in order:
    - Print the stored `topic`, `question`, `context`, `expertise-needed`, and `deferred-history`.
    - Ask the user using the defer-aware prompt format (reuse the stored context in the prompt, don't re-explore).
-   - On answer: update the blocker entry (status → `resolved-by-user`, append deferred-history line, fill resolution). Remember which teammate to re-invoke based on who raised the blocker and the expertise-needed tag (`business` → Analyst, `architecture` → Architect, sometimes both).
+   - On answer: update the blocker entry (status → `resolved-by-user`, append deferred-history line, fill resolution). Remember which agent to re-invoke based on who raised the blocker and the expertise-needed tag (`business` → Analyst, `architecture` → Architect, sometimes both).
    - On defer: append a new `deferred-history` line `{TODAY}: deferred again`. Keep `status: open`. Move to the next.
-5. Build a set of affected teammates from the resolved blockers. If zero blockers got resolved, tell the user "No blockers were resolved this run. Spec unchanged; come back later." and stop.
+5. Build a set of affected agents from the resolved blockers. If zero blockers got resolved, tell the user "No blockers were resolved this run. Spec unchanged; come back later." and stop.
 
-## 2. Phase 2 — Agent team
+## 2. Phase 2 — Background agents
 
-Create the team once: `TeamCreate(team_name: "spec-{ID}")`. All three teammates live in this team and stay alive across the phase so you can `SendMessage` follow-ups.
+Spawn each agent via `Agent(subagent_type: "...", name: "...", run_in_background: true, prompt: "...")`. The call returns an `agentId` (format `a...-...`); the agent runs asynchronously and notifies you when it completes, its final message being the result.
 
-Shared context to pass in every teammate message:
+<critical>
+Record the `agentId` from every spawn into a small registry (`name | agentId | role`). A `name` reaches an agent **only while it is running**; once it completes, resume it only by `agentId` — and resuming preserves its context, so it remembers its prior work. This matters for fix rounds and re-checks, which happen after the agent has completed.
+</critical>
+
+**Addressing:** running agent → `SendMessage(to: "spec-analyst")`; completed agent → `SendMessage(to: "{agentId}")`. The completion notification is your done signal — do not poll for it.
+
+Shared context to pass in every agent prompt:
 - Draft path (or existing spec path on resume) — **instruct agents to read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified facts about the codebase) from the draft file. These two sections are the persistent source of truth — inline prompt context is supplementary.**
 - User's Phase 1 answers (new runs) or resolved-blocker answers (resume runs) — inline as supplementary context
 - Project `CLAUDE.md` path
 
 ### 2a. Analyst
 
-**New runs:** Spawn `spec-analyst` (`Agent(name: "spec-analyst", team_name: "spec-{ID}")`). Send:
+**New runs:** Spawn `Agent(subagent_type: "Spec-Analyst", name: "spec-analyst", run_in_background: true, prompt: "...")` and record its `agentId`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-analyst.md`
 > Spec output path: `tasks/2-spec/{ID}-{slug}.md`
@@ -123,9 +129,8 @@ Shared context to pass in every teammate message:
 > User Phase 1 answers: {inline all answers — supplementary context}
 > Project CLAUDE.md: `{path}`
 > Write the business sections (including Key Constraints, Assumptions, and one `[SENTINEL]` marker in Behavior). Signal `SPEC ANALYST DONE.` when ready. Escalate ambiguities with `SPEC ANALYST QUESTION FOR USER` and wait for my reply.
-> Heartbeat: every 10 min of work OR 5 file edits send a one-line `PROGRESS: [just finished] → [doing next]`. If blocked for more than 5 min, send `BLOCKED: [reason]`.
 
-**Resume runs, business blockers resolved:** Re-message (team persists, but re-spawn if needed):
+**Resume runs, business blockers resolved:** Resume the Analyst by its `agentId` (context preserved):
 
 > `FIX ROUND.` Blockers resolved since last run:
 > - b-N: {question} → answer: {text}
@@ -139,11 +144,11 @@ Shared context to pass in every teammate message:
 Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 - On `SPEC ANALYST QUESTION FOR USER`: extract topic, context, question, options, expertise. Format for the user using the defer-aware prompt (embed context as the "Вопрос N/M" background). On answer → `SendMessage(to: "spec-analyst", "ANSWER: <text>")`. On defer → create a `### b-N` entry in the spec's Blockers section via Edit, then `SendMessage(to: "spec-analyst", "DEFERRED: b-N")`.
 - On `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`: break.
-- On idle > 10 min without signal: send `STATUS CHECK` ping. On second silence, surface to the user.
+- If no completion notification after ~15 min: send `STATUS CHECK` by `name` (it is still running). On second silence, surface to the user.
 
 ### 2b. Architect
 
-**New runs:** Spawn `spec-architect`. Send:
+**New runs:** Spawn `Agent(subagent_type: "Spec-Architect", name: "spec-architect", run_in_background: true, prompt: "...")` and record its `agentId`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-architect.md`
 > Spec path: `tasks/2-spec/{ID}-{slug}.md` (business sections already populated)
@@ -153,19 +158,18 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 > Project CLAUDE.md: `{path}`
 > Before writing the Architecture section, produce the three "Deep codebase exploration" artifacts (analogous features ≥2, vendor/base classes read, integration call-sites) from your instructions file, and attach them under "Exploration evidence" in your `SPEC ARCHITECT DONE.` message. Treat vendor code inside the repo as part of the project.
 > Fill the `## Architecture & Implementation Plan` section in place. Signal `SPEC ARCHITECT DONE.` when ready. Escalate ambiguities with `SPEC ARCHITECT QUESTION FOR USER` and wait.
-> Heartbeat: as above.
 
-**Resume runs, architecture blockers resolved:** Re-message analogously with `FIX ROUND.` and the resolved blocker answers.
+**Resume runs, architecture blockers resolved:** Resume the Architect by its `agentId` with `FIX ROUND.` and the resolved blocker answers.
 
 **Message loop:** same shape as 2a, but with `spec-architect` and the Architect signal names.
 
 ### 2c. Critics (two agents in parallel)
 
-Spawn both critics as teammates in the same team. They run in parallel — no dependencies between them.
+Spawn both critics as background agents in one batch (two `Agent` calls in a single response). They run in parallel — no dependencies between them. Record both `agentId`s.
 
 #### 2c-i. Architecture Critic
 
-Spawn `spec-critic-arch` (`Agent(name: "spec-critic-arch", team_name: "spec-{ID}")`). Send:
+Spawn `Agent(subagent_type: "Spec-Critic-Arch", name: "spec-critic-arch", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-arch.md`
 > Spec path: `tasks/2-spec/{ID}-{slug}.md`
@@ -175,11 +179,10 @@ Spawn `spec-critic-arch` (`Agent(name: "spec-critic-arch", team_name: "spec-{ID}
 > Project CLAUDE.md: `{path}`
 > {On resume:} `RESUMED_RUN: true`
 > Run your full verification and lens pass (Pass 1 + Lenses A–G). Signal `SPEC ARCH CRITIC REPORT` when done.
-> Heartbeat: as above.
 
 #### 2c-ii. Business Critic
 
-Spawn `spec-critic-business` (`Agent(name: "spec-critic-business", team_name: "spec-{ID}")`). Send:
+Spawn `Agent(subagent_type: "Spec-Critic-Business", name: "spec-critic-business", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-business.md`
 > Spec path: `tasks/2-spec/{ID}-{slug}.md`
@@ -189,38 +192,31 @@ Spawn `spec-critic-business` (`Agent(name: "spec-critic-business", team_name: "s
 > Project CLAUDE.md: `{path}`
 > {On resume:} `RESUMED_RUN: true`
 > Run your full business quality lens pass (Lenses G–R). Signal `SPEC BUSINESS CRITIC REPORT` when done.
-> Heartbeat: as above.
 
 **Message loops:** run both in parallel. Both critics rarely escalate; if either does, handle like any other `QUESTION FOR USER`.
 
-#### Optional: GPT-5.4 third critic
-
-If `which opencode` succeeds, launch a GPT-5.4 architecture critic in parallel with the two teammates. Read and follow `~/.claude/review/guides/opencode-runner.md` for the full subprocess lifecycle (launch, parsing, validation, timeout, retry). Use `spec-critic-arch` as the agent and `github-copilot/gpt-5.4` as the model. Pass the same inputs as the arch critic above (spec path, working directory, Phase 1 context, CLAUDE.md path, draft path with `## Decisions`, `RESUMED_RUN: true` on resume runs).
-
-**Important:** opencode in `--pure` mode cannot read files outside the project directory (`~/.claude/agents/` is auto-rejected). Use the symlink `.claude/agents-global/spec-critic-arch.md` instead. If the symlink doesn't exist, run the full setup from `~/.claude/review/guides/opencode-runner.md` (creates symlinks and adds git exclude entry).
-
-The GPT-5.4 critic runs non-interactively — it cannot participate in the `QUESTION FOR USER` message loop. Add to its prompt: "Do not emit SPEC ARCH CRITIC QUESTION FOR USER. If you encounter ambiguity, record it as a finding instead." Also add: "Read `## Decisions` in the draft file and verify EVERY numbered decision is reflected in the spec. Any mismatch = CRITICAL finding." The teammate critics handle all interactive escalation.
-
-Wait for all critics (both teammates + GPT-5.4 if launched) to complete before proceeding.
+Wait for both critics to complete before proceeding.
 
 ### 2d. Apply findings
 
-Merge findings from all critics (arch critic, business critic, and GPT-5.4 critic if launched). This includes `EMERGENT QUESTIONS FOR USER` from all sources — they all feed into Phase 3. Deduplicate findings that flag the same issue — keep the more specific description. If the GPT-5.4 critic was not launched or failed — proceed with the two teammate reports only.
+Merge findings from both critics (arch critic, business critic). This includes `EMERGENT QUESTIONS FOR USER` from both sources — they all feed into Phase 3. Deduplicate findings that flag the same issue — keep the more specific description.
+
+The Analyst, Architect, and both Critics have completed by now — resume each **by its `agentId`** (not by name). Their preserved context means they remember their prior work.
 
 After reports are collected:
 
-- **Business findings** (`route: analyst`) → `SendMessage(to: "spec-analyst", ...)` with the specific findings, request fixes. Run the Analyst message loop again until `SPEC ANALYST FIX ROUND DONE.`.
-- **Architecture findings** (`route: architect`) → `SendMessage(to: "spec-architect", ...)`. Run the Architect message loop until `SPEC ARCHITECT FIX ROUND DONE.`.
-- **After fixes**: optionally re-check with the appropriate critic:
-  - Business findings: `SendMessage(to: "spec-critic-business", "RE-CHECK OF: [f-1, f-3]")` → wait for `SPEC BUSINESS CRITIC RE-CHECK DONE.`
-  - Architecture findings: `SendMessage(to: "spec-critic-arch", "RE-CHECK OF: [f-2, f-4]")` → wait for `SPEC ARCH CRITIC RE-CHECK DONE.`
-- **Maximum 2 fix rounds per teammate.** After two rounds, unresolved business concerns stay in `Edge Cases & Risks`, unresolved architectural concerns stay in `Open architectural questions`. Phase 3 picks them up if they need user input.
-- **Tiny edits** (typo, missing bullet): Lead may Edit the spec file directly instead of round-tripping through a teammate.
+- **Business findings** (`route: analyst`) → resume the Analyst by `agentId` with the specific findings, request fixes. Run the Analyst message loop again until `SPEC ANALYST FIX ROUND DONE.`.
+- **Architecture findings** (`route: architect`) → resume the Architect by `agentId`. Run the Architect message loop until `SPEC ARCHITECT FIX ROUND DONE.`.
+- **After fixes**: optionally re-check with the appropriate critic, resumed by `agentId`:
+  - Business findings: `SendMessage(to: "{business-critic agentId}", "RE-CHECK OF: [f-1, f-3]")` → wait for `SPEC BUSINESS CRITIC RE-CHECK DONE.`
+  - Architecture findings: `SendMessage(to: "{arch-critic agentId}", "RE-CHECK OF: [f-2, f-4]")` → wait for `SPEC ARCH CRITIC RE-CHECK DONE.`
+- **Maximum 2 fix rounds per agent.** After two rounds, unresolved business concerns stay in `Edge Cases & Risks`, unresolved architectural concerns stay in `Open architectural questions`. Phase 3 picks them up if they need user input.
+- **Tiny edits** (typo, missing bullet): Lead may Edit the spec file directly instead of round-tripping through an agent.
 - **`EMERGENT QUESTIONS FOR USER`**: deferred to Phase 3, do not resolve here.
 
 ## 3. Phase 3 — Post-spec clarification
 
-Many open questions only become visible after Analyst describes behavior, Architect lays out files, and Critic hunts gaps. Phase 1 catches what's askable upfront; Phase 3 catches what emerges from the team's work.
+Many open questions only become visible after Analyst describes behavior, Architect lays out files, and Critic hunts gaps. Phase 1 catches what's askable upfront; Phase 3 catches what emerges from the agents' work.
 
 ### Collect open questions
 

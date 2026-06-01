@@ -215,10 +215,42 @@ kimi never blocks a commit on its own.
   globally by editing `~/.claude/git-hooks/pre-commit` to short-
   circuit.
 
+## Parallel pre-review fast-path
+
+For the autonomous SDD workflow (`/implement-wf` → `workflows/implement.js`),
+landing many commits sequentially is slow: each `git commit` runs the LLM gate
+(~minutes) one at a time. The fast-path lets the workflow review every planned
+commit **in parallel up front**, then skip the redundant per-commit LLM review.
+
+- **`approvals.py`** — canonical `diff_hash` (the same `sha256` of the stripped
+  `git diff --cached` used by `scaffold_manifest.py` / `validators/manifest.py`,
+  now imported from here) + the approval-marker store `.review/approvals/<hash>`.
+- **`pre_review.py`** — reviews each commit group concurrently against a private
+  `GIT_INDEX_FILE` (shared index/worktree untouched), reusing `run_review`. A
+  CLEAN group gets a marker. Also runs a whole-diff lens pass over the union for
+  cross-cutting issues. `--verify-range BASE` re-derives each landed commit's
+  canonical hash for the post-Land integrity audit.
+- **`hook._maybe_fastpath`** — at commit time, *after* the deterministic
+  preflight and *before* any LLM work: if `SDD_REVIEW_FASTPATH` is set **and** a
+  marker exists for the staged diff's hash, skip the LLM review (exit 0).
+
+**Fail-safe.** The bypass can only ever *skip an already-reviewed diff*, never
+pass an unreviewed one. No flag, no marker, or any hash mismatch → the full
+review runs. gitleaks/semgrep (pre-commit wrapper) and the coverage/assert
+preflight (`run_gate`) always run regardless.
+
+**Integrity (no signing — the Workflow JS sandbox has no `crypto`).** The
+workflow builds its trusted approved-set from the reviewer agent's return, the
+committer is never told the marker format, and a **separate** verifier agent
+(`--verify-range`) re-derives every landed commit's hash from git so the
+committed set is cross-checked against the approved set. Any unapproved landed
+commit is force-reviewed and surfaced as a Known Concern. Defense-in-depth: a
+`hooks/guard.py` rule blocks shell writes to `.review/approvals/`.
+
 ## Tests
 
 ```
-cd ~/.claude && python3 -m pytest review/test_hook.py -v
+cd ~/.claude && python3 -m pytest review/test_hook.py review/test_approvals.py review/test_pre_review.py -v
 ```
 
 The suite covers:

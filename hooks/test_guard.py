@@ -24,6 +24,20 @@ from hooks.guard import check_command, main
         pytest.param("git push -n origin main", None, id="push-dry-run-allowed"),
         pytest.param("ls -la", None, id="unrelated-allowed"),
         pytest.param("echo --no-verify", None, id="no-verify-without-git-allowed"),
+        # ---------- review-approvals-write ----------
+        pytest.param("echo x > .review/approvals/abc123", "review-approvals-write", id="approvals-redirect"),
+        pytest.param("echo x >> .review/approvals/abc123", "review-approvals-write", id="approvals-append"),
+        pytest.param("touch .review/approvals/deadbeef", "review-approvals-write", id="approvals-touch"),
+        pytest.param("cp /tmp/x .review/approvals/h", "review-approvals-write", id="approvals-cp"),
+        pytest.param("printf x | tee .review/approvals/h", "review-approvals-write", id="approvals-tee"),
+        pytest.param("cat .review/approvals/abc123", None, id="approvals-read-allowed"),
+        pytest.param("ls .review/approvals", None, id="approvals-ls-allowed"),
+        pytest.param(
+            "python3 ~/.claude/review/pre_review.py --plan .review/prereview-plan.json --reset",
+            None,
+            id="prereview-script-allowed",
+        ),
+        pytest.param("echo '{}' > .review/prereview-plan.json", None, id="prereview-plan-write-allowed"),
         # ---------- git-force-push ----------
         pytest.param("git push --force", "git-force-push", id="push-force-long"),
         pytest.param(

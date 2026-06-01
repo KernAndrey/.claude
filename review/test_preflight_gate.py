@@ -674,6 +674,7 @@ def test_run_gate_both_ok() -> None:
     with (
         patch("scripts.preflight_gate._load_config", return_value=GateConfig()),
         patch("scripts.preflight_gate._run_coverage_check", return_value=CoverageResult()),
+        patch("scripts.preflight_gate._diff_has_production_python", return_value=True),
         patch("scripts.preflight_gate._run_assert_check", return_value=AssertResult()),
         patch("scripts.preflight_gate._run_assert_check_js", return_value=AssertResult()),
     ):
@@ -685,6 +686,7 @@ def test_run_gate_coverage_fails_assert_ok() -> None:
     with (
         patch("scripts.preflight_gate._load_config", return_value=GateConfig()),
         patch("scripts.preflight_gate._run_coverage_check", return_value=cov),
+        patch("scripts.preflight_gate._diff_has_production_python", return_value=True),
         patch("scripts.preflight_gate._run_assert_check", return_value=AssertResult()),
         patch("scripts.preflight_gate._run_assert_check_js", return_value=AssertResult()),
     ):
@@ -707,6 +709,7 @@ def test_run_gate_setup_error() -> None:
     with (
         patch("scripts.preflight_gate._load_config", return_value=GateConfig()),
         patch("scripts.preflight_gate._run_coverage_check", return_value=cov),
+        patch("scripts.preflight_gate._diff_has_production_python", return_value=True),
         patch("scripts.preflight_gate._run_assert_check", return_value=AssertResult()),
         patch("scripts.preflight_gate._run_assert_check_js", return_value=AssertResult()),
     ):
@@ -719,6 +722,7 @@ def test_run_gate_internal_error_fail_open() -> None:
     with (
         patch("scripts.preflight_gate._load_config", return_value=cfg),
         patch("scripts.preflight_gate._run_coverage_check", return_value=cov),
+        patch("scripts.preflight_gate._diff_has_production_python", return_value=True),
         patch("scripts.preflight_gate._run_assert_check", return_value=AssertResult()),
         patch("scripts.preflight_gate._run_assert_check_js", return_value=AssertResult()),
     ):
@@ -730,6 +734,7 @@ def test_run_gate_internal_error_fail_closed() -> None:
     with (
         patch("scripts.preflight_gate._load_config", return_value=GateConfig(fail_open_on_error=False)),
         patch("scripts.preflight_gate._run_coverage_check", return_value=cov),
+        patch("scripts.preflight_gate._diff_has_production_python", return_value=True),
         patch("scripts.preflight_gate._run_assert_check", return_value=AssertResult()),
         patch("scripts.preflight_gate._run_assert_check_js", return_value=AssertResult()),
     ):
@@ -2039,6 +2044,7 @@ def test_run_gate_setup_error_tty(capsys: pytest.CaptureFixture[str]) -> None:
     with (
         patch("scripts.preflight_gate._load_config", return_value=GateConfig()),
         patch("scripts.preflight_gate._run_coverage_check", return_value=cov),
+        patch("scripts.preflight_gate._diff_has_production_python", return_value=True),
         patch("scripts.preflight_gate._run_assert_check", return_value=AssertResult()),
         patch("scripts.preflight_gate._run_assert_check_js", return_value=AssertResult()),
         patch("sys.stderr.isatty", return_value=True),
@@ -2070,6 +2076,7 @@ def test_run_gate_internal_error_fail_open_tty(capsys: pytest.CaptureFixture[str
     with (
         patch("scripts.preflight_gate._load_config", return_value=cfg),
         patch("scripts.preflight_gate._run_coverage_check", return_value=cov),
+        patch("scripts.preflight_gate._diff_has_production_python", return_value=True),
         patch("scripts.preflight_gate._run_assert_check", return_value=AssertResult()),
         patch("scripts.preflight_gate._run_assert_check_js", return_value=AssertResult()),
         patch("sys.stderr.isatty", return_value=True),
@@ -2085,6 +2092,7 @@ def test_run_gate_internal_error_fail_closed_tty(capsys: pytest.CaptureFixture[s
     with (
         patch("scripts.preflight_gate._load_config", return_value=GateConfig(fail_open_on_error=False)),
         patch("scripts.preflight_gate._run_coverage_check", return_value=cov),
+        patch("scripts.preflight_gate._diff_has_production_python", return_value=True),
         patch("scripts.preflight_gate._run_assert_check", return_value=AssertResult()),
         patch("scripts.preflight_gate._run_assert_check_js", return_value=AssertResult()),
         patch("sys.stderr.isatty", return_value=True),

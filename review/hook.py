@@ -50,6 +50,7 @@ from config import (
     PRIMARIES,
     RunnerConfig,
 )
+import approvals
 from scripts.preflight_gate import run_gate
 
 # --- Path configuration (derived/fixed locations, not user-tunable) ---
@@ -1679,19 +1680,64 @@ def _maybe_dispatch_chunked() -> None:
     sys.exit(1 if verdict == "BLOCK" else 0)
 
 
+def _maybe_fastpath() -> bool:
+    """Pre-review fast-path: skip the LLM review for an already-approved diff.
+
+    Returns ``True`` (caller should ``exit 0``) only when ALL hold:
+      * ``SDD_REVIEW_FASTPATH`` is set — the workflow Land phase enables the
+        mode; a normal manual commit never has it, so the cache is ignored.
+      * the staged diff is non-empty, and
+      * a marker ``.review/approvals/<diff_hash>`` exists — written by
+        ``pre_review.py`` only after the *same* diff passed review.
+
+    Any miss returns ``False`` → the full review runs (fail-safe: the bypass
+    can only ever *skip* an already-reviewed diff, never pass an unreviewed
+    one). Deterministic gates are NOT skipped: ``run_gate`` already ran before
+    this, and gitleaks/semgrep run earlier in the pre-commit wrapper. The
+    integrity backstop lives in the workflow (an independent post-Land audit
+    re-derives every landed commit's hash from git and demands it was approved).
+    """
+    if not os.environ.get("SDD_REVIEW_FASTPATH"):
+        return False
+    diff, _git_err = get_staged_diff()
+    if not diff:
+        return False
+    h = approvals.diff_hash(diff)
+    if not approvals.approval_exists(Path.cwd(), h):
+        return False
+    info(f"Fast-path: staged diff pre-reviewed CLEAN ({h[:12]}…) — skipping LLM review.")
+    save_log("FASTPATH", diff=diff, error_msg=f"pre-approved {h}")
+    return True
+
+
+def _run_preflight_gate_or_exit() -> None:
+    """Run the deterministic coverage/assert preflight; exit on failure.
+
+    No-op when the gate is disabled. Crash → exit 3; gate failure → exit with
+    the gate's own rc (e.g. 2). Always runs before the fast-path so a
+    pre-approved diff is still held to coverage/assert.
+    """
+    if not COVERAGE_GATE.enabled:
+        return
+    try:
+        rc = run_gate()
+    except Exception as exc:
+        error(f"Pre-flight gate crashed: {type(exc).__name__}: {exc}")
+        sys.exit(3)
+    if rc != 0:
+        sys.exit(rc)
+
+
 def main() -> None:
     try:
         _verify_runner_configs()
         _check_staged_review_guard()
+        _run_preflight_gate_or_exit()
 
-        if COVERAGE_GATE.enabled:
-            try:
-                rc = run_gate()
-            except Exception as exc:
-                error(f"Pre-flight gate crashed: {type(exc).__name__}: {exc}")
-                sys.exit(3)
-            if rc != 0:
-                sys.exit(rc)
+        # Pre-review fast-path: after the deterministic gate, before any LLM
+        # work (single-call OR chunked manifest routing).
+        if _maybe_fastpath():
+            sys.exit(0)
 
         _maybe_dispatch_chunked()
 

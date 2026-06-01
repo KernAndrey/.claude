@@ -25,7 +25,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import hashlib
 import re
 import subprocess
 import sys
@@ -239,18 +238,23 @@ def build_scaffold(
 ) -> str:
     """Compose the YAML scaffold text. ``num_chunks`` is the count of empty
     chunk templates to emit; the writer adds/removes as needed."""
+    # Deferred: review/ is only on sys.path once main() has inserted it (for
+    # direct `python3 scripts/scaffold_manifest.py` runs); importing at module
+    # top would break that path. Single source of truth for the hash format.
+    from approvals import diff_hash
+
     repo_root = Path.cwd() if repo_root is None else repo_root
     diff_text = _git(["diff", "--cached"]).strip()
     if not diff_text:
         raise SystemExit("no staged changes — nothing to manifest")
-    diff_hash = hashlib.sha256(diff_text.encode()).hexdigest()
+    staged_hash = diff_hash(diff_text)
     files = _collect_staged_files()
 
     parts: list[str] = []
     parts.append(_HEADER.format(max_chunks=max_chunks, max_prod=max_prod))
     parts.append("")
     parts.append("version: 1")
-    parts.append(f"diff_hash: {diff_hash}")
+    parts.append(f"diff_hash: {staged_hash}")
     parts.append("")
     parts.append("# Staged files (every file must appear in exactly one chunk's `files:`):")
     for f in files:

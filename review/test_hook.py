@@ -2146,6 +2146,109 @@ def test_main_preflight_gate_setup_error_exits_two() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pre-review fast-path — skip the LLM review when the staged diff was already
+# reviewed CLEAN (marker present) AND the workflow enabled the mode via env.
+# Deterministic gates (run_gate, gitleaks/semgrep) are unaffected.
+# ---------------------------------------------------------------------------
+
+
+def test_fastpath_true_when_flag_and_marker_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hook import _maybe_fastpath
+
+    monkeypatch.setenv("SDD_REVIEW_FASTPATH", "1")
+    with (
+        patch("hook.get_staged_diff", return_value=("+payload\n", "")),
+        patch("hook.approvals.approval_exists", return_value=True) as m_exists,
+        patch("hook.save_log") as m_log,
+    ):
+        assert _maybe_fastpath() is True
+    m_exists.assert_called_once()
+    m_log.assert_called_once()
+
+
+def test_fastpath_false_without_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hook import _maybe_fastpath
+
+    monkeypatch.delenv("SDD_REVIEW_FASTPATH", raising=False)
+    with (
+        patch("hook.get_staged_diff", return_value=("+payload\n", "")),
+        patch("hook.approvals.approval_exists", return_value=True) as m_exists,
+    ):
+        assert _maybe_fastpath() is False
+    m_exists.assert_not_called()  # flag gates even the lookup
+
+
+def test_fastpath_false_when_no_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hook import _maybe_fastpath
+
+    monkeypatch.setenv("SDD_REVIEW_FASTPATH", "1")
+    with (
+        patch("hook.get_staged_diff", return_value=("+unreviewed\n", "")),
+        patch("hook.approvals.approval_exists", return_value=False),
+    ):
+        assert _maybe_fastpath() is False
+
+
+def test_fastpath_false_when_diff_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    from hook import _maybe_fastpath
+
+    monkeypatch.setenv("SDD_REVIEW_FASTPATH", "1")
+    with (
+        patch("hook.get_staged_diff", return_value=("", "")),
+        patch("hook.approvals.approval_exists", return_value=True) as m_exists,
+    ):
+        assert _maybe_fastpath() is False
+    m_exists.assert_not_called()
+
+
+def test_main_fastpath_skips_llm_but_runs_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Approved diff: run_gate runs, LLM pipeline + chunked dispatch do NOT, exit 0."""
+    from hook import main as hook_main
+
+    monkeypatch.setenv("SDD_REVIEW_FASTPATH", "1")
+    with (
+        patch("hook._verify_runner_configs"),
+        patch("hook._check_staged_review_guard"),
+        patch("hook.COVERAGE_GATE", MagicMock(enabled=True)),
+        patch("hook.run_gate", return_value=0) as m_gate,
+        patch("hook.get_staged_diff", return_value=("+payload\n", "")),
+        patch("hook.approvals.approval_exists", return_value=True),
+        patch("hook._maybe_dispatch_chunked") as m_chunked,
+        patch("hook._run_multi_backend_pipeline") as m_pipeline,
+        patch("hook.save_log"),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            hook_main()
+    assert exc_info.value.code == 0
+    m_gate.assert_called_once()  # deterministic gate still enforced
+    m_chunked.assert_not_called()
+    m_pipeline.assert_not_called()  # LLM review skipped
+
+
+def test_main_no_marker_falls_through_to_review(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Flag set but diff NOT pre-approved → full review runs (fail-safe)."""
+    from hook import main as hook_main
+
+    monkeypatch.setenv("SDD_REVIEW_FASTPATH", "1")
+    with (
+        patch("hook._verify_runner_configs"),
+        patch("hook._check_staged_review_guard"),
+        patch("hook.COVERAGE_GATE", MagicMock(enabled=True)),
+        patch("hook.run_gate", return_value=0),
+        patch("hook.get_staged_diff", return_value=("+unreviewed\n", "")),
+        patch("hook.approvals.approval_exists", return_value=False),
+        patch("hook._maybe_dispatch_chunked"),
+        patch("hook.collect_diff", return_value=("+unreviewed\n", "x.py", False)),
+        patch("hook.applicable_lenses", return_value=["bugs"]),
+        patch("hook._run_multi_backend_pipeline", return_value="OK") as m_pipeline,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            hook_main()
+    assert exc_info.value.code == 0
+    m_pipeline.assert_called_once()  # review NOT skipped
+
+
+# ---------------------------------------------------------------------------
 # extract_warning_lines — surface [WARNING] detail to stderr, not just count
 # ---------------------------------------------------------------------------
 

@@ -13,7 +13,6 @@ diff/status/numstat without invoking git.
 
 from __future__ import annotations
 
-import hashlib
 import re
 import subprocess
 from collections.abc import Callable
@@ -24,6 +23,10 @@ from typing import Any
 import yaml
 
 import config
+
+# Single source of truth for the staged-diff hash (shared with the fast-path
+# and the scaffolder) so the manifest freshness check can never drift from it.
+from approvals import diff_hash
 
 # Reuse the same prod-code definition the rest of the hook uses so per-chunk
 # size accounting matches MAX_PROD_LINES gating.
@@ -300,7 +303,7 @@ def _parse_manifest(manifest_text: str, res: ValidationResult) -> dict[str, Any]
 
 
 def _check_diff_hash(manifest: dict[str, Any], diff_text: str, res: ValidationResult) -> None:
-    expected = hashlib.sha256(diff_text.encode()).hexdigest()
+    expected = diff_hash(diff_text)
     if manifest.get("diff_hash") != expected:
         res.add(
             "stale_hash",

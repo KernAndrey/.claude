@@ -2,7 +2,7 @@ Implement an approved specification by handing the whole engine to a determinist
 
 You are the **lead**. You do three things only: **set up**, **launch the workflow**, **report the result**. All coding, testing, reviewing, fixing, committing, and pushing happen inside the `sdd-implement-engine` workflow. You do not spawn coders or reviewers yourself, and you do not write code.
 
-Begin by saying: **"Setting up, then handing implementation to the sdd-implement-engine workflow. It runs autonomously to delivery — code, tests, review, fixes, commits through the gate, and push."**
+Begin by saying: **"Setting up, then handing implementation to the sdd-implement-engine workflow. It runs autonomously to delivery — code, tests, review, fixes, parallel pre-review of the commits, commits through the gate, a landed-commit integrity audit, and push."**
 
 `$ARGUMENTS` is the task identifier (ID or slug).
 
@@ -59,15 +59,15 @@ The call returns when the task is delivered. Watch live progress with `/workflow
 
 The workflow already finalized the spec (Implementation Summary, Known Concerns, Auto-Review Results, Steps for Manual Review), moved it to `tasks/5-review/`, landed the commits through the gate, and pushed the branch. From the returned object, show the user:
 
-1. **Status** — `DELIVERED` or `DELIVERED_WITH_CONCERNS`.
+1. **Status** — `DELIVERED`, `DELIVERED_WITH_CONCERNS`, or `DELIVERED_INCOMPLETE`. The last one means the final acceptance check could not confirm the spec is fully implemented even after the engine's in-run remediation — call this out prominently and point the user at the acceptance gaps recorded in Known Concerns.
 2. **Implementation Summary** (brief) and the **commit list** (subjects).
 3. **Known Concerns**, verbatim — these are the items the engine decided autonomously and the user should review.
 4. **Steps for Manual Review**, the full list.
-5. The instruction: **"Walk through the manual review steps. If everything looks good — `/task-done {ID}`."**
+5. The instruction: **"Walk through the manual review steps. If everything looks good — `/task-done {ID}`."** (For `DELIVERED_INCOMPLETE`, tell the user the task likely needs another pass before `/task-done`.)
 
 If `status` is missing or the workflow returned an error, read the spec in `tasks/4-in-progress/` (it may not have moved), report what landed, and tell the user which phase did not complete.
 
 ## What stays with the lead vs the workflow
 
 - **Lead:** read spec, create worktree, move spec to `4-in-progress`, parse the Coder list, launch, report. Nothing else.
-- **Workflow:** code → test (+ bug loop) → review → fix (+ re-review) → finalize spec → land commits through the gate (+ fix loop, secrets, overrides, chunked manifest) → push. Model for every agent is the session model — choose it when you launch this command.
+- **Workflow:** code → test (+ bug loop) → review → fix (+ re-review) → finalize spec → parallel pre-review of the planned commits (fix loop until clean, ≥3 groups) → land commits through the gate (fast-path past the LLM review for pre-approved diffs; + fix loop, secrets, overrides, chunked manifest) → integrity audit that every landed commit was pre-reviewed → push. Model for every agent is the session model — choose it when you launch this command.

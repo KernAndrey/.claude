@@ -7,7 +7,10 @@ export const meta = {
     { title: 'Test', detail: 'one tester writes tests; bug-fix loop with owning coders' },
     { title: 'Review', detail: 'role reviewers (code/test/spec/security/+ui) in parallel, schema-enforced' },
     { title: 'Fix', detail: 'route MUST FIX/CRITICAL to coders/tester, re-review until clean' },
+    { title: 'Pre-review', detail: 'review all planned commit groups in parallel; fix until clean (≥3 groups)' },
     { title: 'Land', detail: 'finalize spec, land logical commits through the gate, push' },
+    { title: 'Verify', detail: 'audit every landed commit was pre-reviewed (integrity cross-check)' },
+    { title: 'Accept', detail: 'high-level check the spec is fully delivered; remediate gaps in-run' },
   ],
 }
 
@@ -177,6 +180,98 @@ const COMMIT_PLAN_SCHEMA = {
         required: ['message', 'files'],
         properties: {
           message: { type: 'string', description: 'conventional commit subject, prefixed with the task id' },
+          files: { type: 'array', items: { type: 'string' }, minItems: 1 },
+          note: { type: 'string' },
+        },
+      },
+    },
+  },
+}
+
+// Pre-review: what the reviewer agent returns after running pre_review.py.
+// diffHash is the canonical hash of the group's diff; `approved` means the
+// review verdict would let the gate pass. blockers feed routeFixes().
+const PREREVIEW_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['groups', 'wholediff', 'allClean'],
+  properties: {
+    groups: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['index', 'diffHash', 'verdict', 'approved'],
+        properties: {
+          index: { type: 'integer' },
+          diffHash: { type: 'string' },
+          verdict: { type: 'string' },
+          approved: { type: 'boolean' },
+          blockers: { type: 'array', items: FINDING },
+        },
+      },
+    },
+    wholediff: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['verdict'],
+      properties: {
+        verdict: { type: 'string' },
+        blockers: { type: 'array', items: FINDING },
+      },
+    },
+    allClean: { type: 'boolean' },
+  },
+}
+
+// Land-audit: what the verifier agent returns from `pre_review.py --verify-range`.
+const VERIFY_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['commits'],
+  properties: {
+    commits: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sha', 'diffHash'],
+        properties: { sha: { type: 'string' }, diffHash: { type: 'string' } },
+      },
+    },
+  },
+}
+
+// Acceptance: the final high-level "is the spec actually, fully delivered?"
+// verdict. Low-level quality was the reviewers' job; this is the whole-feature
+// view — read the spec intent + ACs + the real code + run the tests.
+const ACCEPT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['complete', 'testsPass', 'gaps', 'rationale'],
+  properties: {
+    complete: { type: 'boolean', description: 'true ONLY if every AC and the intended feature are genuinely implemented end-to-end' },
+    testsPass: { type: 'boolean' },
+    gaps: { type: 'array', items: FINDING, description: 'concrete, actionable shortfalls vs the spec' },
+    rationale: { type: 'string' },
+  },
+}
+
+// Like COMMIT_PLAN_SCHEMA but allows zero groups (the remediation delta may be
+// empty if a fix changed nothing on disk).
+const DELTA_PLAN_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['groups'],
+  properties: {
+    groups: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['message', 'files'],
+        properties: {
+          message: { type: 'string' },
           files: { type: 'array', items: { type: 'string' }, minItems: 1 },
           note: { type: 'string' },
         },
@@ -535,11 +630,69 @@ const plan = await agent(
   { agentType: 'general-purpose', label: 'land:plan', phase: 'Land', schema: COMMIT_PLAN_SCHEMA },
 )
 
+// 4.2.5 — OPTIONAL parallel pre-review (only worth it for several commits).
+// Review every planned group concurrently (pre_review.py parallelizes inside
+// Python) and loop fixes until clean. Clean groups get an on-disk approval
+// marker; the committer's `git commit` then fast-paths past the slow LLM
+// review for that exact diff. `approved` is the workflow's TRUSTED set, built
+// from the reviewer agent's return (not disk) and later cross-checked by an
+// independent verifier — so the committer (no-knowledge of the marker format)
+// cannot smuggle an unreviewed diff past the audit.
+const PREREVIEW_MIN_GROUPS = 3
+const PREREVIEW_MAX_ROUNDS = 4 // optimization, not a gate: leftover groups just hit the live gate
+const approved = new Set() // canonical diffHash strings the workflow trusts as CLEAN
+let preReviewRan = false
+if (plan.groups.length >= PREREVIEW_MIN_GROUPS) {
+  preReviewRan = true
+  phase('Pre-review')
+  const planJson = JSON.stringify({ groups: plan.groups.map(g => ({ message: g.message, files: g.files })) })
+  let pending = plan.groups.map((_g, i) => i)
+  for (let round = 1; round <= PREREVIEW_MAX_ROUNDS && pending.length; round++) {
+    const reset = round === 1
+    const pr = await agent(
+      [
+        preamble('Pre-reviewer'),
+        `Run the parallel pre-review of the planned commit groups. This does NOT commit anything.`,
+        `1. Write this JSON verbatim to ${WORKTREE}/.review/prereview-plan.json (mkdir -p the dir first):`,
+        planJson,
+        `2. From ${WORKTREE}, run exactly:`,
+        `   python3 ~/.claude/review/pre_review.py --plan ${WORKTREE}/.review/prereview-plan.json --repo-root ${WORKTREE}${reset ? ' --reset' : ` --pending ${pending.join(',')}`}`,
+        `   It reviews each group in parallel against a private git index and writes an approval marker for every CLEAN group. It can take many minutes — wait for it.`,
+        `3. Read its JSON stdout: { groups:[{index,message,diff_hash,verdict,too_big,approved,blockers}], wholediff:{verdict,blockers}, all_clean }. Each "blockers" is a list of reviewer lines for BLOCK verdicts, like "[F1] [CRITICAL] path:line — description".`,
+        `4. For each group return {index, diffHash:diff_hash, verdict, approved}. Parse each blocker line into {id, severity:"CRITICAL", file, description} and return them as that group's blockers[]. Do the same for wholediff.blockers.`,
+        `Return PREREVIEW_SCHEMA exactly: groups[], wholediff{verdict,blockers}, allClean (= all_clean).`,
+      ].join('\n'),
+      { agentType: 'general-purpose', label: `prereview:round${round}`, phase: 'Pre-review', schema: PREREVIEW_SCHEMA },
+    )
+    for (const gr of pr.groups) if (gr.approved && gr.diffHash) approved.add(gr.diffHash)
+    const wholediffClean = pr.wholediff.verdict === 'OK' || pr.wholediff.verdict === 'SKIP'
+    if (pr.allClean || (pr.groups.every(g => g.approved) && wholediffClean)) {
+      log(`Pre-review clean after ${round} round(s); ${approved.size} group(s) approved.`)
+      break
+    }
+    const blockers = [].concat(...pr.groups.map(g => g.blockers || [])).concat(pr.wholediff.blockers || [])
+    if (blockers.length) {
+      log(`Pre-review round ${round}: ${blockers.length} blocking finding(s) → routing fixes.`)
+      await routeFixes(blockers)
+    }
+    // A whole-diff fix may touch any group → re-review all; otherwise just the unapproved ones.
+    pending = wholediffClean ? pr.groups.filter(g => !g.approved).map(g => g.index) : plan.groups.map((_g, i) => i)
+    if (round === PREREVIEW_MAX_ROUNDS && pending.length) {
+      knownConcerns.push(`Pre-review did not fully converge after ${PREREVIEW_MAX_ROUNDS} rounds; ${pending.length} group(s) will go through the live commit gate instead of the fast-path.`)
+    }
+  }
+  phase('Land')
+}
+
 // 4.3 — Land each group sequentially through the commit gate, with an
 // unbounded fix loop. The committer agent runs ALONE (never alongside others).
 const commitLedger = []
-for (let gi = 0; gi < plan.groups.length; gi++) {
-  const g = plan.groups[gi]
+// Land a set of logical commit groups sequentially through the gate. Extracted
+// into a function so the acceptance-remediation loop (4.5) can re-land the
+// delta it produces. `fastpathEnabled` gates the SDD_REVIEW_FASTPATH hint.
+async function landGroups(groups, fastpathEnabled) {
+ for (let gi = 0; gi < groups.length; gi++) {
+  const g = groups[gi]
   let landed = false
   let gateRound = 0
   const gatePersist = new Map() // fpKey -> consecutive gate rounds the finding stayed open
@@ -549,6 +702,9 @@ for (let gi = 0; gi < plan.groups.length; gi++) {
       [
         preamble('Committer'),
         `Follow the commit skill procedure (~/.claude/skills/commit/SKILL.md): security scan, Phase 3.5 coverage+assert preflight (a fresh coverage.xml is required), stash-guard, then commit with the AI review hook in the BACKGROUND (the gate can take up to 20 minutes — poll, do not give up early).`,
+        ...(fastpathEnabled
+          ? [`This run pre-reviewed the commits in parallel. Prefix the git commit with the env var SDD_REVIEW_FASTPATH=1 (i.e. \`SDD_REVIEW_FASTPATH=1 git commit ...\`): a commit whose changes already passed pre-review then skips the redundant LLM review automatically — the deterministic gates (coverage/assert/secrets) still run. If the commit was not pre-approved the full review just runs as normal; never try to force a skip any other way.`]
+          : []),
         `Commit ONLY this logical group:`,
         `  message: ${g.message}`,
         `  files: ${g.files.join(', ')}`,
@@ -595,6 +751,128 @@ for (let gi = 0; gi < plan.groups.length; gi++) {
       break
     }
   }
+ }
+}
+
+// Land the initial plan (fast-path enabled iff we pre-reviewed).
+await landGroups(plan.groups, preReviewRan)
+
+// 4.3.5 — Land-audit (integrity backstop for the fast-path). A SEPARATE
+// verifier agent (not the committer) re-derives every landed commit's
+// canonical diff_hash straight from git history and we cross-check it against
+// the trusted `approved` set built during pre-review. Any landed commit whose
+// hash was NOT pre-approved means the fast-path may have skipped review for an
+// unreviewed diff → force a full review of that commit and record it loudly.
+// The committer never produced this evidence, so it cannot fake the audit.
+if (preReviewRan && commitLedger.length) {
+  phase('Verify')
+  const vr = await agent(
+    [
+      preamble('Verifier'),
+      `Audit which commits just landed, for an integrity check. Do NOT commit or change anything.`,
+      `From ${WORKTREE}, run exactly:`,
+      `   python3 ~/.claude/review/pre_review.py --verify-range ${BASE} --repo-root ${WORKTREE}`,
+      `It emits JSON { commits:[{sha, diff_hash}] } — the canonical hash of each ${BASE}..HEAD commit, computed by the same code the gate uses.`,
+      `Return VERIFY_SCHEMA: commits[] of {sha, diffHash:diff_hash}, verbatim from that JSON.`,
+    ].join('\n'),
+    { agentType: 'general-purpose', label: 'verify:land', phase: 'Verify', schema: VERIFY_SCHEMA },
+  )
+  const unapproved = vr.commits.filter(c => !approved.has(c.diffHash))
+  if (unapproved.length) {
+    for (const c of unapproved) {
+      knownConcerns.push(`INTEGRITY: landed commit ${c.sha.slice(0, 9)} was not in the pre-reviewed approved set — its review provenance is unverified.`)
+    }
+    log(`Land-audit: ${unapproved.length} commit(s) not pre-approved → forcing a full review.`)
+    // Force a full review of the unapproved commits and fold findings into concerns (autonomous: surface, don't halt).
+    const audit = await agent(
+      [
+        preamble('Code-Reviewer'),
+        `Integrity backstop: the following landed commits were NOT confirmed as pre-reviewed. Review each commit's full diff now and report any real defects.`,
+        ...unapproved.map(c => `- commit ${c.sha}: inspect with "git show ${c.sha}" inside ${WORKTREE}`),
+        `Base for context: ${BASE}. Read your role instructions: ~/.claude/agents/code-reviewer.md.`,
+        `Return findings[] (id, severity, file, line, description) — empty if all clean.`,
+      ].join('\n'),
+      { agentType: 'Code-Reviewer', label: 'verify:audit-review', phase: 'Verify', schema: { type: 'object', additionalProperties: false, required: ['findings'], properties: { findings: { type: 'array', items: FINDING } } } },
+    )
+    for (const f of audit.findings || []) {
+      knownConcerns.push(`Post-Land audit finding (${f.severity}) ${f.file || '(no file)'}:${f.line || ''} — ${f.description}`)
+    }
+  } else {
+    log(`Land-audit: all ${vr.commits.length} landed commit(s) were pre-reviewed. ✓`)
+  }
+}
+
+// 4.5 — Acceptance gate + in-run remediation. A final, HIGH-LEVEL check that
+// the spec is actually, fully delivered (low-level quality was the reviewers'
+// job). If not, fix the gaps and land the delta through the gate, then
+// re-check — so the workflow finishes the job rather than shipping a partial
+// implementation. NOT round-capped: every remediation delta lands through the
+// full commit gate anyway, so productive rounds run unbounded. Termination is
+// fingerprint-based (same as the review fix loop): a gap that survives
+// STALL_ROUNDS consecutive rounds is retired to Known Concerns; the 1000-agent
+// workflow ceiling is the ultimate backstop.
+phase('Accept')
+
+// Land whatever changes a remediation round left uncommitted, through the gate.
+async function landDelta(tag) {
+  const dplan = await agent(
+    [
+      preamble('Commit planner'),
+      `Remediation landing. Inspect the working tree in ${WORKTREE} (git status --porcelain, git diff --stat) for changes left UNCOMMITTED by the latest fixes.`,
+      `Plan logical commits for ONLY those uncommitted changes — same rules as before (<=300 prod lines/group, vertical slices, conventional subjects prefixed "${TASK}").`,
+      `If the working tree is clean (nothing to commit), return groups: []. Otherwise cover every uncommitted file exactly once.`,
+    ].join('\n'),
+    { agentType: 'general-purpose', label: `accept:${tag}:plan`, phase: 'Accept', schema: DELTA_PLAN_SCHEMA },
+  )
+  if (dplan.groups.length) await landGroups(dplan.groups, false) // full gate on the (small) delta
+  return dplan.groups.length
+}
+
+let accepted = false
+const specGlob = `${WORKTREE}/tasks/5-review/ (the Scribe moved it there; if not found, check tasks/4-in-progress/)`
+const acceptPersist = new Map() // gap fpKey -> consecutive rounds still open
+const acceptGivenUp = new Set() // gap fpKeys retired to Known Concerns
+let acceptRound = 0
+while (true) {
+  acceptRound++
+  const acc = await agent(
+    [
+      preamble('Acceptance auditor'),
+      `FINAL high-level acceptance check — decide whether the spec is ACTUALLY, FULLY implemented, not merely whether files exist. Low-level code quality was already reviewed; you take the whole-feature view.`,
+      `1. Read the spec in full from ${specGlob}. Internalize the intent, every Acceptance Criterion, the Behavior/Examples, and the Work breakdown.`,
+      `2. READ THE REAL CODE for this change in ${WORKTREE}: "git diff ${BASE}..HEAD --stat", then open and read the actual implementations (not just diffs). Judge end-to-end: does this deliver every AC and the intended feature?`,
+      `3. Run the test suite and confirm it genuinely passes. Confirm every Work-breakdown file is created/changed and there are NO leftover TODO / stub / NotImplemented / placeholder.`,
+      `Return complete=true ONLY if the feature is genuinely, fully done. Otherwise complete=false with gaps[] — each a concrete, actionable finding {severity, file, line, description, suggestedFix} — plus testsPass and a one-paragraph rationale.`,
+    ].join('\n'),
+    { agentType: 'general-purpose', label: `accept:round${acceptRound}`, phase: 'Accept', schema: ACCEPT_SCHEMA },
+  )
+  if (acc.complete && acc.testsPass) {
+    accepted = true
+    log(`Acceptance: spec fully implemented${acceptRound > 1 ? ` after ${acceptRound - 1} remediation round(s)` : ''}. ✓`)
+    break
+  }
+  // Build this round's actionable gap set (failing tests fold in as a stable gap).
+  let gaps = (acc.gaps || []).filter(g => g && g.description)
+  if (!acc.testsPass) gaps.push({ id: 'accept-tests', severity: 'MUST_FIX', description: 'Acceptance: test suite is failing' })
+  gaps = gaps.filter(g => !acceptGivenUp.has(fpKey(g)))
+
+  // Fingerprint-based stall detection: retire gaps stuck for STALL_ROUNDS rounds.
+  const curKeys = new Set(gaps.map(fpKey))
+  for (const k of curKeys) acceptPersist.set(k, (acceptPersist.get(k) || 0) + 1)
+  for (const k of Array.from(acceptPersist.keys())) if (!curKeys.has(k)) acceptPersist.delete(k)
+  for (const g of gaps.filter(g => (acceptPersist.get(fpKey(g)) || 0) >= STALL_ROUNDS)) {
+    acceptGivenUp.add(fpKey(g))
+    knownConcerns.push(`Acceptance gap unresolved after ${STALL_ROUNDS} rounds (${g.severity}) ${g.file || '(no file)'}: ${g.description}`)
+  }
+  const toFix = gaps.filter(g => !acceptGivenUp.has(fpKey(g)))
+  if (!toFix.length) {
+    if (acc.gaps && acc.gaps.length === 0 && acc.testsPass) knownConcerns.push(`Acceptance reported incomplete but gave no actionable gaps: ${acc.rationale}`)
+    log(`Acceptance: no further actionable gaps; stopping (${acceptGivenUp.size} retired to Known Concerns).`)
+    break
+  }
+  log(`Acceptance round ${acceptRound}: ${toFix.length} gap(s)${acc.testsPass ? '' : ', tests failing'} → remediating.`)
+  await routeFixes(toFix)
+  await landDelta(`r${acceptRound}`)
 }
 
 // 4.4 — Push the branch (only when a dedicated branch/worktree was created).
@@ -612,7 +890,10 @@ if (a.autoBranch && a.branchName) {
 }
 
 return {
-  status: knownConcerns.length ? 'DELIVERED_WITH_CONCERNS' : 'DELIVERED',
+  // Not accepted → INCOMPLETE (acceptance could not confirm full delivery even
+  // after remediation). Otherwise concerns downgrade DELIVERED → _WITH_CONCERNS.
+  status: !accepted ? 'DELIVERED_INCOMPLETE' : knownConcerns.length ? 'DELIVERED_WITH_CONCERNS' : 'DELIVERED',
+  accepted,
   taskId: TASK,
   branch: a.branchName || BASE,
   changedFiles,

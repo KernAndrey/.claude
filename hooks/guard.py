@@ -41,6 +41,22 @@ RULES: list[Rule] = [
             "fix the underlying issue instead of skipping it."
         ),
     ),
+    Rule(
+        name="review-approvals-write",
+        # Pre-review approval markers (.review/approvals/<hash>) are the
+        # fast-path's "this diff was reviewed CLEAN" signal. They are written
+        # ONLY by review/pre_review.py (Python). A shell write here would forge
+        # an approval and skip the LLM review for unreviewed code. Reads
+        # (cat/ls) are allowed — only write verbs/redirects to that path match.
+        pattern=re.compile(
+            r"(?:>>?|\btee\b|\bcp\b|\bmv\b|\binstall\b|\btouch\b|\bln\b|\bdd\b)[\s\S]*\.review/approvals"
+        ),
+        reason=(
+            "Writing to .review/approvals/ forges a pre-review approval and "
+            "would skip the AI review for unreviewed code. Only review/pre_review.py "
+            "may create these markers. Let the pre-review run produce them."
+        ),
+    ),
     # ---------- Tier 1: enforced from CLAUDE.md "Git Safety" ----------
     Rule(
         name="git-force-push",
@@ -89,9 +105,7 @@ RULES: list[Rule] = [
         name="git-rebase-protected",
         # Lookbehind (?<![\w-]) prevents matching `feature-main` or `prod-dev`
         # while still allowing `origin/main` (preceded by `/`, not `-` or word).
-        pattern=re.compile(
-            r"\bgit\s+rebase\b[\s\S]*(?<![\w-])(?:main|master|dev)(?![-\w/])"
-        ),
+        pattern=re.compile(r"\bgit\s+rebase\b[\s\S]*(?<![\w-])(?:main|master|dev)(?![-\w/])"),
         reason=(
             "Rebasing main/master/dev rewrites shared history and is forbidden "
             "by CLAUDE.md. Rebase only personal feature branches."
@@ -158,16 +172,14 @@ RULES: list[Rule] = [
         name="git-checkout-discard",
         pattern=re.compile(r"\bgit\s+checkout\s+(?:--(?:\s|$)|\.(?:\s|$))"),
         reason=(
-            "`git checkout --` and `git checkout .` discard uncommitted edits "
-            "irreversibly. Only the user may run this."
+            "`git checkout --` and `git checkout .` discard uncommitted edits irreversibly. Only the user may run this."
         ),
     ),
     Rule(
         name="git-restore-discard",
         pattern=re.compile(r"\bgit\s+restore\b(?![\s\S]*--staged\b)"),
         reason=(
-            "`git restore` (without --staged) discards uncommitted edits "
-            "irreversibly. Only the user may run this."
+            "`git restore` (without --staged) discards uncommitted edits irreversibly. Only the user may run this."
         ),
     ),
     Rule(

@@ -55,6 +55,10 @@ projects/**/*-*-*-*-*
 # Transcripts
 transcripts/
 
+# Runtime state
+.last-cleanup
+.last-update-result.json
+
 *.pyc
 __pycache__/
 

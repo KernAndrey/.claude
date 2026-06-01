@@ -76,7 +76,7 @@
       }
     }
   },
-  "effortLevel": "high",
+  "effortLevel": "xhigh",
   "advisorModel": "opus",
   "voice": {
     "enabled": true,

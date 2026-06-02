@@ -222,27 +222,38 @@ landing many commits sequentially is slow: each `git commit` runs the LLM gate
 (~minutes) one at a time. The fast-path lets the workflow review every planned
 commit **in parallel up front**, then skip the redundant per-commit LLM review.
 
-- **`approvals.py`** — canonical `diff_hash` (the same `sha256` of the stripped
-  `git diff --cached` used by `scaffold_manifest.py` / `validators/manifest.py`,
-  now imported from here) + the approval-marker store `.review/approvals/<hash>`.
+- **`approvals.py`** — the canonical **content key** `content_hash` (`sha256` of
+  each changed path's final blob sha, parsed identically on every side by
+  `entries_from_raw` / `content_hash_from_raw`) + the approval-marker store
+  `.review/approvals/<content_key>`. `diff_hash` (the old `sha256` of the stripped
+  `git diff --cached`) is retained as a log/back-compat field only — it is
+  base-dependent, so a content-identical diff reconstructed from a different base
+  silently missed. The content key keys on final content, so it survives base
+  drift, rename detection, and stash reconstruction.
 - **`pre_review.py`** — reviews each commit group concurrently against a private
   `GIT_INDEX_FILE` (shared index/worktree untouched), reusing `run_review`. A
-  CLEAN group gets a marker. Also runs a whole-diff lens pass over the union for
-  cross-cutting issues. `--verify-range BASE` re-derives each landed commit's
-  canonical hash for the post-Land integrity audit.
+  CLEAN group gets a marker keyed on its content key. Also runs a whole-diff lens
+  pass over the union for cross-cutting issues. `--verify-range BASE` re-derives
+  each landed commit's content key for the post-Land integrity audit.
+  `--validate-plan PLAN` is the LLM-free fix-A disjointness gate: it flags any
+  file present in >=2 groups, lists advisory uncovered files, and returns a
+  deterministic disjoint `normalized_plan` fallback.
 - **`hook._maybe_fastpath`** — at commit time, *after* the deterministic
   preflight and *before* any LLM work: if `SDD_REVIEW_FASTPATH` is set **and** a
-  marker exists for the staged diff's hash, skip the LLM review (exit 0).
+  marker exists for the **staged content key** (`get_staged_content_key`), skip
+  the LLM review (exit 0).
 
-**Fail-safe.** The bypass can only ever *skip an already-reviewed diff*, never
-pass an unreviewed one. No flag, no marker, or any hash mismatch → the full
-review runs. gitleaks/semgrep (pre-commit wrapper) and the coverage/assert
-preflight (`run_gate`) always run regardless.
+**Fail-safe.** The bypass can only ever *skip an already-reviewed change*, never
+pass an unreviewed one. No flag, no marker, or any key mismatch → the full
+review runs. Ordinary (non-engine) commits never set `SDD_REVIEW_FASTPATH`, so
+they never compute a content key and take the unchanged path. gitleaks/semgrep
+(pre-commit wrapper) and the coverage/assert preflight (`run_gate`) always run
+regardless.
 
 **Integrity (no signing — the Workflow JS sandbox has no `crypto`).** The
 workflow builds its trusted approved-set from the reviewer agent's return, the
 committer is never told the marker format, and a **separate** verifier agent
-(`--verify-range`) re-derives every landed commit's hash from git so the
+(`--verify-range`) re-derives every landed commit's content key from git so the
 committed set is cross-checked against the approved set. Any unapproved landed
 commit is force-reviewed and surfaced as a Known Concern. Defense-in-depth: a
 `hooks/guard.py` rule blocks shell writes to `.review/approvals/`.

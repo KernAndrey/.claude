@@ -6,15 +6,20 @@ gate sequentially can take hours. This module reviews every planned commit
 group **in parallel** *before* the real commits, using the identical review
 pipeline against a private git index per group (`GIT_INDEX_FILE`) so nothing
 touches the shared working index. A group that passes review gets an approval
-marker (`approvals.write_approval`); at commit time `hook._maybe_fastpath`
-then skips the redundant LLM review for that exact diff.
+marker (`approvals.write_approval`) keyed on its **content key**; at commit time
+`hook._maybe_fastpath` recomputes the same key from the staged blobs and skips
+the redundant LLM review.
 
-Diff identity is the load-bearing invariant: the diff this module hashes for a
-group must be byte-identical to what `git diff --cached` produces when the real
-commit stages the same files — even after earlier groups have been committed
-and HEAD has moved. That holds because the commit planner makes groups
-file-disjoint, so a group's diff never depends on another group's commit. See
-`test_pre_review.py` for the proof (real intervening commit).
+Content identity is the load-bearing invariant: the content key
+(`approvals.content_hash` over each changed path's final blob sha — see
+`_content_key`) must be identical on all three sides — this module's private
+index, the real `git diff --cached` the committer stages, and the post-Land
+audit of the landed commit (`commit_content_key`). Because the key depends only
+on final content (not diff text or base), it survives base drift, rename
+detection, and stash reconstruction — the exact cases where the old textual
+diff hash silently missed. Group file-disjointness (validated by
+`validate_plan`) keeps each group's base stable so its changed-path set does
+not shift either. See `test_pre_review.py` for the proofs.
 
 Parallelism lives here (a thread pool), not at the agent layer — mirroring
 `chunked.py`. The workflow (`implement.js`) invokes this through a single agent
@@ -87,24 +92,71 @@ def _git(args: list[str], repo_root: Path, index_file: str | None = None) -> str
     return result.stdout.strip()
 
 
-def build_group_diff(repo_root: Path, files: list[str]) -> tuple[str, str]:
-    """Stage ``files`` into a throwaway private index and return (diff, names).
+def _stage_into(repo_root: Path, files: list[str], index_file: str) -> None:
+    """Stage ``files`` (vs HEAD) into the private index at ``index_file``.
+
+    ``git add -- <files>`` mirrors exactly how the committer stages, so the
+    resulting ``git diff --cached`` is the same text the real commit produces.
+    """
+    _git(["read-tree", "HEAD"], repo_root, index_file)
+    _git(["add", "--", *files], repo_root, index_file)
+
+
+def build_group(repo_root: Path, files: list[str]) -> tuple[str, str, str]:
+    """Stage ``files`` into a throwaway private index; return (diff, names, content_key).
 
     Uses ``GIT_INDEX_FILE`` so the shared index/working tree is untouched and
-    many groups can run concurrently. ``git add -- <files>`` mirrors exactly
-    how the committer stages, so the resulting ``git diff --cached`` is the
-    same text the real commit will be hashed against.
+    many groups can run concurrently. The diff/names drive the review and the
+    too-big check; ``content_key`` is the base-independent fast-path key
+    (:func:`approvals.content_hash`), computed from the *same* index so it
+    matches what the real commit produces. Staged once — no double work.
     """
     fd, idx_path = tempfile.mkstemp(prefix="prereview-idx-")
     os.close(fd)
     try:
-        _git(["read-tree", "HEAD"], repo_root, idx_path)
-        _git(["add", "--", *files], repo_root, idx_path)
+        _stage_into(repo_root, files, idx_path)
         diff = _git(["diff", "--cached"], repo_root, idx_path)
         names = _git(["diff", "--cached", "--name-only"], repo_root, idx_path)
-        return diff, names
+        content_key = _content_key(repo_root, ["--cached"], idx_path)
+        return diff, names, content_key
     finally:
         os.unlink(idx_path)
+
+
+def build_group_diff(repo_root: Path, files: list[str]) -> tuple[str, str]:
+    """(diff, names) for a group — the 2-tuple shim over :func:`build_group`.
+
+    Kept for the whole-diff pass and call sites that don't need the content key.
+    """
+    diff, names, _ = build_group(repo_root, files)
+    return diff, names
+
+
+def _content_key(repo_root: Path, diff_args: list[str], index_file: str | None = None) -> str:
+    """Content key for the given diff selector, via :func:`approvals.content_hash_from_raw`.
+
+    ``diff_args`` selects the comparison: ``["--cached"]`` (index vs HEAD) for
+    the staged sides, or ``["<sha>~1", "<sha>"]`` for a landed commit. The git
+    invocation matches every other side (raw, full-index, NUL, no-renames) so
+    the key cannot drift.
+    """
+    raw = _git(
+        ["diff", "--raw", "--full-index", "-z", "--no-renames", *diff_args],
+        repo_root,
+        index_file,
+    )
+    return approvals.content_hash_from_raw(raw)
+
+
+def commit_content_key(repo_root: Path, sha: str) -> str:
+    """Content key of a *landed* commit (vs its parent) — the audit side.
+
+    Computed from the commit's post-image blobs, so it equals the pre-review
+    ``content_key`` of the group that produced it whenever the final bytes match
+    — independent of base drift, diff formatting, or how it was staged. Commits
+    in ``base..HEAD`` always have a parent, so there is no root-commit edge case.
+    """
+    return _content_key(repo_root, [f"{sha}~1", sha])
 
 
 def review_group(repo_root: Path, index: int, group: dict) -> dict:
@@ -120,31 +172,44 @@ def review_group(repo_root: Path, index: int, group: dict) -> dict:
     # propagate and sink the whole round. Broad by design — the error text is
     # surfaced in the record, never silently swallowed.
     try:
-        diff, names = build_group_diff(repo_root, files)
+        diff, names, content_key = build_group(repo_root, files)
         if not diff:
-            # Nothing to review (files unchanged vs HEAD). Treat as clean/no-op.
-            return _record(index, message, approvals.diff_hash(diff), "SKIP", False, True, [])
+            # Nothing to review (files unchanged vs HEAD). Treat as clean/no-op;
+            # no marker (there is no commit to fast-path).
+            return _record(index, message, approvals.diff_hash(diff), content_key, "SKIP", False, True, [])
         if count_added_production_lines(diff) >= MAX_PROD_LINES:
             # Rare (planner targets <=300). Don't pre-approve — let the live gate
             # run its chunked/manifest path at commit time.
-            return _record(index, message, approvals.diff_hash(diff), "TOO_BIG", True, False, [])
+            return _record(index, message, approvals.diff_hash(diff), content_key, "TOO_BIG", True, False, [])
         verdict, blockers = _gate_verdict(diff, names)
         approved = verdict in _APPROVE_VERDICTS
-        h = approvals.diff_hash(diff)
         if approved:
-            approvals.write_approval(repo_root, h)
-        return _record(index, message, h, verdict, False, approved, blockers)
+            # Marker keyed on the base-independent content key — the commit-time
+            # fast-path (hook._maybe_fastpath) recomputes the same key from the
+            # staged blobs and matches it here.
+            approvals.write_approval(repo_root, content_key)
+        return _record(index, message, approvals.diff_hash(diff), content_key, verdict, False, approved, blockers)
     except Exception as exc:
-        return _record(index, message, "", "ERROR", False, False, [f"review failed: {type(exc).__name__}: {exc}"])
+        return _record(index, message, "", "", "ERROR", False, False, [f"review failed: {type(exc).__name__}: {exc}"])
 
 
 def _record(
-    index: int, message: str, diff_hash: str, verdict: str, too_big: bool, approved: bool, blockers: list[str]
+    index: int,
+    message: str,
+    diff_hash: str,
+    content_key: str,
+    verdict: str,
+    too_big: bool,
+    approved: bool,
+    blockers: list[str],
 ) -> dict:
+    # diff_hash is log/back-compat only; content_key is the load-bearing
+    # fast-path key (written as the marker and matched by the gate + audit).
     return {
         "index": index,
         "message": message,
         "diff_hash": diff_hash,
+        "content_key": content_key,
         "verdict": verdict,
         "too_big": too_big,
         "approved": approved,
@@ -214,29 +279,103 @@ def _safe_head(repo_root: Path) -> str:
         return ""
 
 
-def hash_commit(repo_root: Path, sha: str) -> str:
-    """Canonical diff_hash of a *landed* commit (vs its parent).
-
-    ``git diff <sha>~1 <sha>`` reproduces, byte-for-byte, the ``git diff
-    --cached`` text the commit was staged from (same blob pair + paths), so
-    this matches the approval hash written at pre-review time. Computed in
-    Python through ``approvals.diff_hash`` so the audit cannot drift from the
-    write side. Commits in ``base..HEAD`` always have a parent (``base``), so
-    there is no root-commit edge case.
-    """
-    diff = _git(["diff", f"{sha}~1", sha], repo_root)
-    return approvals.diff_hash(diff)
-
-
 def verify_range(repo_root: Path, base: str) -> dict:
-    """Re-derive every ``base..HEAD`` commit's canonical diff_hash from git.
+    """Re-derive every ``base..HEAD`` commit's content key from git.
 
-    The post-Land integrity audit: the workflow checks each returned hash is
-    in its trusted approved-set. Run by a verifier agent that is NOT the
-    committer (role separation), reading the immutable git history.
+    The post-Land integrity audit: the workflow checks each returned key is in
+    its trusted approved-set (built from the pre-review markers). Run by a
+    verifier agent that is NOT the committer (role separation), reading the
+    immutable git history through :func:`commit_content_key`.
     """
     shas = [s for s in _git(["log", "--reverse", "--format=%H", f"{base}..HEAD"], repo_root).splitlines() if s]
-    return {"commits": [{"sha": s, "diff_hash": hash_commit(repo_root, s)} for s in shas]}
+    return {"commits": [{"sha": s, "content_key": commit_content_key(repo_root, s)} for s in shas]}
+
+
+def _changed_paths(repo_root: Path) -> set[str]:
+    """Working-tree paths that differ from HEAD: modified/deleted tracked + untracked.
+
+    Used for the advisory completeness check in :func:`validate_plan`. Avoids
+    porcelain rename parsing by unioning ``git diff --name-only HEAD`` (tracked
+    changes, incl. deletions) with the untracked set.
+    """
+    tracked = _git(["diff", "--name-only", "HEAD"], repo_root).splitlines()
+    untracked = _git(["ls-files", "--others", "--exclude-standard"], repo_root).splitlines()
+    return {p for p in (*tracked, *untracked) if p}
+
+
+def _normalize_plan(groups: list[dict]) -> dict:
+    """Deterministically merge groups that share a path into disjoint groups.
+
+    Connected-components over the "groups linked by a shared file" graph
+    (union-find). Files are unioned (dedup, order-preserving) and messages
+    joined. Output order follows the lowest original group index in each
+    component, so the result is stable. This is the engine's guaranteed-disjoint
+    fallback when the planner cannot produce a disjoint plan on its own.
+    """
+    n = len(groups)
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    seen: dict[str, int] = {}
+    for i, g in enumerate(groups):
+        for f in g.get("files", []):
+            if f in seen:
+                union(seen[f], i)
+            else:
+                seen[f] = i
+
+    merged: dict[int, dict] = {}
+    for i, g in enumerate(groups):
+        m = merged.setdefault(find(i), {"message": "", "files": []})
+        for f in g.get("files", []):
+            if f not in m["files"]:
+                m["files"].append(f)
+        msg = g.get("message", "")
+        m["message"] = msg if not m["message"] else (f"{m['message']}; {msg}" if msg else m["message"])
+    return {"groups": [merged[r] for r in sorted(merged)]}
+
+
+def validate_plan(repo_root: Path, plan: dict) -> dict:
+    """Deterministically check a commit plan is file-disjoint (fix A).
+
+    The dominant fast-path failure was a single file split across groups
+    (``tests/__init__.py`` across 5 groups): a group's isolated diff then never
+    matches the whole-file diff, so the fast-path is guaranteed to miss, and
+    committing one group changes another's base. This is a pure-data check (no
+    LLM), which is what makes vertical-slice grouping reliable despite the
+    planner being an LLM step.
+
+    Returns:
+      * ``overlaps`` — every path present in >=2 groups, with the group indices.
+      * ``valid`` — True iff there are no overlaps (the hard, reliable signal).
+      * ``uncovered`` — working-tree changed files in no group (ADVISORY only;
+        does not flip ``valid``, since porcelain edge cases could false-positive).
+      * ``normalized_plan`` — a guaranteed-disjoint plan (overlapping groups
+        merged) the engine can fall back to if a re-prompt still overlaps.
+    """
+    groups: list[dict] = plan.get("groups", [])
+    path_groups: dict[str, list[int]] = {}
+    for i, g in enumerate(groups):
+        for f in g.get("files", []):
+            path_groups.setdefault(f, []).append(i)
+    overlaps = [{"path": p, "groups": idxs} for p, idxs in sorted(path_groups.items()) if len(idxs) > 1]
+    uncovered = sorted(_changed_paths(repo_root) - set(path_groups))
+    return {
+        "valid": not overlaps,
+        "overlaps": overlaps,
+        "uncovered": uncovered,
+        "normalized_plan": _normalize_plan(groups),
+    }
 
 
 def _parse_pending(raw: str | None) -> list[int] | None:
@@ -262,7 +401,13 @@ def main(argv: list[str] | None = None) -> int:
         "--verify-range",
         default=None,
         metavar="BASE",
-        help="audit mode: emit canonical diff_hash for each BASE..HEAD commit",
+        help="audit mode: emit canonical content_key for each BASE..HEAD commit",
+    )
+    parser.add_argument(
+        "--validate-plan",
+        default=None,
+        metavar="PLAN_JSON",
+        help="validate mode: emit {valid,overlaps,uncovered,normalized_plan} for a commit plan",
     )
     parser.add_argument("--repo-root", default=None, help="repo root (default: cwd)")
     parser.add_argument("--reset", action="store_true", help="clear all approval markers first (round 1)")
@@ -277,8 +422,14 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("\n")
         return 0
 
+    if args.validate_plan:
+        plan = json.loads(Path(args.validate_plan).read_text())
+        json.dump(validate_plan(repo_root, plan), sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+
     if not args.plan:
-        parser.error("one of --plan or --verify-range is required")
+        parser.error("one of --plan, --verify-range, or --validate-plan is required")
 
     try:
         pending = _parse_pending(args.pending)

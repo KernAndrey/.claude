@@ -27,7 +27,9 @@ export const meta = {
 //   seededConcerns  [string] — issues the lead could not reconcile pre-launch
 // ---------------------------------------------------------------------------
 
-const a = args || {}
+// The Workflow harness delivers the `args` global as a JSON STRING, not an
+// object — so parse it. (Robust to both: object elsewhere, string here.)
+const a = (typeof args === 'string' ? (args ? JSON.parse(args) : {}) : (args || {}))
 const CODERS = a.coders || []
 const WORKTREE = a.worktreePath
 const SPEC = a.specPath
@@ -35,6 +37,16 @@ const BASE = a.baseBranch
 const TASK = a.taskId || 'TASK'
 const REVIEW_PROMPT = a.reviewPromptPath || null
 const knownConcerns = [].concat(a.seededConcerns || [])
+
+// Fail fast on misconfigured args rather than silently running coderless and
+// crashing minutes later on `CODERS[0].name` during fix-routing.
+if (!WORKTREE || !SPEC || !CODERS.length) {
+  throw new Error(
+    `sdd-implement-engine: bad args — WORKTREE=${WORKTREE}, SPEC=${SPEC}, ` +
+    `CODERS=${CODERS.length}, typeof args=${typeof args}. ` +
+    `Expected a JSON object/string with worktreePath, specPath, and a non-empty coders[].`,
+  )
+}
 
 // How many consecutive rounds the SAME finding may persist before it is
 // retired to Known Concerns. This is NOT a global round cap — productive rounds

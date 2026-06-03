@@ -652,19 +652,19 @@ const scribe = await agent(
   { agentType: 'general-purpose', label: 'land:scribe', phase: 'Land', schema: SCRIBE_SCHEMA },
 )
 
-// 4.2 — Plan logical commits (vertical slices, file-disjoint, <=300 prod lines each).
-// Fix A: groups MUST be file-disjoint vertical slices. A file split across
-// groups (tests/__init__.py across 5 groups on the HCC-097 run) makes each
-// group's isolated diff non-matching (fast-path miss) AND base-unstable
-// (committing one group changes another's). The disjointness rule is in the
-// prompt; validatePlanGroups then enforces it deterministically (LLM-free).
+// 4.2 — Plan the FEWEST cohesive commits (one per logical unit), file-disjoint.
+// SDD-002: size is a SOFT target overridden by cohesion — a coupled feature
+// stays ONE commit even when big; pre-review chunk-reviews it (the gate already
+// does). Disjointness stays a HARD rule: it's what keeps each group's isolated
+// diff content-stable (fast-path) AND base-stable (committing one doesn't shift
+// another). validatePlanGroups enforces disjointness deterministically (LLM-free).
 function planPrompt(extra) {
   return [
     preamble('Commit planner'),
-    `Plan logical commits for the full change set. Group by cohesive unit: each feature chunk together with its tests; config/infra separately; the finalized spec as its own docs commit.`,
-    `VERTICAL SLICES, FILE-DISJOINT (hard rule): each group is a writer + its consumers + that group's tests + that group's registration lines, together. NO file may appear in more than one group — never split a file's changes across groups.`,
+    `Plan the FEWEST coherent commits — ONE per logical unit: a writer + its consumers + THAT unit's tests, together in one group. A cohesive feature is ONE commit even if large; do NOT split it just to stay small. Keep genuinely independent changes (unrelated features, config/infra, the finalized spec docs) as their own commits so bisect still works — cohesion, never maximum size, decides the boundary.`,
+    `FILE-DISJOINT (hard rule): NO file may appear in more than one group — never split a file's changes across groups.`,
     `Shared files (e.g. tests/__init__.py, __manifest__.py, a shared compose/config file) are owned WHOLE by exactly ONE group — typically the integration/registration group, committed last — never split line-by-line across groups.`,
-    `Each group: <=300 added production lines (tests/docs/config do not count). Never "all code" then "all tests".`,
+    `Size (~400 added production lines; tests/docs/config don't count) is a SOFT target, overridden by cohesion: a coupled unit over the limit stays one commit (pre-review chunk-reviews it). Never "all code" then "all tests"; never a tests-only commit.`,
     `Conventional commit subjects, each prefixed with "${TASK}": e.g. "feat(${TASK}): ...".`,
     `Inspect the working tree with Bash (git status --porcelain, git diff --stat) inside ${WORKTREE} to enumerate every changed/new file, including the moved spec.`,
     `Return groups[] of { message, files[] } covering EVERY changed file exactly once.`,
@@ -733,17 +733,21 @@ const plan = {
   }),
 }
 
-// 4.2.5 — OPTIONAL parallel pre-review (only worth it for several commits).
-// Review every planned group concurrently (pre_review.py parallelizes inside
-// Python) and loop fixes until clean. Clean groups get an on-disk approval
-// marker; the committer's `git commit` then fast-paths past the slow LLM
-// review for that content. `approved` is the workflow's TRUSTED set, built
-// from the reviewer agent's return (not disk) and later cross-checked by an
-// independent verifier — so the committer (no-knowledge of the marker format)
-// cannot smuggle an unreviewed change past the audit.
-const PREREVIEW_MIN_GROUPS = 3
-const PREREVIEW_MAX_ROUNDS = 4 // optimization, not a gate: leftover groups just hit the live gate
+// 4.2.5 — Parallel pre-review (fires for 2+ commits). This is the load-bearing
+// SDD-002 win: each commit's review→fix convergence loop (10-15 rounds, hours
+// each at the gate) runs HERE for all commits AT ONCE, so a 3-commit feature
+// converges in ~one commit's wall-clock instead of three sequential ones. Big
+// cohesive groups are chunk-reviewed in parallel (per-group manifest authored by
+// this agent, like the committer fills the gate's). Clean groups get an on-disk
+// approval marker; the committer's `git commit` then fast-paths past the slow LLM
+// review for that content — reviewed exactly once. `approved` is the workflow's
+// TRUSTED set, built from the reviewer agent's return (not disk) and later
+// cross-checked by an independent verifier — so the committer (no-knowledge of
+// the marker format) cannot smuggle an unreviewed change past the audit.
+const PREREVIEW_MIN_GROUPS = 2 // skip only for a single commit (nothing to parallelize)
+const PREREVIEW_MAX_ROUNDS = 12 // must cover real convergence (10-15 cycles); else commits fall to the sequential gate and the parallel win is lost. Leftovers still just hit the live gate.
 const approved = new Set() // content keys the workflow trusts as CLEAN
+let lastPreReviewGroups = [] // final per-group records → audit exclusion (commits pre-review left for the gate)
 let preReviewRan = false
 if (plan.groups.length >= PREREVIEW_MIN_GROUPS) {
   preReviewRan = true
@@ -761,12 +765,14 @@ if (plan.groups.length >= PREREVIEW_MIN_GROUPS) {
         `2. From ${WORKTREE}, run exactly:`,
         `   python3 ~/.claude/review/pre_review.py --plan ${WORKTREE}/.review/prereview-plan.json --repo-root ${WORKTREE}${reset ? ' --reset' : ` --pending ${pending.join(',')}`}`,
         `   It reviews each group in parallel against a private git index and writes an approval marker for every CLEAN group. It can take many minutes — wait for it.`,
-        `3. Read its JSON stdout: { groups:[{index,message,content_key,verdict,too_big,approved,blockers}], wholediff:{verdict,blockers}, all_clean }. Each "blockers" is a list of reviewer lines for BLOCK verdicts, like "[F1] [CRITICAL] path:line — description".`,
-        `4. For each group return {index, contentKey:content_key, verdict, approved}. Parse each blocker line into {id, severity:"CRITICAL", file, description} and return them as that group's blockers[]. Do the same for wholediff.blockers.`,
+        `3. MANIFESTS for big groups: any group whose verdict is "NEEDS_MANIFEST" is a big cohesive commit that must be CHUNK-reviewed. The script has written a scaffold at ${WORKTREE}/.review/prereview/group-<index>/manifest.yaml. For EACH such group, OPEN that file and fill in 'chunks:' — split the group's files into <=6 chunks, each <=400 added PRODUCTION lines (tests/docs/config don't count), every changed file in exactly ONE chunk (use 'line_ranges: all' for whole files; split a single oversized file with explicit ranges). Do NOT edit 'diff_hash'. Then RE-RUN the same command with '--pending <comma-separated NEEDS_MANIFEST indices>' (NO --reset) so those groups chunk-review in parallel. If a group comes back NEEDS_MANIFEST again, its blockers[] hold the validator's errors — fix that manifest and re-run. Repeat until NO group is NEEDS_MANIFEST. (If a group truly cannot fit in 6 chunks, leave its manifest's chunks empty and stop retrying it — it will be reviewed once at the commit gate.)`,
+        `4. Read the FINAL run's JSON stdout: { groups:[{index,message,content_key,verdict,too_big,approved,blockers}], wholediff:{verdict,blockers}, all_clean }. Each "blockers" is a list of reviewer lines for BLOCK verdicts, like "[F1] [CRITICAL] path:line — description".`,
+        `5. For each group return {index, contentKey:content_key, verdict, approved}. Parse each blocker line into {id, severity:"CRITICAL", file, description} and return them as that group's blockers[]. Do the same for wholediff.blockers.`,
         `Return PREREVIEW_SCHEMA exactly: groups[], wholediff{verdict,blockers}, allClean (= all_clean).`,
       ].join('\n'),
       { agentType: 'general-purpose', label: `prereview:round${round}`, phase: 'Pre-review', schema: PREREVIEW_SCHEMA },
     )
+    lastPreReviewGroups = pr.groups
     for (const gr of pr.groups) if (gr.approved && gr.contentKey) approved.add(gr.contentKey)
     const wholediffClean = pr.wholediff.verdict === 'OK' || pr.wholediff.verdict === 'SKIP'
     if (pr.allClean || (pr.groups.every(g => g.approved) && wholediffClean)) {
@@ -880,7 +886,20 @@ if (preReviewRan && commitLedger.length) {
     ].join('\n'),
     { agentType: 'general-purpose', label: 'verify:land', phase: 'Verify', schema: VERIFY_SCHEMA },
   )
-  const unapproved = vr.commits.filter(c => !approved.has(c.contentKey))
+  // Exclude commits pre-review intentionally left for the gate (big or blocked
+  // groups it did NOT approve): those already went through the FULL gate review
+  // once, so the audit must not force a redundant THIRD review — the exact
+  // double-review SDD-002 targets. Keyed on content identity: if committed content
+  // DRIFTED from what pre-review saw, the key won't match and the audit still
+  // (correctly) flags it. KNOWN LIMITATION: a group BLOCKED in pre-review and fixed
+  // LATE (after its final pre-review round) lands with a content key != its stale
+  // pre-review key, so it is not excluded and gets one redundant audit review —
+  // wasteful, not unsafe (no bad code lands). The clean fix is a real "did it
+  // fast-path?" signal rather than "was this content pre-approved?"; out of scope.
+  const expectedGateReviewed = new Set(
+    lastPreReviewGroups.filter(g => !g.approved && g.contentKey).map(g => g.contentKey),
+  )
+  const unapproved = vr.commits.filter(c => !approved.has(c.contentKey) && !expectedGateReviewed.has(c.contentKey))
   if (unapproved.length) {
     for (const c of unapproved) {
       knownConcerns.push(`INTEGRITY: landed commit ${c.sha.slice(0, 9)} was not in the pre-reviewed approved set — its review provenance is unverified.`)

@@ -12,8 +12,12 @@ exercise git plumbing directly.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -309,17 +313,317 @@ def test_review_group_no_marker_on_block(tmp_path: Path) -> None:
     assert approvals.approval_exists(repo, rec["content_key"]) is False
 
 
-def test_review_group_too_big_left_to_live_gate(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# Big cohesive groups — SDD-002: chunk-review in pre-review (no TOO_BIG bail)
+# ---------------------------------------------------------------------------
+
+
+def _big_body(prefix: str = "v", n: int = 500) -> str:
+    """>= MAX_PROD_LINES added production lines so the group takes the big path."""
+    return "".join(f"{prefix}{i} = {i}\n" for i in range(n))
+
+
+def _chunked_result(status: str = "ok", upheld: tuple = (), blocking_text: str = "") -> SimpleNamespace:
+    """Mimic the fields ``_review_big_group`` reads off a ``ChunkedResult``."""
+    clusters = [SimpleNamespace(canonical_line=line) for line in upheld]
+    return SimpleNamespace(status=status, upheld_clusters=clusters, blocking_text=blocking_text)
+
+
+def _manifest_all(diff: str, files: list[str]) -> str:
+    """A filled manifest (one whole-file chunk per file) — enough for
+    ``_ensure_group_manifest`` to read it as authored. Used where
+    ``run_chunked_review`` is mocked, so chunk SIZE is not validated."""
+    chunks = "".join(
+        f"  - id: chunk_{i}\n    rationale: r\n    files:\n      - path: {f}\n        line_ranges: all\n"
+        for i, f in enumerate(files, 1)
+    )
+    return (
+        f"version: 1\ndiff_hash: {approvals.diff_hash(diff)}\n"
+        "default_related_files: []\ncross_chunk_invariants: []\nchunks:\n" + chunks
+    )
+
+
+def _author_manifest(repo: Path, index: int, diff: str, files: list[str]) -> Path:
+    mdir = repo / ".review" / "prereview" / f"group-{index}"
+    mdir.mkdir(parents=True, exist_ok=True)
+    mpath = mdir / "manifest.yaml"
+    mpath.write_text(_manifest_all(diff, files))
+    return mpath
+
+
+def test_review_group_big_scaffolds_manifest_then_needs_author(tmp_path: Path) -> None:
+    """No manifest yet → NEEDS_MANIFEST + a scaffold the agent fills; review is
+    NOT run (would be reviewing an unauthored split)."""
     repo = tmp_path / "r"
     _init_repo(repo)
-    body = "".join(f"v{i} = {i}\n" for i in range(500))  # >= MAX_PROD_LINES added prod lines
-    _write(repo, "big.py", body)
-    # _gate_verdict must NOT be consulted for an over-limit group.
-    with patch("pre_review._gate_verdict", side_effect=AssertionError("must not review")):
+    _write(repo, "big.py", _big_body())
+    with patch("chunked.run_chunked_review", side_effect=AssertionError("must not review without a manifest")):
         rec = pre_review.review_group(repo, 0, {"message": "m", "files": ["big.py"]})
+    assert rec["verdict"] == "NEEDS_MANIFEST"
     assert rec["too_big"] is True
     assert rec["approved"] is False
     assert approvals.approval_exists(repo, rec["content_key"]) is False
+    mpath = repo / ".review" / "prereview" / "group-0" / "manifest.yaml"
+    assert mpath.exists()
+    text = mpath.read_text()
+    diff, _names, _ck = pre_review.build_group(repo, ["big.py"])
+    assert f"diff_hash: {approvals.diff_hash(diff)}" in text  # correct hash for the agent
+    assert "big.py" in text  # file checklist
+    assert "chunks: []" in text  # empty → reads as NEEDS_MANIFEST until filled
+
+
+def test_review_group_big_clean_chunked_writes_marker(tmp_path: Path) -> None:
+    """Authored manifest + CLEAN chunked review → marker written, verdict OK, and
+    the call was driven with the group's OWN manifest/artifacts dir + a runner."""
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "big.py", _big_body())
+    diff, _names, content_key = pre_review.build_group(repo, ["big.py"])
+    mpath = _author_manifest(repo, 0, diff, ["big.py"])
+    with patch("chunked.run_chunked_review", return_value=_chunked_result("ok", ())) as m:
+        rec = pre_review.review_group(repo, 0, {"message": "m", "files": ["big.py"]})
+    assert m.called
+    _args, kw = m.call_args
+    assert kw["manifest_path"] == mpath
+    assert kw["review_dir"] == mpath.parent
+    assert callable(kw["runner"])
+    assert rec["verdict"] == "OK"
+    assert rec["approved"] is True
+    assert approvals.approval_exists(repo, content_key) is True
+
+
+def test_review_group_big_block_writes_no_marker(tmp_path: Path) -> None:
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "big.py", _big_body())
+    diff, _names, content_key = pre_review.build_group(repo, ["big.py"])
+    _author_manifest(repo, 0, diff, ["big.py"])
+    upheld = ("[F1] [CRITICAL] big.py:1 — real bug",)
+    with patch("chunked.run_chunked_review", return_value=_chunked_result("ok", upheld)):
+        rec = pre_review.review_group(repo, 0, {"message": "m", "files": ["big.py"]})
+    assert rec["verdict"] == "BLOCK"
+    assert rec["approved"] is False
+    assert any("real bug" in b for b in rec["blockers"])
+    assert approvals.approval_exists(repo, content_key) is False
+
+
+def test_review_group_big_invalid_manifest_bounces_to_author(tmp_path: Path) -> None:
+    """A bad chunk split (validator failed) → NEEDS_MANIFEST carrying the errors,
+    no marker."""
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "big.py", _big_body())
+    diff, _names, content_key = pre_review.build_group(repo, ["big.py"])
+    _author_manifest(repo, 0, diff, ["big.py"])
+    bad = _chunked_result("manifest_invalid", (), blocking_text="chunk 'chunk_1': 700 added prod lines, max is 400")
+    with patch("chunked.run_chunked_review", return_value=bad):
+        rec = pre_review.review_group(repo, 0, {"message": "m", "files": ["big.py"]})
+    assert rec["verdict"] == "NEEDS_MANIFEST"
+    assert rec["approved"] is False
+    assert any("max is 400" in b for b in rec["blockers"])
+    assert approvals.approval_exists(repo, content_key) is False
+
+
+def test_review_big_group_real_pipeline_clean_writes_marker(tmp_path: Path) -> None:
+    """Integration: a big group through the REAL run_chunked_review (reviewer
+    subprocesses stubbed CLEAN) writes the approval marker and returns OK.
+
+    Exercises the success path the mocked tests skip: validate against the private
+    index → spawn the real chunk + whole-diff jobs → arbiter skipped (no findings)
+    → _review_big_group writes the marker. This is the path a real /implement-wf
+    run depends on, proven here without LLM calls."""
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "big.py", _big_body(n=500))
+    diff, _names, content_key = pre_review.build_group(repo, ["big.py"])
+    # A VALID 2-chunk split (one whole-file chunk would be oversized at 500 prod).
+    mdir = repo / ".review" / "prereview" / "group-0"
+    mdir.mkdir(parents=True)
+    (mdir / "manifest.yaml").write_text(
+        f"version: 1\ndiff_hash: {approvals.diff_hash(diff)}\n"
+        "default_related_files: []\ncross_chunk_invariants: []\nchunks:\n"
+        "  - id: chunk_1\n    rationale: r\n    files:\n      - path: big.py\n        line_ranges: [[1, 250]]\n"
+        "  - id: chunk_2\n    rationale: r\n    files:\n      - path: big.py\n        line_ranges: [[251, 500]]\n"
+    )
+    spawned = {"n": 0}
+
+    def clean_reviewer(*args: object, **kwargs: object) -> tuple[str, str, int]:
+        spawned["n"] += 1
+        # Non-empty output that parses to ZERO findings = a real CLEAN review.
+        # (Empty stdout is treated as a reviewer FAILURE, not a pass.)
+        return ("No issues found — reviewed clean.\n", "", 0)
+
+    with patch("hook.run_reviewer", side_effect=clean_reviewer):
+        rec = pre_review.review_group(repo, 0, {"message": "m", "files": ["big.py"]})
+    assert spawned["n"] > 0  # the real pipeline actually spawned reviewer jobs
+    assert rec["verdict"] == "OK"
+    assert rec["approved"] is True
+    assert approvals.approval_exists(repo, content_key) is True
+
+
+def test_ensure_group_manifest_refreshes_hash_when_fileset_unchanged(tmp_path: Path) -> None:
+    """A fix round that only moved line counts must NOT bounce to the agent:
+    same file-set → refresh diff_hash in place, keep the authored chunks."""
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "big.py", _big_body())
+    diff, names, _ck = pre_review.build_group(repo, ["big.py"])
+    mdir = repo / ".review" / "prereview" / "group-0"
+    mdir.mkdir(parents=True)
+    mpath = mdir / "manifest.yaml"
+    # Author with a STALE (wrong) diff_hash but the correct file-set.
+    mpath.write_text(_manifest_all("+totally different\n", ["big.py"]))
+    status = pre_review._ensure_group_manifest(mpath, diff, names, repo)
+    assert status == "ready"
+    text = mpath.read_text()
+    assert f"diff_hash: {approvals.diff_hash(diff)}" in text  # refreshed in place
+    assert "chunk_1" in text  # authored chunks preserved (not re-scaffolded)
+
+
+def test_ensure_group_manifest_rescaffolds_when_fileset_changes(tmp_path: Path) -> None:
+    """Files added/removed → the split must be re-authored (fresh empty scaffold)."""
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "big.py", _big_body())
+    _write(repo, "extra.py", "x = 1\n")
+    diff, names, _ck = pre_review.build_group(repo, ["big.py", "extra.py"])
+    mdir = repo / ".review" / "prereview" / "group-0"
+    mdir.mkdir(parents=True)
+    mpath = mdir / "manifest.yaml"
+    # Manifest claims only big.py, but the group now also has extra.py.
+    mpath.write_text(_manifest_all(diff, ["big.py"]))
+    status = pre_review._ensure_group_manifest(mpath, diff, names, repo)
+    assert status == "needs_manifest"
+    assert "chunks: []" in mpath.read_text()  # re-scaffolded empty for the agent
+
+
+def test_concurrent_big_groups_use_isolated_dirs_and_private_index(tmp_path: Path) -> None:
+    """The load-bearing test: two big groups reviewed in parallel get DISTINCT
+    per-group manifest + artifacts dirs (no collision), and the chunked review of
+    each reads its OWN private index (not the empty real one)."""
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "a.py", _big_body("a"))
+    _write(repo, "b.py", _big_body("b"))
+    for idx, f in ((0, "a.py"), (1, "b.py")):
+        diff, _n, _ck = pre_review.build_group(repo, [f])
+        _author_manifest(repo, idx, diff, [f])
+
+    seen: list[tuple] = []
+    lock = threading.Lock()
+
+    def fake(diff: str, files: str, repo_root: Path, **kw: object) -> SimpleNamespace:
+        with lock:
+            seen.append((kw["manifest_path"], kw["review_dir"]))
+        # Prove the runner reads the group's PRIVATE index — the real index is
+        # empty during pre-review, so a missing/wrong runner would yield "" here
+        # and the chunked validator would falsely report 0 changed files.
+        staged = kw["runner"](["diff", "--cached", "--name-only"])
+        assert staged.strip(), "runner must read the private index with staged files"
+        return _chunked_result("ok", ())
+
+    plan = {"groups": [{"message": "a", "files": ["a.py"]}, {"message": "b", "files": ["b.py"]}]}
+    # Mock the whole-diff pass too (run_pre_review reviews the union via _gate_verdict)
+    # so the test exercises only the big-group chunked path, deterministically.
+    with (
+        patch("chunked.run_chunked_review", side_effect=fake),
+        patch("pre_review._gate_verdict", return_value=("OK", [])),
+    ):
+        report = pre_review.run_pre_review(repo, plan, pending=None, reset=True, max_workers=4)
+
+    assert report["all_clean"] is True
+    assert len({m for m, _ in seen}) == 2  # distinct per-group manifests
+    assert len({r for _, r in seen}) == 2  # distinct per-group artifacts dirs
+    for f in ("a.py", "b.py"):
+        _d, _n, ck = pre_review.build_group(repo, [f])
+        assert approvals.approval_exists(repo, ck) is True
+
+
+def test_chunked_validation_uses_injected_runner_for_private_index(tmp_path: Path) -> None:
+    """Directly proves the runner is what makes the chunked validator see the
+    staged change-set: with the private-index runner the manifest validates; with
+    the default runner (real, empty index) it does not."""
+    from validators.manifest import validate
+
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "big.py", _big_body(n=500))
+    diff, _names, _ck = pre_review.build_group(repo, ["big.py"])
+    # Split the 500-line file into two <=400-prod-line chunks so the manifest is
+    # genuinely valid (one whole-file chunk would be oversized).
+    manifest = (
+        f"version: 1\ndiff_hash: {approvals.diff_hash(diff)}\n"
+        "default_related_files: []\ncross_chunk_invariants: []\nchunks:\n"
+        "  - id: chunk_1\n    rationale: r\n    files:\n      - path: big.py\n        line_ranges: [[1, 250]]\n"
+        "  - id: chunk_2\n    rationale: r\n    files:\n      - path: big.py\n        line_ranges: [[251, 500]]\n"
+    )
+    fd, idx = tempfile.mkstemp(prefix="prereview-chunk-test-")
+    os.close(fd)
+    pre_review._stage_into(repo, ["big.py"], idx)
+    try:
+        ok = validate(manifest, diff, repo, runner=lambda a: pre_review._git_raw(a, repo, idx))
+        bad = validate(manifest, diff, repo)  # default runner → real (empty) index
+    finally:
+        os.unlink(idx)
+    assert ok.ok is True  # private index → manifest covers the staged files
+    assert bad.ok is False  # real index empty → validation fails → the runner mattered
+
+
+def test_run_chunked_review_threads_per_group_paths(tmp_path: Path) -> None:
+    """End-to-end (no mock): a custom manifest_path + review_dir + runner drive
+    the real ``run_chunked_review``. An invalid manifest makes it short-circuit at
+    validation (before any reviewer spawns), proving the runner is consulted and
+    artifacts land under the per-group review_dir — the chunked.py plumbing."""
+    import chunked
+
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "big.py", _big_body())
+    diff, names, _ck = pre_review.build_group(repo, ["big.py"])
+    mdir = tmp_path / "g0"
+    mdir.mkdir()
+    mpath = mdir / "manifest.yaml"
+    # Stale hash + one oversized whole-file chunk → validation fails (no reviewers).
+    mpath.write_text(_manifest_all("+stale\n", ["big.py"]))
+    runner_calls: list[list[str]] = []
+    fd, idx = tempfile.mkstemp(prefix="prereview-chunk-test-")
+    os.close(fd)
+    pre_review._stage_into(repo, ["big.py"], idx)
+
+    def runner(args: list[str]) -> str:
+        runner_calls.append(args[:2])
+        return pre_review._git_raw(args, repo, idx)
+
+    try:
+        result = chunked.run_chunked_review(diff, names, repo, manifest_path=mpath, review_dir=mdir, runner=runner)
+    finally:
+        os.unlink(idx)
+    assert result.status == "manifest_invalid"
+    assert runner_calls  # the injected runner drove the validate path
+    assert (mdir / "state" / "00_validation.json").exists()  # per-group review_dir used for artifacts
+
+
+def test_manifest_helpers_tolerate_malformed_input(tmp_path: Path) -> None:
+    """Defensive paths: non-dict chunks/entries are ignored, and an unparseable
+    manifest re-scaffolds rather than crashing the worker thread."""
+    # Non-dict chunk ("oops") skipped; non-dict entry ("x") and a path-less entry
+    # skipped; only the well-formed {"path": ...} is claimed.
+    claimed = pre_review._manifest_claimed_files(
+        {"chunks": ["oops", {"files": ["x", {"no": "path"}, {"path": "a.py"}]}]}
+    )
+    assert claimed == {"a.py"}
+    assert pre_review._manifest_claimed_files({}) == set()
+
+    repo = tmp_path / "r"
+    _init_repo(repo)
+    _write(repo, "big.py", _big_body())
+    diff, names, _ck = pre_review.build_group(repo, ["big.py"])
+    mdir = repo / ".review" / "prereview" / "group-0"
+    mdir.mkdir(parents=True)
+    mpath = mdir / "manifest.yaml"
+    mpath.write_text("[unclosed flow")  # invalid YAML → yaml.YAMLError
+    assert pre_review._ensure_group_manifest(mpath, diff, names, repo) == "needs_manifest"
+    assert "chunks: []" in mpath.read_text()  # re-scaffolded for the agent
 
 
 # ---------------------------------------------------------------------------

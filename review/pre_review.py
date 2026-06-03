@@ -37,13 +37,17 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
+import yaml
+
 import approvals
-from config import MAX_PROD_LINES
+from config import MAX_CHUNKS, MAX_PROD_LINES, PREREVIEW_MAX_CONCURRENT_CHUNKED
 from consolidation import consolidate
 from hook import applicable_lenses, count_added_production_lines
 from orchestrator import run_multi_backend
@@ -52,6 +56,14 @@ from orchestrator import run_multi_backend
 # BLOCK = upheld critical(s); EMPTY = every reviewer failed (don't approve —
 # let the live gate retry); SKIP = no applicable lens (gate would exit 0 too).
 _APPROVE_VERDICTS = frozenset({"OK", "SKIP"})
+
+# Bound how many BIG (chunked) groups review AT ONCE. Each chunked review fans
+# out uncapped internally (chunked.py: max_workers=len(jobs)), so the nested
+# product groups×jobs is what melts the backend — not any single review. The
+# realistic 2-3-big-commit feature still runs fully in parallel (the whole point:
+# overlap the multi-round convergence latency). Small single-call groups never
+# touch this. See config.PREREVIEW_MAX_CONCURRENT_CHUNKED.
+_CHUNKED_SEM = threading.BoundedSemaphore(PREREVIEW_MAX_CONCURRENT_CHUNKED)
 
 
 def _gate_verdict(diff: str, names: str) -> tuple[str, list[str]]:
@@ -159,6 +171,175 @@ def commit_content_key(repo_root: Path, sha: str) -> str:
     return _content_key(repo_root, [f"{sha}~1", sha])
 
 
+def _prereview_dir(repo_root: Path, index: int) -> Path:
+    """Private per-group manifest + artifacts dir for a big group's chunked review.
+
+    Each big group gets its OWN ``.review/prereview/group-<i>/`` so parallel
+    chunk-reviews never clobber a sibling's manifest/state, and so none of it
+    collides with the gate's top-level ``.review/manifest.yaml`` (left untouched,
+    so a fall-through commit still auto-scaffolds normally). ``.review/`` is
+    gitignored, so nothing here is ever committed.
+    """
+    return repo_root / ".review" / "prereview" / f"group-{index}"
+
+
+def _git_raw(args: list[str], repo_root: Path, index_file: str) -> str:
+    """Like :func:`_git` but returns UNSTRIPPED stdout, byte-for-byte matching
+    ``validators.manifest._default_git_runner``.
+
+    The chunked validator reads name-status/numstat through an injected runner;
+    feeding it this (pointed at the group's private ``GIT_INDEX_FILE``) makes the
+    pre-review read its private index identically to how the gate reads the real
+    one — so the validation that passes here also passes at the gate.
+    """
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo_root,
+        env={**os.environ, "GIT_INDEX_FILE": index_file},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+
+def _scaffold_group_manifest(diff: str, names: str, repo_root: Path) -> str:
+    """Empty per-group manifest for the pre-review agent to fill (mirrors the
+    gate's auto-scaffold).
+
+    Carries the correct ``diff_hash`` + a file checklist; ``chunks: []`` makes the
+    validator report ``no_chunks`` until the agent supplies the split, which is how
+    an un-filled scaffold reads as ``NEEDS_MANIFEST`` rather than passing review.
+    """
+    file_list = [f for f in names.splitlines() if f]
+    related = (
+        "default_related_files:\n  - CLAUDE.md" if (repo_root / "CLAUDE.md").exists() else "default_related_files: []"
+    )
+    header = [
+        "# Big cohesive commit group — fill in `chunks:` so the chunked reviewers run.",
+        f"#   <= {MAX_CHUNKS} chunks; each <= {MAX_PROD_LINES} added PROD lines",
+        "#   (tests/docs/config do NOT count); every file in EXACTLY one chunk;",
+        "#   prefer `line_ranges: all` for whole files. Do NOT edit diff_hash.",
+        "#   This group is one commit of a consistent multi-commit branch: the",
+        "#   working tree (Read/Grep) is authoritative — do not flag a symbol or",
+        "#   test that lives in a sibling commit; record such cross-commit",
+        "#   assumptions under cross_chunk_invariants instead.",
+        "# Files in this group (each must appear in exactly one chunk):",
+        *[f"#   - {f}" for f in file_list],
+    ]
+    return "\n".join(
+        [
+            "version: 1",
+            f"diff_hash: {approvals.diff_hash(diff)}",
+            "",
+            *header,
+            "",
+            related,
+            "cross_chunk_invariants: []",
+            "chunks: []",
+            "",
+        ]
+    )
+
+
+def _manifest_claimed_files(manifest: dict) -> set[str]:
+    """Every ``path`` the manifest's chunks claim — used to tell a stale-hash
+    refresh (same files, line counts moved) from a real re-author (files added or
+    removed)."""
+    out: set[str] = set()
+    for chunk in manifest.get("chunks") or []:
+        if not isinstance(chunk, dict):
+            continue
+        for entry in chunk.get("files") or []:
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                out.add(entry["path"])
+    return out
+
+
+def _refresh_manifest_diff_hash(mpath: Path, diff_hash: str) -> None:
+    """Rewrite ONLY the ``diff_hash:`` line, preserving the agent's chunks/comments."""
+    text = mpath.read_text(encoding="utf-8")
+    new_text, n = re.subn(r"(?m)^diff_hash:.*$", f"diff_hash: {diff_hash}", text)
+    mpath.write_text(new_text if n else f"diff_hash: {diff_hash}\n{text}", encoding="utf-8")
+
+
+def _ensure_group_manifest(mpath: Path, diff: str, names: str, repo_root: Path) -> str:
+    """Make ``mpath`` ready for a chunked review, or signal the agent to author it.
+
+    Returns ``"ready"`` when a filled manifest already claims the current file-set
+    (its ``diff_hash`` is refreshed in place so a fix round that only moved line
+    counts does NOT bounce back to the agent — that keeps the LLM off the
+    steady-state critical path, which is where the parallel-convergence win lives).
+    Returns ``"needs_manifest"`` (writing a fresh empty scaffold) when there is no
+    manifest yet, it is un-filled, or the changed file-set shifted so the split
+    must be (re)authored.
+    """
+    current_files = {f for f in names.splitlines() if f}
+    if mpath.exists():
+        try:
+            loaded = yaml.safe_load(mpath.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError:
+            loaded = {}
+        if isinstance(loaded, dict) and _manifest_claimed_files(loaded) == current_files and current_files:
+            _refresh_manifest_diff_hash(mpath, approvals.diff_hash(diff))
+            return "ready"
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    mpath.write_text(_scaffold_group_manifest(diff, names, repo_root), encoding="utf-8")
+    return "needs_manifest"
+
+
+def _review_big_group(repo_root: Path, index: int, group: dict, diff: str, names: str, content_key: str) -> dict:
+    """Chunk-review a big cohesive group through the SAME pipeline the gate uses.
+
+    Replaces the old ``TOO_BIG`` bail. Bailing left the group for the live gate,
+    which reviewed it once AND then the post-Land audit force-reviewed it again
+    (it was never pre-approved) — the exact double review SDD-002 kills. Instead
+    pre-review chunk-reviews it now, in parallel with sibling groups (bounded by
+    ``_CHUNKED_SEM``), against a per-group manifest + private index. CLEAN → write
+    the marker so the commit fast-paths and is reviewed exactly once.
+
+    When the per-group manifest is missing/un-filled/stale-by-file-set, returns
+    ``NEEDS_MANIFEST`` so the pre-review agent authors the chunk split (as the
+    committer already does at the gate) and re-runs.
+    """
+    message = group.get("message", "")
+    dh = approvals.diff_hash(diff)
+    review_dir = _prereview_dir(repo_root, index)
+    mpath = review_dir / "manifest.yaml"
+    if _ensure_group_manifest(mpath, diff, names, repo_root) == "needs_manifest":
+        return _record(index, message, dh, content_key, "NEEDS_MANIFEST", True, False, [])
+
+    from chunked import run_chunked_review  # lazy: heavy import, mirrors hook.py
+
+    fd, idx_path = tempfile.mkstemp(prefix=f"prereview-chunk-{index}-")
+    os.close(fd)
+    try:
+        # A PERSISTENT private index (build_group's is already unlinked): the
+        # chunked validator reads it through `runner` for the whole call.
+        _stage_into(repo_root, group.get("files", []), idx_path)
+        with _CHUNKED_SEM:
+            result = run_chunked_review(
+                diff,
+                names,
+                repo_root,
+                manifest_path=mpath,
+                review_dir=review_dir,
+                runner=lambda a: _git_raw(a, repo_root, idx_path),
+            )
+    finally:
+        os.unlink(idx_path)
+
+    if result.status == "manifest_invalid":
+        # The agent's chunk split is invalid (coverage/size/stale ranges). Bounce
+        # back with the validator's errors so it fixes the SAME manifest.
+        return _record(index, message, dh, content_key, "NEEDS_MANIFEST", True, False, [result.blocking_text])
+    if result.upheld_clusters:
+        return _record(
+            index, message, dh, content_key, "BLOCK", True, False, [c.canonical_line for c in result.upheld_clusters]
+        )
+    approvals.write_approval(repo_root, content_key)
+    return _record(index, message, dh, content_key, "OK", True, True, [])
+
+
 def review_group(repo_root: Path, index: int, group: dict) -> dict:
     """Review one commit group in isolation; write its marker if it passes.
 
@@ -178,9 +359,12 @@ def review_group(repo_root: Path, index: int, group: dict) -> dict:
             # no marker (there is no commit to fast-path).
             return _record(index, message, approvals.diff_hash(diff), content_key, "SKIP", False, True, [])
         if count_added_production_lines(diff) >= MAX_PROD_LINES:
-            # Rare (planner targets <=300). Don't pre-approve — let the live gate
-            # run its chunked/manifest path at commit time.
-            return _record(index, message, approvals.diff_hash(diff), content_key, "TOO_BIG", True, False, [])
+            # Big cohesive commit: chunk-review it through the SAME pipeline the
+            # gate uses (per-group manifest + private index), in parallel with
+            # sibling groups, instead of bailing TOO_BIG. CLEAN → marker →
+            # fast-path → reviewed exactly once (no gate re-review, no audit
+            # double-review). May return NEEDS_MANIFEST for the agent to author.
+            return _review_big_group(repo_root, index, group, diff, names, content_key)
         verdict, blockers = _gate_verdict(diff, names)
         approved = verdict in _APPROVE_VERDICTS
         if approved:

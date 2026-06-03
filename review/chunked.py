@@ -38,7 +38,7 @@ import yaml
 import config
 from config import ARBITER, CHUNKED_BACKENDS, FALLBACK, RunnerConfig
 from consolidation import FindingCluster, parse_multi_arbiter_output
-from validators.manifest import ValidationResult
+from validators.manifest import GitRunner, ValidationResult
 from validators.manifest import validate as validate_manifest
 
 
@@ -110,11 +110,16 @@ class _RunPersister:
     that compose the pipeline without on-disk forensics.
     """
 
-    def __init__(self, repo_root: Path | None = None) -> None:
-        self._enabled = repo_root is not None
+    def __init__(self, repo_root: Path | None = None, *, review_dir: Path | None = None) -> None:
+        # ``review_dir`` overrides the default ``<repo_root>/.review`` so a caller
+        # running several pipelines concurrently (pre-review chunk-reviewing many
+        # commit groups at once) can give each its own private artifacts dir and
+        # never clobber a sibling's ``state/``/``raw/``. When supplied it alone
+        # enables the persister, even without a ``repo_root``.
+        self._enabled = repo_root is not None or review_dir is not None
         if self._enabled:
-            assert repo_root is not None  # type narrowing for mypy
-            self.review_dir = repo_root / ".review"
+            base = review_dir if review_dir is not None else (repo_root / ".review")  # type: ignore[operator]
+            self.review_dir = base
             self.state_dir = self.review_dir / "state"
             self.raw_dir = self.review_dir / "raw"
         self._stage = "init"
@@ -717,10 +722,16 @@ class _RunInputs:
     validation: ValidationResult = field(default_factory=ValidationResult)
 
 
-def _load_and_validate(diff: str, repo_root: Path) -> _RunInputs:
-    text = _manifest_path(repo_root).read_text(encoding="utf-8")
+def _load_and_validate(
+    diff: str,
+    repo_root: Path,
+    *,
+    manifest_path: Path | None = None,
+    runner: GitRunner | None = None,
+) -> _RunInputs:
+    text = (manifest_path or _manifest_path(repo_root)).read_text(encoding="utf-8")
     inputs = _RunInputs(manifest_text=text)
-    inputs.validation = validate_manifest(text, diff, repo_root)
+    inputs.validation = validate_manifest(text, diff, repo_root, runner=runner)
     if inputs.validation.ok:
         loaded = yaml.safe_load(text)
         if isinstance(loaded, dict):
@@ -867,18 +878,29 @@ def run_chunked_review(
     repo_root: Path,
     *,
     is_merge: bool = False,
+    manifest_path: Path | None = None,
+    review_dir: Path | None = None,
+    runner: GitRunner | None = None,
 ) -> ChunkedResult:
     """Run the chunked pipeline end-to-end on the current staged diff.
 
-    Caller must have already verified ``manifest_present(repo_root)``.
+    Caller must have already verified ``manifest_present(repo_root)`` (or the
+    equivalent for an explicit ``manifest_path``).
 
-    Per-stage state is flushed to ``.review/state/`` and per-job raw
-    output to ``.review/raw/`` as soon as each stage completes, so a
+    ``manifest_path``/``review_dir``/``runner`` let a caller drive the pipeline
+    off something other than ``<repo_root>/.review`` against the real
+    ``.git/index``: pre-review reviews each planned commit group in parallel,
+    each with its OWN per-group manifest + artifacts dir, staged into a private
+    ``GIT_INDEX_FILE`` index that ``runner`` reads. Defaults reproduce the gate's
+    behaviour (top-level manifest, real index) exactly.
+
+    Per-stage state is flushed to ``<review_dir>/state/`` and per-job raw
+    output to ``<review_dir>/raw/`` as soon as each stage completes, so a
     crash anywhere in the pipeline still leaves a complete forensic
     trail for the writer.
     """
     started = time.monotonic()
-    persister = _RunPersister(repo_root)
+    persister = _RunPersister(repo_root, review_dir=review_dir)
     persister.reset_state_dirs()
     try:
         return _run_chunked_review_impl(
@@ -888,6 +910,8 @@ def run_chunked_review(
             is_merge=is_merge,
             started=started,
             persister=persister,
+            manifest_path=manifest_path,
+            runner=runner,
         )
     except Exception:
         persister.record_crash(traceback.format_exc())
@@ -902,8 +926,10 @@ def _run_chunked_review_impl(
     is_merge: bool,
     started: float,
     persister: _RunPersister,
+    manifest_path: Path | None = None,
+    runner: GitRunner | None = None,
 ) -> ChunkedResult:
-    inputs = _load_and_validate(diff, repo_root)
+    inputs = _load_and_validate(diff, repo_root, manifest_path=manifest_path, runner=runner)
     persister.record_validation(inputs.validation)
     if not inputs.validation.ok:
         ended = time.monotonic()

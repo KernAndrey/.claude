@@ -18,7 +18,16 @@ Decompose a big idea into multiple draft tasks.
 
 This phase is **mandatory** and cannot be skipped.
 
-1. Based on the big idea and codebase exploration, compile 3-5 clarifying questions. Focus areas:
+### Before any question — the gate
+
+1. Dig the code first. Find the answer where it lives — models, call-sites, existing conventions — before forming a question.
+2. Resolve it yourself when you can. A purely technical point the code answers, or an obvious yes (e.g. "should I do the task at all?"), needs no question — decide and record it as context.
+3. Ask only genuine decisions — ones with downstream consequences where a wrong guess causes rework. When unsure which kind it is, ask: a 30-second question beats a silent wrong default.
+4. Ask as many as genuinely matter — never pad to a count.
+
+**Language.** Run the QA session in Russian — questions, options, and the +/− trade-offs the user reads and answers. Everything that persists is English — spec sections, plan, code, commit messages, and recorded Decisions/Blockers (translate the gist of the user's Russian answer).
+
+1. Based on the big idea and codebase exploration, compile the clarifying questions that genuinely matter (no padding to a count). Focus areas:
    - **Границы**: Что явно НЕ входит в эту идею? Есть ли смежные вещи, которые трогать не нужно?
    - **Гранулярность**: Насколько мелко бить? Одна фича = одна задача, или крупнее?
    - **Порядок**: Есть ли жёсткие зависимости между частями, или всё можно делать параллельно?
@@ -28,14 +37,14 @@ This phase is **mandatory** and cannot be skipped.
 2. **Ask questions ONE AT A TIME.** Follow the same format as `/spec`:
 
    ```
-   **Вопрос N/M**: {краткий контекст — что ты нашёл в кодовой базе, если релевантно}
+   **Вопрос N/M**: {контекст для человека ВНЕ задачи: о чём вопрос, что ты нашёл в коде, почему выбор важен и чем грозит ошибка}
 
    {Сам вопрос}
 
    Варианты:
-   1. {вариант А}
-   2. {вариант Б}
-   3. {вариант В — если нужен}
+   1. {вариант А} — + {плюс}; − {минус}
+   2. {вариант Б} — + {плюс}; − {минус}
+   3. {вариант В — если нужен} — + {плюс}; − {минус}
    4. Другое (напиши свой вариант)
    ```
 
@@ -43,7 +52,6 @@ This phase is **mandatory** and cannot be skipped.
 4. If an answer reveals new ambiguities — add follow-up questions.
 
 **Rules for this phase:**
-- Questions and options are in **Russian**.
 - Ask when something is unclear.
 - This phase is mandatory.
 - Focus on decomposition concerns (what are the pieces, how they relate), not implementation details (each task will get its own `/spec` Q&A later).

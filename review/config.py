@@ -97,6 +97,17 @@ FANOUT_THRESHOLD = MAX_PROD_LINES
 MAX_CHUNKS = 6  # validator rejects manifests with more chunks. Effective
 # upper bound on a chunked commit ≈ MAX_CHUNKS * MAX_PROD_LINES.
 
+# Pre-review chunk-reviews several BIG commit groups in parallel, and each
+# chunked review itself fans out uncapped (chunked.py: max_workers=len(jobs)).
+# Without a ceiling the nested product (groups × jobs-per-group) can spawn
+# 50+ concurrent reviewer subprocesses and rate-limit/melt the backend. This
+# caps how many big groups chunk-review AT ONCE; the realistic 2-3-big-commit
+# feature stays fully parallel (that's the whole point — overlap the multi-round
+# convergence latency), while a pathological many-big-group plan degrades to
+# this many at a time instead of all at once. Small (single-call) groups are
+# unaffected. Raise it if your backend has the headroom.
+PREREVIEW_MAX_CONCURRENT_CHUNKED = 4
+
 # Lens whitelist used by the manifest validator. Must match the prompt files
 # under review/prompts/ (bugs.md, architecture.md, tests.md). Adding a lens
 # means dropping a new prompt file AND updating LENS_APPLICABILITY in hook.py.

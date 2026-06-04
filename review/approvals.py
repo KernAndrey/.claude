@@ -35,8 +35,72 @@ def diff_hash(diff_text: str) -> str:
     ``diff_text`` must be the stripped output of ``git diff --cached`` (the
     form produced by ``hook.get_staged_diff``); the same normalization is used
     everywhere this hash is computed.
+
+    Retained as a log/back-compat field only. The fast-path marker, the
+    commit-time match, and the post-Land audit all key on :func:`content_hash`
+    instead — a textual diff hash is base-dependent (it embeds the pre-image
+    blob and diff formatting), so a diff that is byte-identical in *content* but
+    reconstructed from a different base would miss. See ``pre_review`` and
+    ``hook._maybe_fastpath``.
     """
     return hashlib.sha256(diff_text.encode()).hexdigest()
+
+
+def content_hash(entries: dict[str, str]) -> str:
+    """Canonical content key of a staged group: ``sha256`` of its file contents.
+
+    ``entries`` maps each changed path to its full (40-hex) staged blob sha, or
+    the sentinel ``"deleted"`` for a removed path. This is the single source of
+    truth for the content key — the pre-review write side, the commit-time match
+    side, and the post-Land audit must all build ``entries`` the same way (via
+    ``git diff --name-status --no-renames`` + ``git rev-parse``) and hash through
+    here, so the three sides cannot drift.
+
+    Unlike :func:`diff_hash` this is base-INDEPENDENT: it depends only on the
+    final content of the group's files, not on the pre-image or diff text. Two
+    commits with identical final bytes therefore share a key even if their diffs
+    differ (different base, stash reconstruction, rename detection) — which is
+    exactly when the textual hash silently missed.
+    """
+    canonical = "\n".join(f"{path}\0{entries[path]}" for path in sorted(entries))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def entries_from_raw(raw_z: str) -> dict[str, str]:
+    """Parse ``git diff --raw --full-index -z --no-renames`` into {path -> key}.
+
+    Each NUL-separated record is ``:<srcmode> <dstmode> <srcsha> <dstsha> <status>``
+    followed by the literal path. The value kept is the *destination* (post-image)
+    blob sha — the final content — or the sentinel ``"deleted"`` for a removed
+    path. ``--full-index`` guarantees the full 40-hex sha (raw output abbreviates
+    by default); ``--no-renames`` keeps a rename as delete+add so the key depends
+    only on final content. Lives here (not in a caller) so the pre-review write
+    side, the commit-time match side, and the audit all parse identically.
+    """
+    toks = raw_z.split("\0")
+    entries: dict[str, str] = {}
+    i = 0
+    while i + 1 < len(toks):
+        meta, path = toks[i], toks[i + 1]
+        i += 2
+        if not meta or not path:
+            continue
+        parts = meta.split()
+        status = parts[-1] if parts else ""
+        dst_sha = parts[3] if len(parts) >= 4 else ""
+        entries[path] = "deleted" if status.startswith("D") else dst_sha
+    return entries
+
+
+def content_hash_from_raw(raw_z: str) -> str:
+    """Content key straight from raw git diff output — parse + hash, single-sourced.
+
+    Every side (pre-review write, commit-time match, post-Land audit) runs its
+    own ``git diff --raw --full-index -z --no-renames`` (the selector differs:
+    ``--cached`` vs a ``C~1 C`` range) and passes the raw stdout here, so the key
+    is computed one way only and the three sides cannot drift.
+    """
+    return content_hash(entries_from_raw(raw_z))
 
 
 def approvals_dir(repo_root: Path) -> Path:

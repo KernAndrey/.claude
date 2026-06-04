@@ -169,6 +169,26 @@ def get_staged_files() -> str:
     return result.stdout.strip()
 
 
+def get_staged_content_key() -> str:
+    """Content key of the staged change set — the fast-path match side.
+
+    Runs the identical ``git diff --raw --full-index -z --no-renames --cached``
+    that ``pre_review`` uses on its private index and hashes through
+    ``approvals.content_hash_from_raw``, so a marker written at pre-review time
+    is found here whenever the staged final bytes match — regardless of base
+    drift or how the change was reconstructed. Returns "" if git fails (→ no
+    match → full review, fail-safe).
+    """
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--raw", "--full-index", "-z", "--no-renames"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return approvals.content_hash_from_raw(result.stdout)
+
+
 def get_git_status() -> str:
     result = subprocess.run(
         ["git", "status", "--porcelain"],
@@ -1687,26 +1707,33 @@ def _maybe_fastpath() -> bool:
       * ``SDD_REVIEW_FASTPATH`` is set — the workflow Land phase enables the
         mode; a normal manual commit never has it, so the cache is ignored.
       * the staged diff is non-empty, and
-      * a marker ``.review/approvals/<diff_hash>`` exists — written by
-        ``pre_review.py`` only after the *same* diff passed review.
+      * a marker ``.review/approvals/<content_key>`` exists — written by
+        ``pre_review.py`` only after the *same content* passed review.
+
+    The key is the staged change set's CONTENT key (``get_staged_content_key``),
+    not the textual diff hash: it depends only on each changed path's final blob
+    sha, so it matches the pre-review marker even when the diff text differs
+    (base drift, stash reconstruction, rename detection). That base-dependence
+    was why the old textual hash silently missed.
 
     Any miss returns ``False`` → the full review runs (fail-safe: the bypass
-    can only ever *skip* an already-reviewed diff, never pass an unreviewed
+    can only ever *skip* an already-reviewed change, never pass an unreviewed
     one). Deterministic gates are NOT skipped: ``run_gate`` already ran before
     this, and gitleaks/semgrep run earlier in the pre-commit wrapper. The
     integrity backstop lives in the workflow (an independent post-Land audit
-    re-derives every landed commit's hash from git and demands it was approved).
+    re-derives every landed commit's content key from git and demands it was
+    approved).
     """
     if not os.environ.get("SDD_REVIEW_FASTPATH"):
         return False
     diff, _git_err = get_staged_diff()
     if not diff:
         return False
-    h = approvals.diff_hash(diff)
-    if not approvals.approval_exists(Path.cwd(), h):
+    key = get_staged_content_key()
+    if not key or not approvals.approval_exists(Path.cwd(), key):
         return False
-    info(f"Fast-path: staged diff pre-reviewed CLEAN ({h[:12]}…) — skipping LLM review.")
-    save_log("FASTPATH", diff=diff, error_msg=f"pre-approved {h}")
+    info(f"Fast-path: staged content pre-reviewed CLEAN ({key[:12]}…) — skipping LLM review.")
+    save_log("FASTPATH", diff=diff, error_msg=f"pre-approved {key}")
     return True
 
 

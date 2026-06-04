@@ -2158,12 +2158,36 @@ def test_fastpath_true_when_flag_and_marker_present(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("SDD_REVIEW_FASTPATH", "1")
     with (
         patch("hook.get_staged_diff", return_value=("+payload\n", "")),
+        patch("hook.get_staged_content_key", return_value="a" * 64),
         patch("hook.approvals.approval_exists", return_value=True) as m_exists,
         patch("hook.save_log") as m_log,
     ):
         assert _maybe_fastpath() is True
-    m_exists.assert_called_once()
+    m_exists.assert_called_once_with(Path.cwd(), "a" * 64)  # matches on the CONTENT key
     m_log.assert_called_once()
+
+
+def test_get_staged_content_key_empty_on_git_failure() -> None:
+    """git diff non-zero → "" (→ fast-path miss → full review, fail-safe)."""
+    from hook import get_staged_content_key
+
+    fake = MagicMock(returncode=128, stdout="")
+    with patch("hook.subprocess.run", return_value=fake):
+        assert get_staged_content_key() == ""
+
+
+def test_fastpath_false_when_content_key_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """git failed to produce a content key ("") → no match, full review (fail-safe)."""
+    from hook import _maybe_fastpath
+
+    monkeypatch.setenv("SDD_REVIEW_FASTPATH", "1")
+    with (
+        patch("hook.get_staged_diff", return_value=("+payload\n", "")),
+        patch("hook.get_staged_content_key", return_value=""),
+        patch("hook.approvals.approval_exists", return_value=True) as m_exists,
+    ):
+        assert _maybe_fastpath() is False
+    m_exists.assert_not_called()  # an empty key never consults the marker store
 
 
 def test_fastpath_false_without_flag(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2184,6 +2208,7 @@ def test_fastpath_false_when_no_marker(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SDD_REVIEW_FASTPATH", "1")
     with (
         patch("hook.get_staged_diff", return_value=("+unreviewed\n", "")),
+        patch("hook.get_staged_content_key", return_value="b" * 64),
         patch("hook.approvals.approval_exists", return_value=False),
     ):
         assert _maybe_fastpath() is False
@@ -2212,6 +2237,7 @@ def test_main_fastpath_skips_llm_but_runs_gate(monkeypatch: pytest.MonkeyPatch) 
         patch("hook.COVERAGE_GATE", MagicMock(enabled=True)),
         patch("hook.run_gate", return_value=0) as m_gate,
         patch("hook.get_staged_diff", return_value=("+payload\n", "")),
+        patch("hook.get_staged_content_key", return_value="a" * 64),
         patch("hook.approvals.approval_exists", return_value=True),
         patch("hook._maybe_dispatch_chunked") as m_chunked,
         patch("hook._run_multi_backend_pipeline") as m_pipeline,
@@ -2236,6 +2262,7 @@ def test_main_no_marker_falls_through_to_review(monkeypatch: pytest.MonkeyPatch)
         patch("hook.COVERAGE_GATE", MagicMock(enabled=True)),
         patch("hook.run_gate", return_value=0),
         patch("hook.get_staged_diff", return_value=("+unreviewed\n", "")),
+        patch("hook.get_staged_content_key", return_value="b" * 64),
         patch("hook.approvals.approval_exists", return_value=False),
         patch("hook._maybe_dispatch_chunked"),
         patch("hook.collect_diff", return_value=("+unreviewed\n", "x.py", False)),

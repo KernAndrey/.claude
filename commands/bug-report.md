@@ -17,6 +17,15 @@ You are helping a QA engineer file a bug report. Your goal is to produce a clear
 
 ### Phase 3 — Clarifying Questions
 
+**Before any question — the gate.**
+
+1. Dig the code first. Find the answer where it lives — models, call-sites, existing conventions — before forming a question.
+2. Resolve it yourself when you can. A purely technical point the code answers, or an obvious yes (e.g. "should I do the task at all?"), needs no question — decide and record it as context.
+3. Ask only genuine decisions — ones with downstream consequences where a wrong guess causes rework. When unsure which kind it is, ask: a 30-second question beats a silent wrong default.
+4. Ask as many as genuinely matter — never pad to a count.
+
+**Language.** Run the QA session in Russian — questions, options, and the +/− trade-offs the user reads and answers. The bug report itself stays in English (see top of this file). Write each question with context legible to someone not living in the task; where a question offers options (e.g. severity, priority), put each option's trade-off in its `description` (+ upside; − downside).
+
 6. Ask clarifying questions **one at a time** using `AskUserQuestion`. Adapt your questions based on what you found in the codebase and what information is still missing. Typical questions (ask only what's relevant — skip what's already clear):
 
    - **Steps to reproduce** *(required)* — ask for exact steps. If the initial description is vague, keep asking until you have a concrete, numbered sequence. Do not proceed without this.

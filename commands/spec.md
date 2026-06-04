@@ -28,28 +28,36 @@ This phase is **mandatory** for new runs and cannot be skipped.
    - **Архитектура и интеграция**: Новый модуль или расширение существующего? Есть ли конвенция для похожих фич? Спрашивай ТОЛЬКО когда ответ не очевиден из кодовой базы.
 4. Ask questions **one at a time** using the defer-aware prompt format below.
 5. **After each answer**, immediately append the decision to the draft file under a `## Decisions` section using `Edit`. Number each decision sequentially. Format: `N. **Short label**: decision text`. This section becomes the authoritative source of user decisions for all agents — inline prompt text is supplementary.
-6. After each answer, if it reveals new ambiguities, add follow-up questions to the queue. Continue until no questions remain. Minimum 3 questions total, no upper limit.
+6. After each answer, if it reveals new ambiguities, add follow-up questions to the queue. Continue until no questions remain — ask as many as genuinely matter, no padding to a count.
 
 **Rules for this phase:**
-- Questions and options are in Russian.
 - Frame questions in business/domain terms, except architectural topics which are technical by nature.
 - Architectural questions only when the codebase doesn't give a clear answer; if there's an obvious convention, note it as context for the Architect, don't ask.
 - Include what you learned from exploring the codebase as context ("Я вижу, что сейчас система делает X — Y должен заменить это или работать параллельно?").
 - One question at a time.
+
+## Before any question — the gate
+
+1. Dig the code first. Find the answer where it lives — models, call-sites, existing conventions — before forming a question.
+2. Resolve it yourself when you can. A purely technical point the code answers, or an obvious yes (e.g. "should I do the task at all?"), needs no question — decide and record it as context.
+3. Ask only genuine decisions — ones with downstream consequences where a wrong guess causes rework. When unsure which kind it is, ask: a 30-second question beats a silent wrong default.
+4. Ask as many as genuinely matter — never pad to a count.
+
+**Language.** Run the QA session in Russian — questions, options, and the +/− trade-offs the user reads and answers. Everything that persists is English — spec sections, plan, code, commit messages, and recorded Decisions/Blockers (translate the gist of the user's Russian answer).
 
 ## Defer-aware prompt format
 
 Every question to the user — in Phase 1, Phase 1.5, agent escalations, or Phase 3 — uses this format:
 
 ```
-**Вопрос N/M**: {краткий контекст — что ты нашёл в кодовой базе, что написано в спеке, почему вопрос важен}
+**Вопрос N/M**: {контекст для человека ВНЕ задачи: о чём вопрос, что ты нашёл в коде/спеке, почему выбор важен и чем грозит ошибка}
 
 {Сам вопрос}
 
 Варианты:
-1. {вариант А}
-2. {вариант Б}
-3. {вариант В — если нужен}
+1. {вариант А} — + {плюс}; − {минус}
+2. {вариант Б} — + {плюс}; − {минус}
+3. {вариант В — если нужен} — + {плюс}; − {минус}
 4. Другое (напиши свой вариант)
 
 (можешь ответить или отложить вопрос — напиши "пропустить" / "позже" / "не знаю", и вопрос уйдёт в Blockers)
@@ -67,7 +75,7 @@ No keyword matching — understand the intent from meaning.
 
 ### Blocker entry format
 
-Each blocker is a level-3 heading inside the spec's `## Blockers` section. Generate `b-N` by counting existing `### b-` headings and taking the next integer (first is `b-1`).
+Each blocker is a level-3 heading inside the spec's `## Blockers` section. Generate `b-N` by counting existing `### b-` headings and taking the next integer (first is `b-1`). The spec is an English artifact: record every field in English (translate the gist of the Russian Q&A — the question need not be verbatim).
 
 ```markdown
 ### b-N — <short title summarizing the question>
@@ -76,7 +84,7 @@ Each blocker is a level-3 heading inside the spec's `## Blockers` section. Gener
 - **raised-on**: {TODAY}
 - **expertise-needed**: business | architecture | testing | security | ux | unknown
 - **context**: <what was found in the code or spec, what's ambiguous, what each option would imply>
-- **question**: <the exact question you asked the user>
+- **question**: <the question you asked the user, in English>
 - **options**:
   1. <option>
   2. <option>

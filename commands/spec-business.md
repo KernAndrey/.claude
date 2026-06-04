@@ -16,7 +16,7 @@ Ask only business questions. Architecture, file paths, class names, module layou
 
 ## 1. Phase 1 — Discovery (mandatory)
 
-This phase cannot be skipped. Minimum 3 questions total, no upper limit.
+This phase cannot be skipped. Ask as many as genuinely matter — no padding to a count.
 
 1. Read the draft task carefully.
 2. Explore the project codebase for **domain context only**: existing user-facing features related to the draft, domain vocabulary used in model names and UI strings, business rules visible in existing behavior (state machines, status transitions, lifecycle stages, permissions). As you find relevant facts, append them to the draft file under a `## Codebase Observations` section in **domain language**:
@@ -39,23 +39,31 @@ This phase cannot be skipped. Minimum 3 questions total, no upper limit.
 6. After each answer, if it reveals a new business ambiguity, add follow-up questions to the queue. Continue until no business questions remain.
 
 **Rules for this phase:**
-- Questions and options are in Russian.
 - Frame questions in business/domain terms.
 - Include what you learned from the codebase as context ("Я вижу, что сейчас система делает X — Y должен заменить это или работать параллельно?").
 - One question at a time.
 - If a question starts drifting toward architecture (files, classes, schemas, integration mechanics), drop it from the queue and write it under `## Architecture & Implementation Plan → Open architectural questions` in the spec instead.
 
+### Before any question — the gate
+
+1. Dig the code first. Find the answer where it lives — models, call-sites, existing conventions — before forming a question.
+2. Resolve it yourself when you can. A purely technical point the code answers, or an obvious yes (e.g. "should I do the task at all?"), needs no question — decide and record it as context.
+3. Ask only genuine decisions — ones with downstream consequences where a wrong guess causes rework. When unsure which kind it is, ask: a 30-second question beats a silent wrong default.
+4. Ask as many as genuinely matter — never pad to a count.
+
+**Language.** Run the QA session in Russian — questions, options, and the +/− trade-offs the user reads and answers. Everything that persists is English — spec sections, plan, code, commit messages, and recorded Decisions/Blockers (translate the gist of the user's Russian answer).
+
 ### Defer-aware prompt format
 
 ```
-**Вопрос N/M**: {краткий контекст — что ты нашёл в кодовой базе, что написано в драфте, почему вопрос важен}
+**Вопрос N/M**: {контекст для человека ВНЕ задачи: о чём вопрос, что ты нашёл в коде/драфте, почему выбор важен и чем грозит ошибка}
 
 {Сам вопрос}
 
 Варианты:
-1. {вариант А}
-2. {вариант Б}
-3. {вариант В — если нужен}
+1. {вариант А} — + {плюс}; − {минус}
+2. {вариант Б} — + {плюс}; − {минус}
+3. {вариант В — если нужен} — + {плюс}; − {минус}
 4. Другое (напиши свой вариант)
 
 (можешь ответить или отложить вопрос — напиши "пропустить" / "позже" / "не знаю", и вопрос уйдёт в Blockers)
@@ -73,7 +81,7 @@ No keyword matching — understand the intent from meaning.
 
 ### Blocker entry format
 
-Each blocker is a level-3 heading inside the spec's `## Blockers` section. Generate `b-N` by counting existing `### b-` headings and taking the next integer (first is `b-1`).
+Each blocker is a level-3 heading inside the spec's `## Blockers` section. Generate `b-N` by counting existing `### b-` headings and taking the next integer (first is `b-1`). The spec is an English artifact: record every field in English (translate the gist of the Russian Q&A — the question need not be verbatim).
 
 ```markdown
 ### b-N — <short title summarizing the question>
@@ -82,7 +90,7 @@ Each blocker is a level-3 heading inside the spec's `## Blockers` section. Gener
 - **raised-on**: {TODAY}
 - **expertise-needed**: business | architecture | testing | security | ux | unknown
 - **context**: <what was found in the code or draft, what's ambiguous, what each option would imply>
-- **question**: <the exact question you asked the user>
+- **question**: <the question you asked the user, in English>
 - **options**:
   1. <option>
   2. <option>

@@ -14,7 +14,16 @@ If `$ARGUMENTS` is a task ID or slug — find the file under `tasks/1-draft/`, `
 
 ### 2. Clarify before planning
 
-Use `AskUserQuestion` for anything unclear: scope, edge cases, affected files, expected behavior, acceptance criteria. Group 2-4 related questions per call. Do not assume silently — if something is ambiguous, ask.
+**Before any question — the gate.**
+
+1. Dig the code first. Find the answer where it lives — models, call-sites, existing conventions — before forming a question.
+2. Resolve it yourself when you can. A purely technical point the code answers, or an obvious yes (e.g. "should I do the task at all?"), needs no question — decide and record it as context.
+3. Ask only genuine decisions — ones with downstream consequences where a wrong guess causes rework. When unsure which kind it is, ask: a 30-second question beats a silent wrong default.
+4. Ask as many as genuinely matter — never pad to a count.
+
+**Language.** Run the QA session in Russian — questions, options, and the +/− trade-offs the user reads and answers. Everything that persists is English — spec sections, plan, code, commit messages, and recorded Decisions/Blockers (translate the gist of the user's Russian answer).
+
+Use `AskUserQuestion` for the decisions that survive the gate: scope, edge cases, affected files, expected behavior, acceptance criteria. Group 2-4 related questions per call. In each `question`, give context legible to someone not living in the task — what it's about, what you found in the code, why the choice matters. In each option's `description`, state that option's trade-offs (+ upside; − downside).
 
 ### 3. Requirements the plan must cover
 

@@ -1,6 +1,6 @@
 Inject lightweight task-implementation requirements into the plan being drafted in plan mode.
 
-Invoke this command from plan mode when a task is small enough to skip the full SDD flow (`/spec` → `/implement`) but still needs discipline: clarifying questions, worktree, tests, commit, and review handoff.
+Invoke this command from plan mode when a task is small enough to skip the full SDD flow (`/spec` → `/implement`) but still needs discipline: clarifying questions, worktree, tests, commit, auto-merge into `dev`, and a review handoff on `dev`.
 
 Assumes the project is SDD-initialized: `.tasks.toml` exists and `tasks/1-draft` … `tasks/6-done` directories are present. If `.tasks.toml` is missing — tell the user to run `/task-init` first and stop.
 
@@ -32,17 +32,23 @@ The plan may be written in any style, but it must include and honour all of the 
 - **Worktree isolation.** Work happens in `wt create task/{ID}-{slug} --base origin/dev`; all subsequent steps run inside the returned worktree path.
 - **Task lifecycle — in progress.** Move task file to `tasks/4-in-progress/`, update frontmatter `status: in-progress`, `updated: {TODAY}`, `branch: task/{ID}-{slug}` before implementation starts.
 - **Tests in the same pass as code.** Every new or modified code path (function, branch, template conditional, user-facing surface) gets a test that asserts on its behavior. Follow the Test discipline section in `~/.claude/CLAUDE.md`. Run tests and paste passing output into the session before committing.
-- **Commit via the `commit` skill.** Invoke the `Skill` tool with `skill: commit`. Conventional commit message prefixed with task ID, e.g. `feat({ID}): add order validation`. Split into logical commits if the change spans multiple cohesive units. Commit is mandatory — no step is "done" without it.
-- **Task lifecycle — review.** After commit, move task file to `tasks/5-review/`, update frontmatter `status: review`, `updated: {TODAY}`.
-- **Stop for human review.** After moving to `tasks/5-review/`, report to the user: branch name, worktree path, commit hashes, and: "Ready for review. After you approve — I will merge to `dev` (`--no-ff`), run `/task-done {ID}`, and remove the worktree." Then stop.
-- **Post-review steps (documented, not executed).** The plan should note that after user approval the operator runs: `git checkout dev && git pull` → `git merge --no-ff task/{ID}-{slug} -m "Merge task/{ID}-{slug} into dev"` → `git push origin dev` → `/task-done {ID}` → `wt remove task/{ID}-{slug}`. These are NOT executed as part of this command.
+- **Task lifecycle — review (before the commit).** Once tests pass, move the task file to `tasks/5-review/` and update frontmatter `status: review`, `updated: {TODAY}`. Do this **before** committing so the move is captured in the commit — otherwise it is lost when the worktree is removed and never reaches `dev`.
+- **Commit via the `commit` skill.** Invoke the `Skill` tool with `skill: commit`. The commit captures the code, the tests, and the task-file move to `tasks/5-review/`. Conventional commit message prefixed with task ID, e.g. `feat({ID}): add order validation`. Split into logical commits if the change spans multiple cohesive units. Commit is mandatory — no step is "done" without it.
+- **Integrate into `dev` (executed automatically after a clean commit).** Run from the **main checkout**, not the worktree — you cannot `git checkout dev` from inside the task worktree, nor `wt remove` a worktree you are standing in. Resolve the main checkout path from the first entry of `git worktree list`, `cd` there, then:
+  1. Verify the main checkout is clean (`git status --porcelain` is empty). If dirty — stop and report; do not touch it.
+  2. `git checkout dev && git pull`
+  3. `git merge --no-ff task/{ID}-{slug} -m "Merge task/{ID}-{slug} into dev"`
+  4. `git push origin dev`
+  5. `wt remove task/{ID}-{slug}`
+  **Remove the worktree only after `git push origin dev` succeeds.** On any failure before that — main checkout dirty, `git pull` fails or diverges, merge conflicts (run `git merge --abort`), or push rejected — leave the worktree and its branch in place, report the exact failure, and stop. Until the push lands, that branch is the only copy of the work. Do **not** run `/task-done` — the task stays in `tasks/5-review/` for human review on `dev`.
+- **Report.** After a successful push and worktree removal, report to the user: commit hashes, "merged into `dev` and pushed to `origin/dev`", "worktree removed", "task is in `tasks/5-review/`". Close with: "Review the integrated result on `dev`; when satisfied, run `/task-done {ID}`." Then stop.
 
 ### 4. Mandatory reminders — include verbatim in the plan
 
 <critical>
 - The pre-commit AI reviewer BLOCKS commits that add or modify code paths without test coverage. Write tests in the same pass as the code.
 - Commit goes through the `commit` skill — not raw `git commit`. The skill handles security scan, logical splitting, and conventional messages.
-- Stop after moving the task to `tasks/5-review/`. Do not merge to `dev` and do not move to `tasks/6-done/` until the user confirms review passed.
+- Move the task to `tasks/5-review/` BEFORE committing — the commit must capture the move, or it is destroyed when the worktree is removed. After committing, merge into `dev` and run `wt remove` only once `git push origin dev` succeeds; on any earlier failure leave the worktree and branch intact and report. Do not run `/task-done` — the task stays in `tasks/5-review/`.
 </critical>
 
 ### 5. Finish with ExitPlanMode

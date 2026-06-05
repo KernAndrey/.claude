@@ -44,13 +44,13 @@ import tempfile
 import threading
 from pathlib import Path
 
-import yaml
-
 import approvals
-from config import MAX_CHUNKS, MAX_PROD_LINES, PREREVIEW_MAX_CONCURRENT_CHUNKED
+import yaml
 from consolidation import consolidate
 from hook import applicable_lenses, count_added_production_lines
 from orchestrator import run_multi_backend
+
+from config import MAX_CHUNKS, MAX_PROD_LINES, PREREVIEW_MAX_CONCURRENT_CHUNKED
 
 # Verdicts that mean "the live gate would allow this commit" → safe to approve.
 # BLOCK = upheld critical(s); EMPTY = every reviewer failed (don't approve —
@@ -217,8 +217,29 @@ def _scaffold_group_manifest(diff: str, names: str, repo_root: Path) -> str:
     header = [
         "# Big cohesive commit group — fill in `chunks:` so the chunked reviewers run.",
         f"#   <= {MAX_CHUNKS} chunks; each <= {MAX_PROD_LINES} added PROD lines",
-        "#   (tests/docs/config do NOT count); every file in EXACTLY one chunk;",
-        "#   prefer `line_ranges: all` for whole files. Do NOT edit diff_hash.",
+        "#   (tests/docs/config do NOT count); every file in EXACTLY one chunk.",
+        "# Per-chunk schema (the validator REQUIRES these exact keys):",
+        "#   - id: a short slug matching [a-z][a-z0-9_]* (lowercase letters, digits,",
+        "#         underscores; starts with a letter) — NOT `name`.",
+        "#   - files: a non-empty list; each entry is `- path: <repo-relative path>`",
+        "#       with `line_ranges:` set to either the string `all` (whole file) or a",
+        "#       LIST of [start, end] pairs, e.g. `[[1, 250]]` — NOT a string like \"1-250\".",
+        "#   Split one oversized file across chunks with disjoint ranges; whole files use `all`.",
+        "#   Do NOT edit diff_hash.",
+        "# Example — copy the shape, replace ids/paths/ranges, and REMOVE the leading '# ':",
+        "#   chunks:",
+        "#     - id: core_logic",
+        "#       files:",
+        "#         - path: services/foo.py",
+        "#           line_ranges: all",
+        "#         - path: services/big.py",
+        "#           line_ranges: [[1, 250]]",
+        "#     - id: tests_and_wiring",
+        "#       files:",
+        "#         - path: services/big.py",
+        "#           line_ranges: [[251, 474]]",
+        "#         - path: tests/test_foo.py",
+        "#           line_ranges: all",
         "#   This group is one commit of a consistent multi-commit branch: the",
         "#   working tree (Read/Grep) is authoritative — do not flag a symbol or",
         "#   test that lives in a sibling commit; record such cross-commit",

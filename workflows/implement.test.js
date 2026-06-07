@@ -338,31 +338,55 @@ test('test_committer_already_landed_shortcircuit', async () => {
   assert.strictEqual(mod.getPollCounter(), 1, 'only the single launch spawn was charged; no poll agents spawned (the wait was skipped)')
 })
 
-// Schema sanity — HANDLE_PREREVIEW_SCHEMA branch A is fully discriminated (a
-// {needAwait:false} cannot satisfy branch A's const:true), and COMMIT_RESULT_SCHEMA
-// carries the optional needRelaunch flag (D9). Static-shape checks only.
+// Schema sanity — both SDD-003 schemas are FLAT plain objects (NO top-level oneOf:
+// the Anthropic API rejects a top-level oneOf in an agent tool input_schema; the
+// discrimination moved into the JS, which branches on the field VALUES). Asserts the
+// flat shape + the expected optional properties. COMMIT_RESULT_SCHEMA still carries
+// the optional needRelaunch (D9). Static-shape checks only.
 test('test_schema_shapes', async () => {
   const mod = await loadEngine()
+
+  // HANDLE_PREREVIEW_SCHEMA — flat object, NO oneOf, all fields optional.
   const h = mod.HANDLE_PREREVIEW_SCHEMA
-  assert.ok(Array.isArray(h.oneOf) && h.oneOf.length === 2, 'HANDLE_PREREVIEW_SCHEMA is a 2-branch oneOf')
-  const branchA = h.oneOf[0]
-  assert.strictEqual(branchA.additionalProperties, false)
-  assert.deepStrictEqual(branchA.required, ['needAwait'])
-  assert.strictEqual(branchA.properties.needAwait.const, true, 'branch A is discriminated by needAwait const:true')
+  assert.strictEqual(h.type, 'object', 'HANDLE_PREREVIEW_SCHEMA is a plain object')
+  assert.ok(!('oneOf' in h) && !('anyOf' in h) && !('allOf' in h), 'HANDLE_PREREVIEW_SCHEMA has NO top-level oneOf/anyOf/allOf (API-valid)')
+  assert.strictEqual(h.additionalProperties, false)
+  for (const k of ['needAwait', 'groups', 'wholediff', 'allClean']) {
+    assert.ok(k in h.properties, `HANDLE_PREREVIEW_SCHEMA exposes the optional ${k} property`)
+  }
+  assert.ok(!Array.isArray(h.required) || h.required.length === 0, 'HANDLE_PREREVIEW_SCHEMA requires no field (JS discriminates on values)')
+
+  // COMMIT_RESULT_SCHEMA — optional needRelaunch (D9).
   assert.ok('needRelaunch' in mod.COMMIT_RESULT_SCHEMA.properties, 'COMMIT_RESULT_SCHEMA has the optional needRelaunch (D9)')
   assert.ok(!mod.COMMIT_RESULT_SCHEMA.required.includes('needRelaunch'), 'needRelaunch is OPTIONAL (not required)')
 
-  // MF-A — LAND_LAUNCH_SCHEMA is a discriminated union with REQUIRED keys per
-  // branch, so a malformed launch (alreadyLanded w/o result, or started w/o
-  // outFile/doneTest) is REJECTED by the schema instead of yielding an undefined
-  // commit result that crashes landGroups.
+  // LAND_LAUNCH_SCHEMA — flat object, NO oneOf, all branch fields optional.
   const ll = mod.LAND_LAUNCH_SCHEMA
-  assert.ok(Array.isArray(ll.oneOf) && ll.oneOf.length === 2, 'LAND_LAUNCH_SCHEMA is a 2-branch oneOf')
-  const [branchAlready, branchStarted] = ll.oneOf
-  assert.deepStrictEqual(branchAlready.required, ['alreadyLanded', 'result'], 'alreadyLanded branch REQUIRES result (no undefined crash)')
-  assert.strictEqual(branchAlready.properties.alreadyLanded.const, true, 'alreadyLanded branch is discriminated by const:true')
-  assert.deepStrictEqual(branchStarted.required, ['started', 'outFile', 'doneTest'], 'started branch REQUIRES outFile+doneTest')
-  assert.strictEqual(branchStarted.properties.started.const, true, 'started branch is discriminated by const:true')
+  assert.strictEqual(ll.type, 'object', 'LAND_LAUNCH_SCHEMA is a plain object')
+  assert.ok(!('oneOf' in ll) && !('anyOf' in ll) && !('allOf' in ll), 'LAND_LAUNCH_SCHEMA has NO top-level oneOf/anyOf/allOf (API-valid)')
+  assert.strictEqual(ll.additionalProperties, false)
+  for (const k of ['alreadyLanded', 'result', 'started', 'outFile', 'doneTest']) {
+    assert.ok(k in ll.properties, `LAND_LAUNCH_SCHEMA exposes the optional ${k} property`)
+  }
+  assert.ok(!Array.isArray(ll.required) || ll.required.length === 0, 'LAND_LAUNCH_SCHEMA requires no field (JS discriminates on values)')
+})
+
+// REGRESSION (the bug class the D7c smoke caught) — EVERY agent-facing tool
+// input_schema must be API-valid: top-level type:'object' and NO top-level
+// oneOf/anyOf/allOf (the Anthropic API returns 400 "input_schema does not support
+// oneOf, allOf, or anyOf at the top level" otherwise — adding type:'object' does
+// NOT help). This iterates the full schema set so a future schema that reintroduces
+// a top-level combinator is caught here, before it 400s every agent of that role.
+test('test_agent_schemas_are_api_valid', async () => {
+  const mod = await loadEngine()
+  const schemas = mod.allSchemas
+  assert.ok(schemas && Object.keys(schemas).length >= 15, 'allSchemas exposes every agent-facing schema')
+  for (const [name, s] of Object.entries(schemas)) {
+    assert.strictEqual(s.type, 'object', `${name} must have top-level type:'object' (API requirement)`)
+    assert.ok(!('oneOf' in s), `${name} must NOT have a top-level oneOf (API 400s on it)`)
+    assert.ok(!('anyOf' in s), `${name} must NOT have a top-level anyOf (API 400s on it)`)
+    assert.ok(!('allOf' in s), `${name} must NOT have a top-level allOf (API 400s on it)`)
+  }
 })
 
 // MF-A — the alreadyLanded idempotency short-circuit returns a VALID COMMIT_RESULT

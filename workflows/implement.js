@@ -274,26 +274,28 @@ const PREREVIEW_SCHEMA = {
 }
 
 // SDD-003 — what the pre-review HANDLE agent returns each iteration of the
-// NEEDS_MANIFEST sub-loop. A discriminated union (oneOf), because the existing
-// PREREVIEW_SCHEMA is additionalProperties:false so a bare {needAwait:true}
-// would FAIL validation and leave the sub-loop structurally inert.
-//   branch A — {needAwait:true}: the handle authored the manifests AND itself
-//              relaunched `pre_review.py --pending` detached; the JS re-enters
-//              the wait with NO new launch. Fully discriminated by const:true so
-//              a {needAwait:false} cannot pass branch A and crash the === true
-//              branch.
-//   branch B — the full PREREVIEW_SCHEMA body (groups, wholediff, allClean),
-//              consumed by the unchanged round-loop body exactly as before.
+// NEEDS_MANIFEST sub-loop. FLAT object (NO top-level oneOf/anyOf/allOf): the
+// Anthropic API rejects a top-level oneOf in an agent({schema}) tool input_schema
+// ("400 input_schema does not support oneOf, allOf, or anyOf at the top level" —
+// adding type:'object' does NOT help; proven by probe + the D7c smoke). So the two
+// logical branches are merged into ONE flat shape with ALL fields optional, and
+// the JS does the discrimination (it already branches on the field VALUES):
+//   branch A — { needAwait:true }: the handle authored the manifests AND itself
+//              relaunched `pre_review.py --pending` detached; the JS re-enters the
+//              wait with NO new launch. (runPreReviewWait checks `needAwait===true`.)
+//   branch B — the full PREREVIEW body { groups, wholediff, allClean }, consumed by
+//              the unchanged round-loop body. (runPreReviewWait validates groups[] +
+//              wholediff are present before returning it, so a malformed handle
+//              degrades cleanly instead of crashing the round loop on pr.groups.)
 const HANDLE_PREREVIEW_SCHEMA = {
-  oneOf: [
-    {
-      type: 'object',
-      additionalProperties: false,
-      required: ['needAwait'],
-      properties: { needAwait: { type: 'boolean', const: true } },
-    },
-    PREREVIEW_SCHEMA,
-  ],
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    needAwait: { type: 'boolean' },
+    groups: PREREVIEW_SCHEMA.properties.groups,
+    wholediff: PREREVIEW_SCHEMA.properties.wholediff,
+    allClean: PREREVIEW_SCHEMA.properties.allClean,
+  },
 }
 
 // Land-audit: what the verifier agent returns from `pre_review.py --verify-range`.
@@ -398,28 +400,28 @@ const COMMIT_RESULT_SCHEMA = {
   },
 }
 
-// SDD-003 (MF-A) — what the committer LAUNCH agent returns. A discriminated union
-// (oneOf) with REQUIRED keys per branch, so a malformed launch (e.g. alreadyLanded
-// with no result, or started with no outFile/doneTest) is REJECTED by the schema
-// and auto-retried — never silently passed through to yield an undefined commit
-// result that would crash landGroups on `cr.knownConcerns`.
+// SDD-003 (MF-A) — what the committer LAUNCH agent returns. FLAT object (NO
+// top-level oneOf/anyOf/allOf): the Anthropic API rejects a top-level oneOf in an
+// agent({schema}) tool input_schema ("400 ... does not support oneOf, allOf, or
+// anyOf at the top level"; proven by probe + the D7c smoke, where land:launch
+// 400'd SPAWN_RETRIES times and the engine landed NO commit). The two logical
+// branches are merged into ONE flat shape with ALL fields optional; the JS does
+// the discrimination on the field VALUES (landGroupViaGate):
 //   branch A — idempotency short-circuit: { alreadyLanded:true, result }.
 //   branch B — job launched detached: { started:true, outFile, doneTest }.
+// Because the schema no longer REQUIRES per-branch fields, landGroupViaGate guards
+// a malformed launch (neither a valid alreadyLanded nor a valid started shape) and
+// degrades to POLL_EXHAUSTED rather than dereferencing undefined.
 const LAND_LAUNCH_SCHEMA = {
-  oneOf: [
-    {
-      type: 'object',
-      additionalProperties: false,
-      required: ['alreadyLanded', 'result'],
-      properties: { alreadyLanded: { type: 'boolean', const: true }, result: COMMIT_RESULT_SCHEMA },
-    },
-    {
-      type: 'object',
-      additionalProperties: false,
-      required: ['started', 'outFile', 'doneTest'],
-      properties: { started: { type: 'boolean', const: true }, outFile: { type: 'string' }, doneTest: { type: 'string' } },
-    },
-  ],
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    alreadyLanded: { type: 'boolean' },
+    result: COMMIT_RESULT_SCHEMA,
+    started: { type: 'boolean' },
+    outFile: { type: 'string' },
+    doneTest: { type: 'string' },
+  },
 }
 
 const SCRIBE_SCHEMA = {
@@ -592,7 +594,13 @@ async function runPreReviewWait(deps) {
     const h = await spawnWithBudget(handle)
     if (h === POLL_EXHAUSTED) return POLL_EXHAUSTED
     if (h.needAwait === true) continue // branch A — re-enter await, no new launch
-    return h // branch B — the full PREREVIEW_SCHEMA body
+    // branch B — the full PREREVIEW body. HANDLE_PREREVIEW_SCHEMA is FLAT (no
+    // top-level oneOf — the API forbids it), so it no longer REQUIRES groups[] +
+    // wholediff. Guard them here: a malformed handle (not needAwait AND not a valid
+    // PREREVIEW body) degrades to POLL_EXHAUSTED rather than letting the round-loop
+    // body crash on pr.groups.
+    if (!Array.isArray(h.groups) || !h.wholediff) return POLL_EXHAUSTED
+    return h
   }
 }
 
@@ -617,11 +625,14 @@ async function landGroupViaGate(deps) {
   // idempotency short-circuit: the group's commit ALREADY landed (the only case
   // that may claim landed — there is no in-flight false-success guard; see the
   // committer launch prompt for why).
-  // LAND_LAUNCH_SCHEMA's oneOf already REQUIRES `result` on this branch, so the
-  // result-less case is unreachable in production; the explicit guard exists only
-  // so a malformed return degrades cleanly (POLL_EXHAUSTED → recorded Known
-  // Concern) instead of falling into awaitDetachedJob(undefined,{doneTest:undefined}).
+  // LAND_LAUNCH_SCHEMA is FLAT (no top-level oneOf — the API forbids it), so it no
+  // longer REQUIRES per-branch fields; the JS does the discrimination here. An
+  // alreadyLanded with no result degrades cleanly.
   if (lr.alreadyLanded) return lr.result || POLL_EXHAUSTED
+  // A valid "started" branch carries both outFile and doneTest; a malformed launch
+  // (neither a valid alreadyLanded nor a valid started shape) degrades to
+  // POLL_EXHAUSTED rather than calling awaitDetachedJob(undefined,{doneTest:undefined}).
+  if (!lr.outFile || !lr.doneTest) return POLL_EXHAUSTED
   const done = await awaitDetachedJob(lr.outFile, { label, phase: phaseName, doneTest: lr.doneTest })
   if (done === POLL_EXHAUSTED) return POLL_EXHAUSTED
   // null collect → bounded re-spawn; a sustained null degrades via POLL_EXHAUSTED.
@@ -735,6 +746,15 @@ if (typeof __IMPL_TEST__ !== 'undefined' && __IMPL_TEST__) {
     HANDLE_PREREVIEW_SCHEMA,
     COMMIT_RESULT_SCHEMA,
     LAND_LAUNCH_SCHEMA,
+    // Every agent-facing tool input_schema — the regression test iterates this to
+    // assert each is API-valid (top-level type:'object', no top-level oneOf/anyOf/
+    // allOf, which the Anthropic API rejects). Add new agent schemas here.
+    allSchemas: {
+      CODER_SCHEMA, CODER_FIX_SCHEMA, TESTER_SCHEMA, REVIEWER_SCHEMA, RE_REVIEW_SCHEMA,
+      COMMIT_PLAN_SCHEMA, PREREVIEW_SCHEMA, HANDLE_PREREVIEW_SCHEMA, VERIFY_SCHEMA,
+      PLAN_VALIDATION_SCHEMA, ACCEPT_SCHEMA, DELTA_PLAN_SCHEMA, COMMIT_RESULT_SCHEMA,
+      LAND_LAUNCH_SCHEMA, SCRIBE_SCHEMA,
+    },
     setSpawnAgent: (fn) => { spawnAgent = fn },
     resetPollCounter: () => { pollAgentsSpawned = 0 },
     setPollCounter: (n) => { pollAgentsSpawned = n },

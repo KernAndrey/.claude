@@ -55,6 +55,8 @@ Workflow({
 
 The call returns when the task is delivered. Watch live progress with `/workflows`.
 
+Capture two fields from the returned terminal result/object — you need them for Phase 5 recovery if the run dies: the `runId` and the persisted `scriptPath`. The Workflow tool returns these on the awaited call **even when the run fails**, so save both the moment the call returns, before you branch on success vs death.
+
 ## Phase 4: Report (lead)
 
 The workflow already finalized the spec (Implementation Summary, Known Concerns, Auto-Review Results, Steps for Manual Review), moved it to `tasks/5-review/`, landed the commits through the gate, and pushed the branch. From the returned object, show the user:
@@ -65,9 +67,67 @@ The workflow already finalized the spec (Implementation Summary, Known Concerns,
 4. **Steps for Manual Review**, the full list.
 5. The instruction: **"Walk through the manual review steps. If everything looks good — `/task-done {ID}`."** (For `DELIVERED_INCOMPLETE`, tell the user the task likely needs another pass before `/task-done`.)
 
-If `status` is missing or the workflow returned an error, read the spec in `tasks/4-in-progress/` (it may not have moved), report what landed, and tell the user which phase did not complete.
+If `status` is missing or the workflow returned an error, read the spec in `tasks/4-in-progress/` (it may not have moved), report what landed, and tell the user which phase did not complete. When the run returned a death/error rather than a delivered object, go to **Phase 5** before reporting — Phase 5 decides whether to recover or to report-and-stop.
+
+## Phase 5: Recovery on workflow death (lead)
+
+The engine now holds its own long gate-waits, so a healthy run reaches delivery on its own. Phase 5 is the safety-net for a run that dies anyway (a transient agent death, a stale environment, or an engine bug). Reach it only when the Phase-4 awaited `Workflow(...)` call returned a death/error object instead of a delivered result. Recovery is **same-session only**: resume replays already-completed agents from cache and re-runs from the dead step onward, and works only while this session stays alive.
+
+Track an **attempts counter per failure point** (keyed by the phase + step that died). The whole cycle below is bounded: at most **2 resume attempts at the same failure point**, then stop and report.
+
+### Step 1 — Diagnose first (never blind-restart)
+
+Diagnosing before acting prevents re-running a non-transient failure straight back into the same wall. Read, in order, and show the user what you found:
+
+1. The returned error/object from the Phase-4 call (the death's shape and message).
+2. The run and agent transcripts (use `/workflows` and the run's transcript) — find the agent and step that died.
+3. The working-tree state: `git -C {worktree_path} status --porcelain`, `git -C {worktree_path} log --oneline {base}..HEAD`, and any half-written `.review/` state.
+4. The last phase the run reached (from the engine's `phase(...)` log and the transcripts).
+
+Then classify the cause into exactly one of three kinds:
+
+- **Transient** — one agent died or a service errored (e.g. a 529), run otherwise healthy. → Step 2 (resume directly).
+- **Fixable** — an environment/orchestration problem: a stuck background process, a half-written review-state file, a stale lock, a stale base needing a fresh fetch/FF-rebase, a wrong launch argument. → Step 2 (fix the cause, then resume). (If the BETA engine-self-patching block below is present, an engine bug you can fix on a well-supported, logged hypothesis is also Fixable.)
+- **Unfixable or undecidable** — → Step 3 (stop and report the diagnosis + the failed phase). Also stop here if this failure point has already been attempted twice.
+
+### Step 2 — Fix (if needed) and resume
+
+**Blast-radius of any fix you apply:** environment/orchestration only (plus the engine itself, but ONLY via the BETA block below, and only while that block is present). Never touch the feature/product code the run is implementing — that is the engine's sole responsibility. This never-feature-code limit holds for every fix in this phase, in both regions.
+
+Infra/orchestration fixes you may apply: kill a stuck background process, delete a half-written `.review/` state file or a stale lock, `git fetch` + fast-forward a stale base, correct a launch argument. Apply the minimal fix, then resume.
+
+Resume same-session from the point of death by re-calling the Workflow tool with the captured ids:
+
+```
+Workflow({ scriptPath: "{captured scriptPath}", resumeFromRunId: "{captured runId}" })
+```
+
+Resume only when you have BOTH `scriptPath` and `runId` from the Phase-4 result. If either is missing from the death object, you cannot resume blind — go to Step 3 and report instead. On resume, completed `agent()` calls with an unchanged prompt+opts return cached results; the run re-executes from the first changed/new/incomplete call.
+
+After resume, increment the attempts counter for this failure point. If the run dies again at the **same** point, re-diagnose (Step 1). Once attempts at one point reach 2 and it fails a third time, stop and report (Step 3) — make no further resume attempt at that point.
+
+<!-- BETA: engine self-patching — remove when the engine is stable -->
+### Engine self-patching (BETA — remove when the engine is stable)
+
+This is a deliberately temporary, beta-phase capability. Deleting this single block (between the BETA markers) disables engine self-patching entirely with no other edits; the rest of Phase 5 — diagnosis, infra/orchestration fixes, the resume call, the ≤2-attempt bound, and the report — keeps working without it. It is a tracked sunset item.
+
+You may edit the engine itself — `~/.claude/workflows/implement.js` — when your diagnosis points at an engine bug. The bar is loosened on purpose: a **well-supported, LOGGED hypothesis** is enough; you do NOT need a smoking-gun transcript line, only a stated rationale a reviewer could follow. The safety net is git history — any engine change is revertable, and over-restricting this defeats the beta-test purpose of surfacing problems no one anticipated.
+
+These guards still hold for every engine patch:
+
+1. **Log it verbatim.** Before patching, write your hypothesis (the reasoning) and the exact change into the final report's Known Concerns, verbatim. This is mandatory — an unlogged engine change is forbidden.
+2. **Never feature/product code.** The patch touches `implement.js` (or its test) only — never the code the run is implementing.
+3. **Stay within the ≤2-attempt bound** at the same failure point.
+4. **Account for cache invalidation.** Editing the engine invalidates the resume cache from the first changed `agent()` call onward. Earlier completed agents stay cached; do NOT assume a post-change step is cached.
+
+Then resume per Step 2.
+<!-- /BETA -->
+
+### Step 3 — Stop and report
+
+When the cause is unfixable/undecidable, or the 2-attempt bound at a failure point is exhausted, or the death object lacks `scriptPath`/`runId`, stop. Report: which phase failed, your diagnosis, what landed so far (the `git log` from Step 1), and — if you patched the engine — the verbatim recovery note already recorded in Known Concerns.
 
 ## What stays with the lead vs the workflow
 
 - **Lead:** read spec, create worktree, move spec to `4-in-progress`, parse the Coder list, launch, report. Nothing else.
-- **Workflow:** code → test (+ bug loop) → review → fix (+ re-review) → finalize spec → parallel pre-review of the planned commits (fix loop until clean, ≥3 groups) → land commits through the gate (fast-path past the LLM review for pre-approved diffs; + fix loop, secrets, overrides, chunked manifest) → integrity audit that every landed commit was pre-reviewed → push. Model for every agent is the session model — choose it when you launch this command.
+- **Workflow:** code → test (+ bug loop) → review → fix (+ re-review) → finalize spec → parallel pre-review of the planned commits (fix loop until clean, ≥2 groups) → land commits through the gate (fast-path past the LLM review for pre-approved diffs; + fix loop, secrets, overrides, chunked manifest) → integrity audit that every landed commit was pre-reviewed → push. Model for every agent is the session model — choose it when you launch this command.

@@ -7,7 +7,7 @@ export const meta = {
     { title: 'Test', detail: 'one tester writes tests; bug-fix loop with owning coders' },
     { title: 'Review', detail: 'role reviewers (code/test/spec/security/+ui) in parallel, schema-enforced' },
     { title: 'Fix', detail: 'route MUST FIX/CRITICAL to coders/tester, re-review until clean' },
-    { title: 'Pre-review', detail: 'review all planned commit groups in parallel; fix until clean (≥3 groups)' },
+    { title: 'Pre-review', detail: 'review all planned commit groups in parallel; fix until clean (≥2 groups)' },
     { title: 'Land', detail: 'finalize spec, land logical commits through the gate, push' },
     { title: 'Verify', detail: 'audit every landed commit was pre-reviewed (integrity cross-check)' },
     { title: 'Accept', detail: 'high-level check the spec is fully delivered; remediate gaps in-run' },
@@ -55,6 +55,42 @@ if (!WORKTREE || !SPEC || !CODERS.length) {
 // Keyed by content fingerprint, not by agent-assigned id, because re-review
 // agents do not reliably preserve ids across rounds.
 const STALL_ROUNDS = 3
+
+// SDD-003 — JS-held long-wait bounds. The workflow loop (not any single agent)
+// holds each 15-60 min gate wait by re-spawning a fresh one-check poll agent per
+// cycle. Two bounds keep it finite AND under the 1000-agent lifetime cap:
+//   POLL_CEILING   — per-wait cycle cap. 24 cycles x ~270s ≈ 1.8h covers a
+//                    60-min-and-then-some single wait.
+//   MAX_POLL_AGENTS — module-level GLOBAL poll budget across ALL waits in the
+//                    run. 700 deliberately reserves ~300 non-poll agents under
+//                    the 1000 cap (code/test/review/fix + pre-review rounds +
+//                    land/verify/accept/push + retries empirically ~210-300).
+// On exhaustion of EITHER bound the wait ends with a recorded Known Concern and
+// the run degrades to its existing stall path — it NEVER throw-aborts the run.
+// (The 700/300 split is re-confirmed against the live agent counter on the D7d
+// field run — the only place the real non-poll count is observable.)
+const POLL_CEILING = 24
+const MAX_POLL_AGENTS = 700
+let pollAgentsSpawned = 0 // module-level global poll counter (incremented per poll spawn)
+
+// Sentinel awaitDetachedJob returns to its caller on bound exhaustion. It is a
+// recorded-error signal, NOT a throw — the caller degrades that one wait and
+// continues (a pre-review wait leaves its pending group(s) to the live gate; a
+// committer wait records the group as not-landed and moves on).
+const POLL_EXHAUSTED = Symbol('POLL_EXHAUSTED')
+
+// SDD-003 (MF-C) — backstop for the committer's `needRelaunch` re-commit path.
+// EVERY in-gate fix (manifest-fill / secret / WARNING / coverage) returns
+// needRelaunch and re-runs the full JS-held triple; a gate that keeps rejecting
+// the fix would otherwise spin toward the 1000-agent cap. Cap the CONSECUTIVE
+// needRelaunch rounds (a productive blockingFindings round resets the counter, so
+// the unbounded-but-productive path is preserved). Set comfortably ABOVE the
+// documented worst case — Key Constraints #1 / AC-5 Scenario B / the TMS-102
+// provenance all cite "10 or more" gate rounds for ONE commit, so a cap of ~20
+// admits the real 10-cycle commit while still stopping a true runaway. DEVIATION
+// from the reviewer's example "STALL_ROUNDS*2"=6, which would kill legitimate
+// 10-cycle commits (AC-5).
+const MAX_NEEDRELAUNCH_ROUNDS = 20
 
 const FRONTEND_RE = /\.(x?html?|css|s[ac]ss|less|jsx?|tsx?|vue|svelte|qweb|mako|jinja2)$/i
 const TEST_PATH_RE = /(^|\/)tests?\/|_test\.|\.test\.|\.spec\./i
@@ -237,6 +273,29 @@ const PREREVIEW_SCHEMA = {
   },
 }
 
+// SDD-003 — what the pre-review HANDLE agent returns each iteration of the
+// NEEDS_MANIFEST sub-loop. A discriminated union (oneOf), because the existing
+// PREREVIEW_SCHEMA is additionalProperties:false so a bare {needAwait:true}
+// would FAIL validation and leave the sub-loop structurally inert.
+//   branch A — {needAwait:true}: the handle authored the manifests AND itself
+//              relaunched `pre_review.py --pending` detached; the JS re-enters
+//              the wait with NO new launch. Fully discriminated by const:true so
+//              a {needAwait:false} cannot pass branch A and crash the === true
+//              branch.
+//   branch B — the full PREREVIEW_SCHEMA body (groups, wholediff, allClean),
+//              consumed by the unchanged round-loop body exactly as before.
+const HANDLE_PREREVIEW_SCHEMA = {
+  oneOf: [
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['needAwait'],
+      properties: { needAwait: { type: 'boolean', const: true } },
+    },
+    PREREVIEW_SCHEMA,
+  ],
+}
+
 // Land-audit: what the verifier agent returns from `pre_review.py --verify-range`.
 const VERIFY_SCHEMA = {
   type: 'object',
@@ -330,7 +389,37 @@ const COMMIT_RESULT_SCHEMA = {
     // Scoped overrides the committer added to clear a recurring false-positive.
     overridesAdded: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['where', 'reason'], properties: { where: { type: 'string' }, reason: { type: 'string' } } } },
     knownConcerns: { type: 'array', items: { type: 'string' } },
+    // SDD-003 (D9) — relaunch signal. When the collect agent makes an in-gate
+    // LOCAL fix (manifest-fill / secret removal / WARNING fix) it returns
+    // {landed:false, needRelaunch:true} WITHOUT git-committing in its own turn;
+    // the while(!landed) loop re-runs the FULL launch->await->collect triple so
+    // the re-commit's 15-60 min gate wait is ALSO JS-held, not just the first.
+    needRelaunch: { type: 'boolean' },
   },
+}
+
+// SDD-003 (MF-A) — what the committer LAUNCH agent returns. A discriminated union
+// (oneOf) with REQUIRED keys per branch, so a malformed launch (e.g. alreadyLanded
+// with no result, or started with no outFile/doneTest) is REJECTED by the schema
+// and auto-retried — never silently passed through to yield an undefined commit
+// result that would crash landGroups on `cr.knownConcerns`.
+//   branch A — idempotency short-circuit: { alreadyLanded:true, result }.
+//   branch B — job launched detached: { started:true, outFile, doneTest }.
+const LAND_LAUNCH_SCHEMA = {
+  oneOf: [
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['alreadyLanded', 'result'],
+      properties: { alreadyLanded: { type: 'boolean', const: true }, result: COMMIT_RESULT_SCHEMA },
+    },
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['started', 'outFile', 'doneTest'],
+      properties: { started: { type: 'boolean', const: true }, outFile: { type: 'string' }, doneTest: { type: 'string' } },
+    },
+  ],
 }
 
 const SCRIBE_SCHEMA = {
@@ -379,6 +468,278 @@ function ownerOf(file) {
 const BLOCKING = new Set(['CRITICAL', 'MUST_FIX'])
 function blockingFindings(report) {
   return (report.findings || []).filter(f => BLOCKING.has(f.severity))
+}
+
+// ===========================================================================
+// SDD-003 — JS-held long-wait (launch -> JS-await -> collect)
+// ---------------------------------------------------------------------------
+// The two long-wait points (parallel pre-review + the AI commit gate) take
+// 15-60 min. A single agent CANNOT hold that wait: the harness auto-backgrounds
+// any foreground command past ~10 min, a workflow agent({schema}) gets no
+// background re-wake, and the StructuredOutput Stop-hook fails it the moment it
+// ends a turn without a result. So the JS LOOP holds every wait by re-spawning a
+// FRESH one-check poll agent per cycle; no single agent's turn spans the job.
+// ===========================================================================
+
+// POLL_PROTOCOL survives (TMS-102 / D2) ONLY as the short-sleep guidance INSIDE
+// each per-cycle poll agent's prompt. Its old "poll back-to-back in one turn"
+// loop role is now the JS loop's job — so a poll agent does EXACTLY ONE sleep +
+// ONE readiness check and then RETURNS, never looping in-turn.
+const POLL_PROTOCOL = [
+  `HOW TO DO ONE readiness check for a long (15-60 min) background job WITHOUT being failed by the Stop-hook:`,
+  `- Issue EXACTLY ONE Bash call with the Bash tool timeout set to 300000 ms: run \`sleep 270\` and then, in the SAME call, the one readiness test below.`,
+  `- Do NOT loop in-turn: NEVER issue a second sleep, NEVER use a single \`while …; do sleep …; done\` loop or any command longer than ~5 min (the harness backgrounds it and you will not be re-woken). The JS workflow loop will re-spawn a fresh poll agent for the next cycle.`,
+  `- Then RETURN immediately with { done: true } if the result is ready or { done: false } if not — do NOT wait for it to finish, do NOT read or interpret the result here (a later collect agent does that).`,
+].join('\n')
+
+// Indirection seam: production runs route every SDD-003 spawn through `agent`
+// (the runtime-injected global); the control-flow test overrides `spawnAgent`
+// with a stub so it exercises the REAL loop logic without spawning agents.
+let spawnAgent = (typeof agent !== 'undefined' ? agent : undefined)
+
+// awaitDetachedJob — the JS loop that HOLDS one long wait. It spawns one fresh,
+// null-safe, one-check poll agent per cycle and returns when a poll reports done.
+//   outFile  — the readiness target. For pre-review this is the JS-owned <outFile>
+//              ("done" = target exists, written by an atomic mv); for the committer
+//              this is the launch-RETURNED bg output path ("done" = a terminal gate
+//              result is present). The launch step owns the freshness rm -f; this
+//              helper only reads readiness.
+//   opts     — { label, phase, doneTest } where doneTest is the literal Bash the
+//              poll runs to decide readiness (it must echo READY when done).
+// Returns true when the job is done; returns POLL_EXHAUSTED (a sentinel, NOT a
+// throw) when POLL_CEILING or the MAX_POLL_AGENTS global budget is hit, so the
+// caller degrades that wait to a recorded Known Concern and continues.
+async function awaitDetachedJob(outFile, opts) {
+  const { label, phase: phaseName, doneTest } = opts
+  for (let cycle = 1; cycle <= POLL_CEILING; cycle++) {
+    if (pollAgentsSpawned >= MAX_POLL_AGENTS) {
+      // Global poll budget exhausted across ALL waits — degrade, do not abort.
+      return POLL_EXHAUSTED
+    }
+    pollAgentsSpawned++
+    const p = await spawnAgent(
+      [
+        `You are a one-check POLL agent inside an automated workflow. Your ONLY job is a single readiness check on a long detached job, then RETURN.`,
+        POLL_PROTOCOL,
+        `The readiness check (run it verbatim after the sleep, in the same Bash call): ${doneTest}`,
+        `If it prints READY return { done: true }; otherwise return { done: false }. Return the minimal schema { done }.`,
+      ].join('\n'),
+      { agentType: 'general-purpose', label: `${label}:poll${cycle}`, phase: phaseName, schema: { type: 'object', additionalProperties: false, required: ['done'], properties: { done: { type: 'boolean' } } } },
+    )
+    // Null-safety: a null poll return is a terminal service error for THIS cycle.
+    // It means "still waiting, re-poll" — never read .done off it, never count it
+    // as done, never abort. Spawn a fresh poll on the next iteration.
+    if (!p) continue
+    if (p.done === true) return true
+  }
+  // Per-wait POLL_CEILING reached without "done".
+  return POLL_EXHAUSTED
+}
+
+// Default per-site retry cap for a BOUNDED null-retry of a non-poll spawn
+// (launch / handle / collect). A null return is a terminal service error for
+// that one call; a TRANSIENT null clears within a couple of retries, but a
+// SUSTAINED null (a real outage) must NOT spin forever toward the 1000-agent cap.
+const SPAWN_RETRIES = 5
+
+// spawnWithBudget — call a spawn fn, and on a null return (terminal service
+// error) re-spawn up to maxRetries times, charging each attempt against the
+// module-level MAX_POLL_AGENTS budget (so a sustained outage degrades EARLY, not
+// at the 1000-agent cap). Returns the first truthy result, or the POLL_EXHAUSTED
+// sentinel when the per-site retries OR the global budget are exhausted — the
+// caller MUST check `=== POLL_EXHAUSTED` before dereferencing the result. This is
+// what makes the four null-retry sites bounded by construction (Risk 3, AC-7);
+// it never throws and never spins unbounded.
+async function spawnWithBudget(fn, maxRetries = SPAWN_RETRIES) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    if (pollAgentsSpawned >= MAX_POLL_AGENTS) return POLL_EXHAUSTED
+    pollAgentsSpawned++
+    const r = await fn()
+    if (r) return r
+    // null → terminal service error this attempt; re-spawn (bounded).
+  }
+  return POLL_EXHAUSTED
+}
+
+// runPreReviewWait — the pre-review launch-once + NEEDS_MANIFEST handle sub-loop,
+// extracted so it is unit-testable with injected collaborators (the inline
+// round-loop body at the call site stays byte-for-byte unchanged; it just calls
+// this to obtain `pr`). Contract (Integration points 1-4b):
+//   launch ONCE before the loop; then do { await; handle } while (handle.needAwait).
+//   The handle agent (branch A) authors manifests AND relaunches `--pending`
+//   ITSELF, so the JS re-enters `await` with NO new launch (no double-launch).
+//   A null handle return re-spawns the handle (handle carries its own already-
+//   running guard, so a re-spawn never double-launches the review).
+//   `accumulated` is the JS-owned full-set merge so the handle computes allClean
+//   over the FULL group set, not the partial --pending subset.
+// Returns a branch-B-shaped value (PREREVIEW_SCHEMA body) OR POLL_EXHAUSTED.
+async function runPreReviewWait(deps) {
+  const { launch, handle, outFile, doneTest, label, phaseName } = deps
+  // launch ONCE — the handle relaunches --pending internally thereafter. Null-safe
+  // AND bounded: a null launch return is a terminal service error → re-spawn up to
+  // SPAWN_RETRIES (the launch's pgrep guard makes a re-spawn idempotent: if the
+  // prior call DID start the job before erroring, the re-spawn finds it running
+  // and no-ops). pre_review.py is read-only against a private index, so a restart
+  // is safe (Approach / Assumptions). A SUSTAINED null degrades via POLL_EXHAUSTED.
+  const lr = await spawnWithBudget(launch)
+  if (lr === POLL_EXHAUSTED) return POLL_EXHAUSTED
+  while (true) {
+    const done = await awaitDetachedJob(outFile, { label, phase: phaseName, doneTest })
+    if (done === POLL_EXHAUSTED) return POLL_EXHAUSTED
+    // Null-safety + bound: a null handle return → re-spawn the handle (it is
+    // guarded against an already-running --pending, so a re-spawn cannot
+    // double-launch); a sustained null degrades via POLL_EXHAUSTED.
+    const h = await spawnWithBudget(handle)
+    if (h === POLL_EXHAUSTED) return POLL_EXHAUSTED
+    if (h.needAwait === true) continue // branch A — re-enter await, no new launch
+    return h // branch B — the full PREREVIEW_SCHEMA body
+  }
+}
+
+// landGroupViaGate — the committer launch -> JS-await -> collect triple for ONE
+// commit attempt, extracted so it is unit-testable. EVERY attempt (the first AND
+// every re-commit after an in-gate fix) goes through this triple, so every gate
+// wait is JS-held (D9). Returns the COMMIT_RESULT the caller's while(!landed)
+// loop branches on (landed / needRelaunch / blockingFindings / else), OR
+// POLL_EXHAUSTED when the wait hits a bound.
+//   launch  — stages + preflight + idempotency-guard + starts `git commit` via
+//             run_in_background:true; RETURNS { outFile } (the harness-assigned
+//             bg output path) or a short-circuit { alreadyLanded:true, result }.
+//   collect — reads the bg output file and returns COMMIT_RESULT_SCHEMA; for an
+//             exit-1 in-gate-fixable sub-case it does ONLY the local fix and
+//             returns { landed:false, needRelaunch:true } (no git commit in-turn).
+async function landGroupViaGate(deps) {
+  const { launch, collect, label, phaseName } = deps
+  // null launch → bounded re-spawn (idempotency guard makes it safe); a sustained
+  // null degrades via POLL_EXHAUSTED. MUST check the sentinel BEFORE dereferencing.
+  const lr = await spawnWithBudget(launch)
+  if (lr === POLL_EXHAUSTED) return POLL_EXHAUSTED
+  // idempotency short-circuit: the group's commit ALREADY landed (the only case
+  // that may claim landed — there is no in-flight false-success guard; see the
+  // committer launch prompt for why).
+  // LAND_LAUNCH_SCHEMA's oneOf already REQUIRES `result` on this branch, so the
+  // result-less case is unreachable in production; the explicit guard exists only
+  // so a malformed return degrades cleanly (POLL_EXHAUSTED → recorded Known
+  // Concern) instead of falling into awaitDetachedJob(undefined,{doneTest:undefined}).
+  if (lr.alreadyLanded) return lr.result || POLL_EXHAUSTED
+  const done = await awaitDetachedJob(lr.outFile, { label, phase: phaseName, doneTest: lr.doneTest })
+  if (done === POLL_EXHAUSTED) return POLL_EXHAUSTED
+  // null collect → bounded re-spawn; a sustained null degrades via POLL_EXHAUSTED.
+  const cr = await spawnWithBudget(() => collect(lr.outFile))
+  if (cr === POLL_EXHAUSTED) return POLL_EXHAUSTED
+  return cr
+}
+
+// landGroupLoop — drives ONE commit group's while(!landed) loop, extracted from
+// landGroups so the multi-cycle control flow (the needRelaunch re-entry + the
+// MF-B budget degrade + the MF-C stall backstop + the blockingFindings backstop)
+// is unit-testable. Collaborators are injected so the test can stub them:
+//   viaGate(gateRound) → COMMIT_RESULT | POLL_EXHAUSTED  (the full launch->await->collect triple)
+//   routeFixes(findings)  — routes blocking gate findings to the owning coders
+//   deps: { knownConcerns, commitLedger, log, g, gi }
+// Every long wait inside it is JS-held (viaGate holds the gate wait); it NEVER
+// spins unbounded — POLL_EXHAUSTED, the needRelaunch stall cap, the
+// blockingFindings STALL_ROUNDS backstop, and the verdict-ERROR path all break.
+async function landGroupLoop(viaGate, routeFixes, deps) {
+  const { knownConcerns, commitLedger, log, g, gi } = deps
+  let landed = false
+  let gateRound = 0
+  let relaunchStreak = 0 // consecutive needRelaunch rounds (reset by a productive blockingFindings round)
+  const gatePersist = new Map() // fpKey -> consecutive gate rounds the finding stayed open
+  while (!landed) {
+    gateRound++
+    const cr = await viaGate(gateRound)
+    // MF-B / Bound exhaustion (POLL_CEILING / MAX_POLL_AGENTS / sustained null) —
+    // degrade, do NOT abort: record this group as not-landed and move on.
+    if (cr === POLL_EXHAUSTED) {
+      knownConcerns.push(`commit gate: job did not finish (poll/spawn budget exhausted) for group "${g.message}"; left uncommitted.`)
+      break
+    }
+    knownConcerns.push(...(cr.knownConcerns || []))
+    if (cr.landed) {
+      commitLedger.push({ message: g.message, shaSummary: cr.shaSummary, warnings: cr.warnings, overridesAdded: cr.overridesAdded })
+      landed = true
+    } else if (cr.needRelaunch) {
+      // The collect agent applied a LOCAL in-gate fix (manifest-fill / secret
+      // removal / WARNING fix / coverage) and did NOT commit — re-run the FULL
+      // JS-held triple so the re-commit's gate wait is JS-held too (D9).
+      // MF-C backstop: a gate that keeps rejecting the fix must not spin toward
+      // the 1000-agent cap. Cap CONSECUTIVE needRelaunch rounds (a productive
+      // blockingFindings round resets the streak), set above the documented
+      // 10-cycle worst case (AC-5) so legitimate long commits still land.
+      relaunchStreak++
+      if (relaunchStreak > MAX_NEEDRELAUNCH_ROUNDS) {
+        knownConcerns.push(`Commit group "${g.message}" did not converge after ${MAX_NEEDRELAUNCH_ROUNDS} consecutive in-gate-fix relaunch rounds; left uncommitted.`)
+        break
+      }
+      log(`Commit group ${gi + 1} gate round ${gateRound}: in-gate fix applied → relaunching the full commit cycle (relaunch streak ${relaunchStreak}/${MAX_NEEDRELAUNCH_ROUNDS}).`)
+      continue
+    } else if (cr.blockingFindings && cr.blockingFindings.length) {
+      relaunchStreak = 0 // a productive (routed) round resets the needRelaunch streak
+      // Backstop: if the SAME gate findings persist for STALL_ROUNDS rounds the
+      // committer's own fix+override path is not converging — stop retrying this
+      // group, record it, and move on rather than loop toward the 1000-agent cap.
+      const keys = new Set(cr.blockingFindings.map(fpKey))
+      for (const k of keys) gatePersist.set(k, (gatePersist.get(k) || 0) + 1)
+      for (const k of Array.from(gatePersist.keys())) if (!keys.has(k)) gatePersist.delete(k)
+      if (cr.blockingFindings.every(f => (gatePersist.get(fpKey(f)) || 0) >= STALL_ROUNDS)) {
+        knownConcerns.push(`Commit group "${g.message}" did not pass the gate after ${STALL_ROUNDS} rounds; left uncommitted. Findings: ${cr.blockingFindings.map(f => f.description).join('; ')}`)
+        break
+      }
+      log(`Commit group ${gi + 1} blocked by gate: ${cr.blockingFindings.length} finding(s) → routing.`)
+      await routeFixes(cr.blockingFindings)
+    } else {
+      // verdict ERROR with no actionable findings — record and stop retrying this group
+      knownConcerns.push(`Commit group "${g.message}" could not be landed automatically (committer verdict ${cr.verdict}).`)
+      break
+    }
+  }
+}
+
+// preReviewDegrade — the pre-review main-loop's POLL_EXHAUSTED degrade, extracted
+// so it is unit-testable (symmetric with landGroupLoop's tested degrade). This is
+// SDD-003's OWN added check, which sits ABOVE the frozen :789-805 convergence body
+// (approved-set build, allClean, routeFixes, pending recompute, round cap) — so
+// extracting it touches none of that load-bearing logic. Returns true (and records
+// a Known Concern) when the wait exhausted, so the caller `break`s the round loop
+// and leaves the pending group(s) to the live commit gate; false otherwise.
+function preReviewDegrade(pr, round, pendingLen, knownConcerns) {
+  if (pr === POLL_EXHAUSTED) {
+    knownConcerns.push(`pre-review: job did not finish within the poll ceiling (round ${round}); ${pendingLen} group(s) will go through the live commit gate instead of the fast-path.`)
+    return true
+  }
+  return false
+}
+
+// SDD-003 test seam (Seam B): the engine file is a top-level-await script with
+// runtime-injected globals (agent/phase/parallel/log/args) and a tail `return`,
+// so it loads via neither require nor import — only the Workflow runtime's
+// AsyncFunction wrap. The control-flow test re-creates that wrap and sets
+// __IMPL_TEST__, bailing HERE (before the first real agent() call) with the
+// hoisted helpers + bounds exposed, so it exercises the REAL loop logic without
+// running the engine. Guarded with typeof so production (no such binding) never
+// ReferenceErrors and never bails.
+if (typeof __IMPL_TEST__ !== 'undefined' && __IMPL_TEST__) {
+  return {
+    awaitDetachedJob,
+    spawnWithBudget,
+    runPreReviewWait,
+    preReviewDegrade,
+    landGroupViaGate,
+    landGroupLoop,
+    POLL_CEILING,
+    MAX_POLL_AGENTS,
+    SPAWN_RETRIES,
+    MAX_NEEDRELAUNCH_ROUNDS,
+    POLL_EXHAUSTED,
+    HANDLE_PREREVIEW_SCHEMA,
+    COMMIT_RESULT_SCHEMA,
+    LAND_LAUNCH_SCHEMA,
+    setSpawnAgent: (fn) => { spawnAgent = fn },
+    resetPollCounter: () => { pollAgentsSpawned = 0 },
+    setPollCounter: (n) => { pollAgentsSpawned = n },
+    getPollCounter: () => pollAgentsSpawned,
+  }
 }
 
 // ===========================================================================
@@ -754,24 +1115,86 @@ if (plan.groups.length >= PREREVIEW_MIN_GROUPS) {
   phase('Pre-review')
   const planJson = JSON.stringify({ groups: plan.groups.map(g => ({ message: g.message, files: g.files })) })
   let pending = plan.groups.map((_g, i) => i)
+  // SDD-003 (Integration point 4b) — FULL-SET MERGE. `pre_review.py --pending
+  // <subset>` reviews ONLY the requested indices and reports all_clean over THAT
+  // subset, so a relaunch's output file does not carry the earlier-approved
+  // groups. The spec's literal mechanism (a JS-owned Map fed to the handle as
+  // priorState) cannot work for the within-round manifest case: branch A returns
+  // only { needAwait } (locked schema), so the JS never observes the first FULL
+  // review before a manifest relaunch shrinks the file to the subset. DEVIATION:
+  // the full-set state is instead carried by a handle-maintained on-disk
+  // accumulator (see preReviewAccum below) which the handle reads+merges+writes
+  // each call and whose lifecycle is tied to --reset, exactly like pre_review.py's
+  // own clear_approvals. The branch-B handle returns the full set from it.
+  // SDD-003 (Integration points 1-3) — JS-owned readiness target. The launch/
+  // relaunch shell writes the job to <outFile>.part and atomically `mv`s it to
+  // <outFile> ONLY on a complete result, so "done" = "the target exists" and a
+  // poll can never read a partial result (Risk 4). The path is STABLE across all
+  // launches/relaunches, so EVERY launch/relaunch MUST `rm -f` it first (Risk 6).
+  const preReviewOut = `${WORKTREE}/.review/prereview-out.json`
+  const preReviewDoneTest = `test -e "${preReviewOut}" && echo READY || echo NOT_READY`
+  // The handle-maintained full-set accumulator (see the DEVIATION note above).
+  // The handle reads+merges+writes it each call; only the --reset launch clears
+  // it. The branch-B handle returns the full set from it, so the unchanged body
+  // below sees every group.
+  const preReviewAccum = `${WORKTREE}/.review/prereview-accum.json`
   for (let round = 1; round <= PREREVIEW_MAX_ROUNDS && pending.length; round++) {
     const reset = round === 1
-    const pr = await agent(
+    const pendingArg = reset ? '--reset' : `--pending ${pending.join(',')}`
+    // launch ONCE per outer round — the handle relaunches --pending itself.
+    const launchPreReview = () => spawnAgent(
       [
-        preamble('Pre-reviewer'),
-        `Run the parallel pre-review of the planned commit groups. This does NOT commit anything.`,
-        `1. Write this JSON verbatim to ${WORKTREE}/.review/prereview-plan.json (mkdir -p the dir first):`,
+        preamble('Pre-reviewer (launch)'),
+        `LAUNCH the parallel pre-review of the planned commit groups DETACHED, then RETURN immediately. Do NOT wait for it to finish, do NOT commit anything, do NOT read the result (a later agent collects it). The JS workflow loop holds the wait.`,
+        `0. IDEMPOTENCY GUARD (run FIRST — makes a re-spawn after a transient error safe): if a pre-review is already running, do NOT start a second one. Run \`pgrep -f "pre_review.py.*--repo-root ${WORKTREE}"\`; if it finds a process, the job is already launched — return done=true WITHOUT starting another (and skip the freshness rm, which would race the running job's output).`,
+        `1. Write this JSON verbatim to "${WORKTREE}/.review/prereview-plan.json" (mkdir -p the dir first):`,
         planJson,
-        `2. From ${WORKTREE}, run exactly:`,
-        `   python3 ~/.claude/review/pre_review.py --plan ${WORKTREE}/.review/prereview-plan.json --repo-root ${WORKTREE}${reset ? ' --reset' : ` --pending ${pending.join(',')}`}`,
-        `   It reviews each group in parallel against a private git index and writes an approval marker for every CLEAN group. It can take many minutes — wait for it.`,
-        `3. MANIFESTS for big groups: any group whose verdict is "NEEDS_MANIFEST" is a big cohesive commit that must be CHUNK-reviewed. The script has written a scaffold at ${WORKTREE}/.review/prereview/group-<index>/manifest.yaml. For EACH such group, OPEN that file and fill in 'chunks:' — split the group's files into <=6 chunks, each <=400 added PRODUCTION lines (tests/docs/config don't count), every changed file in exactly ONE chunk. Each chunk MUST be a mapping with two keys: 'id' (a slug matching [a-z][a-z0-9_]* — lowercase letters/digits/underscores, starts with a letter; the key is literally 'id', NOT 'name') and 'files' (a non-empty list where each entry is '- path: <repo-relative path>' plus 'line_ranges:' set to either the string 'all' for a whole file OR a LIST of [start, end] pairs like [[1, 250]] to take part of an oversized file — a bare string like "1-250" is INVALID). Whole files use 'all'; split a single oversized file across chunks with disjoint pair-lists. Do NOT edit 'diff_hash'. Then RE-RUN the same command with '--pending <comma-separated NEEDS_MANIFEST indices>' (NO --reset) so those groups chunk-review in parallel. If a group comes back NEEDS_MANIFEST again, its blockers[] hold the validator's errors — fix that manifest and re-run. Repeat until NO group is NEEDS_MANIFEST. (If a group truly cannot fit in 6 chunks, leave its manifest's chunks empty and stop retrying it — it will be reviewed once at the commit gate.)`,
-        `4. Read the FINAL run's JSON stdout: { groups:[{index,message,content_key,verdict,too_big,approved,blockers}], wholediff:{verdict,blockers}, all_clean }. Each "blockers" is a list of reviewer lines for BLOCK verdicts, like "[F1] [CRITICAL] path:line — description".`,
-        `5. For each group return {index, contentKey:content_key, verdict, approved}. Parse each blocker line into {id, severity:"CRITICAL", file, description} and return them as that group's blockers[]. Do the same for wholediff.blockers.`,
-        `Return PREREVIEW_SCHEMA exactly: groups[], wholediff{verdict,blockers}, allClean (= all_clean).`,
+        `2. FRESHNESS (mandatory, ONLY when step 0 found nothing running): the readiness target is reused across rounds, so a stale file would falsely report "done". Run \`rm -f "${preReviewOut}" "${preReviewOut}.part"\` BEFORE starting the job.${reset ? ` This is the FULL --reset round, so ALSO clear the full-set accumulator: \`rm -f "${preReviewAccum}"\` (it is rebuilt from this full review; later --pending rounds must NOT clear it).` : ''}`,
+        `3. From ${WORKTREE}, start the review DETACHED writing to a .part file and atomically renaming on completion (so "done" = the target exists, never a partial read). ALL paths below are double-quoted because the worktree path may contain spaces. Run EXACTLY:`,
+        `   ( python3 ~/.claude/review/pre_review.py --plan "${WORKTREE}/.review/prereview-plan.json" --repo-root "${WORKTREE}" ${pendingArg} > "${preReviewOut}.part" 2> "${WORKTREE}/.review/prereview-err.log" && mv "${preReviewOut}.part" "${preReviewOut}" ) &`,
+        `   It reviews each group in parallel against a private git index and writes an approval marker for every CLEAN group. The script itself is NOT modified; the shell redirect produces the atomic file.`,
+        `Return done=true once you have STARTED the detached job (it is launched, not finished).`,
       ].join('\n'),
-      { agentType: 'general-purpose', label: `prereview:round${round}`, phase: 'Pre-review', schema: PREREVIEW_SCHEMA },
+      { agentType: 'general-purpose', label: `prereview:launch:round${round}`, phase: 'Pre-review', schema: { type: 'object', additionalProperties: false, required: ['done'], properties: { done: { type: 'boolean' } } } },
     )
+    // handle — runs after each "done": parse the FINAL JSON, merge into the
+    // full-set view, and EITHER author manifests + relaunch --pending detached
+    // (branch A {needAwait:true}, NO new launch by the JS) OR return the full
+    // PREREVIEW_SCHEMA body (branch B). Carries its own already-running guard so a
+    // null-handle re-spawn cannot double-launch (Integration point 4a).
+    const handlePreReview = () => spawnAgent(
+      [
+        preamble('Pre-reviewer (handle)'),
+        `The detached pre-review just finished. READ its result, MERGE it into the full-set accumulator, then EITHER (A) author manifests + relaunch the pending groups detached, OR (B) return the merged full-set result. This does NOT commit anything.`,
+        `1. Read the FINAL run's JSON from ${preReviewOut} (use ${WORKTREE}/.review/prereview-err.log if it is empty): { groups:[{index,message,content_key,verdict,too_big,approved,blockers}], wholediff:{verdict,blockers}, all_clean }. Each "blockers" is a list of reviewer lines for BLOCK verdicts, like "[F1] [CRITICAL] path:line — description".`,
+        `2. FULL-SET ACCUMULATOR (this run reviewed only the subset ${pendingArg}; a --pending run's output does NOT carry the earlier-reviewed groups, so the file alone is incomplete). The full-set state lives at ${preReviewAccum}, keyed by group index:`,
+        `   a. Read ${preReviewAccum} if it exists (a JSON object { "<index>": {index,contentKey,verdict,approved,blockers}, ... }); treat a missing/empty file as {}.`,
+        `   b. MERGE this run's groups OVER it (current run wins for the indices it reviewed; indices it did NOT touch keep their last-known record). For each reviewed group store {index, contentKey:content_key, verdict, approved, blockers:(parsed from its blocker lines)}.`,
+        `   c. Write the merged object BACK to ${preReviewAccum}. This accumulator is your single source of truth for the FULL group set — it survives the subset relaunches within this round.`,
+        `3. BRANCH A — MANIFESTS for big groups: if ANY group's verdict is "NEEDS_MANIFEST" it is a big cohesive commit that must be CHUNK-reviewed. The script wrote a scaffold at ${WORKTREE}/.review/prereview/group-<index>/manifest.yaml. For EACH such group OPEN that file and fill in 'chunks:' — split the group's files into <=6 chunks, each <=400 added PRODUCTION lines (tests/docs/config don't count), every changed file in exactly ONE chunk. Each chunk MUST be a mapping with two keys: 'id' (a slug matching [a-z][a-z0-9_]* — lowercase letters/digits/underscores, starts with a letter; the key is literally 'id', NOT 'name') and 'files' (a non-empty list where each entry is '- path: <repo-relative path>' plus 'line_ranges:' set to either the string 'all' for a whole file OR a LIST of [start, end] pairs like [[1, 250]] to take part of an oversized file — a bare string like "1-250" is INVALID). Whole files use 'all'; split a single oversized file across chunks with disjoint pair-lists. Do NOT edit 'diff_hash'. (If a group truly cannot fit in 6 chunks, leave its manifest's chunks empty so it is reviewed once at the commit gate, and do NOT keep relaunching it.)`,
+        `   AFTER authoring manifests (and AFTER writing the accumulator in step 2c), RELAUNCH the review DETACHED for exactly the NEEDS_MANIFEST indices, with the SAME freshness + atomic-rename discipline (ALL paths double-quoted — the worktree path may contain spaces) — but do NOT clear the accumulator (only --reset clears it): FIRST guard against an already-running pending review — if \`pgrep -f "pre_review.py.*--repo-root ${WORKTREE}.*--pending"\` finds one, do NOT start a second (just return {needAwait:true}). This pattern is SCOPED to THIS worktree (it matches --repo-root ${WORKTREE} AND --pending, in the relaunch command's arg order) so a concurrent /implement-wf run in ANOTHER worktree never makes you skip your own relaunch. Otherwise run \`rm -f "${preReviewOut}" "${preReviewOut}.part"\` then \`( python3 ~/.claude/review/pre_review.py --plan "${WORKTREE}/.review/prereview-plan.json" --repo-root "${WORKTREE}" --pending <NEEDS_MANIFEST indices> > "${preReviewOut}.part" 2> "${WORKTREE}/.review/prereview-err.log" && mv "${preReviewOut}.part" "${preReviewOut}" ) &\`. Then return EXACTLY { needAwait: true } — the JS re-enters the wait with NO new launch.`,
+        `4. BRANCH B — if NO group is NEEDS_MANIFEST: return the FULL set from the merged accumulator (NOT just this run's subset). For each accumulated group return {index, contentKey, verdict, approved} with its blockers[] (each {id, severity:"CRITICAL", file, description}). Parse wholediff.blockers from this run's file the same way. Return groups[], wholediff{verdict,blockers}, allClean (= true iff EVERY group in the accumulated full set is approved AND wholediff is OK/SKIP).`,
+        `Return HANDLE_PREREVIEW_SCHEMA: EITHER { needAwait: true } (branch A) OR the full body { groups[], wholediff{verdict,blockers}, allClean } (branch B).`,
+      ].join('\n'),
+      { agentType: 'general-purpose', label: `prereview:handle:round${round}`, phase: 'Pre-review', schema: HANDLE_PREREVIEW_SCHEMA },
+    )
+    const pr = await runPreReviewWait({
+      launch: launchPreReview,
+      handle: handlePreReview,
+      outFile: preReviewOut,
+      doneTest: preReviewDoneTest,
+      label: `prereview:round${round}`,
+      phaseName: 'Pre-review',
+    })
+    // Bound exhaustion (POLL_CEILING / MAX_POLL_AGENTS) — degrade, do NOT abort:
+    // record the wait as a Known Concern and leave the pending groups to the live
+    // commit gate (the existing degrade pattern), then stop the pre-review loop.
+    // review-note: preReviewDegrade is unit-tested (implement.test.js::test_prereview_mainloop_exhausted_degrades, which asserts the Known-Concern record + the break signal). This one-line break-on-exhaustion stays INLINE because extracting the frozen :789-805 convergence body (approved-set build, allClean test, routeFixes, pending recompute, audit-exclusion) to unit-test a single branch would force a byte-for-byte change to that load-bearing region — disproportionate and riskier than the branch itself; the integration is field-validated (D7c/d).
+    if (preReviewDegrade(pr, round, pending.length, knownConcerns)) break
+    // pr.groups is the branch-B FULL set (from the handle's accumulator), so the
+    // unchanged body below sees every group — approved set, allClean test,
+    // routeFixes, pending recompute, and the audit-exclusion list all operate on
+    // the complete plan, not a --pending subset.
     lastPreReviewGroups = pr.groups
     for (const gr of pr.groups) if (gr.approved && gr.contentKey) approved.add(gr.contentKey)
     const wholediffClean = pr.wholediff.verdict === 'OK' || pr.wholediff.verdict === 'SKIP'
@@ -793,8 +1216,9 @@ if (plan.groups.length >= PREREVIEW_MIN_GROUPS) {
   phase('Land')
 }
 
-// 4.3 — Land each group sequentially through the commit gate, with an
-// unbounded fix loop. The committer agent runs ALONE (never alongside others).
+// 4.3 — Land each group sequentially through the commit gate, with a fix loop
+// bounded on every path (STALL_ROUNDS on blockingFindings; MAX_NEEDRELAUNCH_ROUNDS
+// on needRelaunch). The committer agent runs ALONE (never alongside others).
 const commitLedger = []
 // Land a set of logical commit groups sequentially through the gate. Extracted
 // into a function so the acceptance-remediation loop (4.5) can re-land the
@@ -802,15 +1226,37 @@ const commitLedger = []
 async function landGroups(groups, fastpathEnabled) {
  for (let gi = 0; gi < groups.length; gi++) {
   const g = groups[gi]
-  let landed = false
-  let gateRound = 0
-  const gatePersist = new Map() // fpKey -> consecutive gate rounds the finding stayed open
-  while (!landed) {
-    gateRound++
-    const cr = await agent(
+  // SDD-003 (D9, Integration points 3 & 5) — EVERY commit attempt (the first AND
+  // every re-commit after an in-gate fix) goes through the full JS-held
+  // launch -> awaitDetachedJob -> collect triple, so every gate wait is JS-held,
+  // not just the first. The launch RETURNS the harness-assigned bg output path
+  // (run_in_background); a null launch is safe to re-spawn because of the
+  // idempotency guard. The collect, for an in-gate-fixable exit-1 sub-case, does
+  // ONLY the local fix and returns needRelaunch (no in-turn git commit), so the
+  // loop re-runs the WHOLE triple. The loop control + its MF-B/MF-C backstops
+  // live in landGroupLoop (unit-tested); viaGate is the per-cycle triple.
+  const viaGate = (gateRound) => {
+    const landLaunch = () => spawnAgent(
       [
-        preamble('Committer'),
-        `Follow the commit skill procedure (~/.claude/skills/commit/SKILL.md): security scan, Phase 3.5 coverage+assert preflight (a fresh coverage.xml is required), stash-guard, then commit with the AI review hook in the BACKGROUND (the gate can take up to 20 minutes — poll, do not give up early).`,
+        preamble('Committer (launch)'),
+        `LAUNCH a commit for ONE logical group, then RETURN immediately — do NOT wait for the AI review gate (the JS workflow loop holds that wait), do NOT read the result (a later collect agent does).`,
+        // IDEMPOTENCY: only an ALREADY-LANDED commit may claim landed. There is
+        // deliberately NO "in-flight commit" guard: returning landed for an
+        // in-flight (not-yet-finished) commit is a FALSE success — the gate may
+        // still block/crash, but landGroupLoop would record it landed and advance,
+        // silently dropping the commit. Instead we rely on git's own serialization:
+        // a null-launch re-spawn that starts a second `git commit` while the first
+        // is mid-gate fails fast ("index.lock exists"), and a later retry's
+        // already-landed check (case a) picks up the first commit once its gate
+        // completes and returns the REAL landed result. So the rare
+        // null-re-spawn-mid-commit case converges via git's lock + the already-landed
+        // check, with NO false landed:true and NO silent drop — strictly safer.
+        `IDEMPOTENCY GUARD (run FIRST — makes a re-spawn safe, never double-commits), scoped to THIS worktree (paths double-quoted — the worktree path may contain spaces):`,
+        `  ALREADY-LANDED check — run \`git -C "${WORKTREE}" log --oneline ${BASE}..HEAD\` and look for a commit whose subject is EXACTLY this group's conventional subject (it is ALREADY prefixed with the task id "${TASK}" — match it verbatim, do NOT add another prefix):`,
+        `      ${g.message}`,
+        `If that subject is ALREADY present (the commit really landed), do NOT start another — return { alreadyLanded:true, result:{ landed:true, verdict:"CLEAN", shaSummary:"<the existing short hash + subject>", blockingFindings:[], warnings:[], overridesAdded:[], knownConcerns:[] } }.`,
+        `If a \`git commit\` for this group is still RUNNING (e.g. \`git commit\` fails fast with "index.lock exists"), do NOT fabricate a landed result — just proceed to start the commit normally; git's own lock serializes it and a later already-landed check will pick up the real result.`,
+        `Otherwise: follow the commit skill procedure (~/.claude/skills/commit/SKILL.md): security scan, Phase 3.5 coverage+assert preflight (a fresh coverage.xml is required), stash-guard, then launch \`git commit\` via the Bash tool's run_in_background:true (the commit-skill way — NEVER a shell \`&\`, which detaches the commit and leaves HEAD unchanged). The AI review gate takes 15-25 min and runs in the BACKGROUND.`,
         ...(fastpathEnabled
           ? [`This run pre-reviewed the commits in parallel. Prefix the git commit with the env var SDD_REVIEW_FASTPATH=1 (i.e. \`SDD_REVIEW_FASTPATH=1 git commit ...\`): a commit whose changes already passed pre-review then skips the redundant LLM review automatically — the deterministic gates (coverage/assert/secrets) still run. If the commit was not pre-approved the full review just runs as normal; never try to force a skip any other way.`]
           : []),
@@ -818,48 +1264,37 @@ async function landGroups(groups, fastpathEnabled) {
         `  message: ${g.message}`,
         `  files: ${g.files.join(', ')}`,
         `Work inside ${WORKTREE}. Stage only these files (never -A / .).`,
+        `When you launch the commit via run_in_background:true the Bash tool assigns an OUTPUT-FILE path for the background process. RETURN that exact path as outFile, and a doneTest = a single Bash one-liner that prints READY when the gate has produced a TERMINAL result (a commit SHA, or "Review BLOCKED"/"### Upheld findings", or "manifest auto-scaffolded", or a preflight exit-2/3 marker) in that output file, else NOT_READY. DOUBLE-QUOTE the output-file path (it may contain spaces) — e.g. \`grep -qE '<short-sha>|Review BLOCKED|### Upheld findings|manifest auto-scaffolded|preflight (failed|crashed)' "<outFile>" && echo READY || echo NOT_READY\`.`,
+        `Return { started:true, outFile, doneTest }. (If you took the idempotency short-circuit, return { alreadyLanded:true, result } instead.)`,
+      ].join('\n'),
+      { agentType: 'general-purpose', label: `land:launch:${gi + 1}:${gateRound}`, phase: 'Land', schema: LAND_LAUNCH_SCHEMA },
+    )
+    const landCollect = (outFile) => spawnAgent(
+      [
+        preamble('Committer (collect)'),
+        `The background commit's AI review gate has finished. READ its result from the background output file "${outFile}" (double-quote it when you cat/grep it — the path may contain spaces) and return the structured outcome. Do NOT issue a fresh \`git commit\` in your own turn — if a re-commit is needed you signal it with needRelaunch and the JS re-runs the whole launch->wait->collect cycle.`,
         ``,
-        `READING THE GATE RESULT — the git commit exit code is authoritative:`,
-        `- exit 0  → commit landed. Return landed=true with shaSummary ("git log -1 --oneline").`,
-        `- exit 2  → coverage/assert preflight failed (usually a missing/stale coverage.xml or an untested new line / weak assertion). Regenerate coverage, add the missing test/assertion, re-commit. This is yours to fix.`,
-        `- exit 3  → preflight gate crashed. Return landed=false, verdict ERROR, with the crash text in knownConcerns.`,
+        `READING THE GATE RESULT — the git commit exit code (in "${outFile}") is authoritative:`,
+        `- exit 0  → commit landed. Return landed=true with shaSummary (\`git -C "${WORKTREE}" log -1 --oneline\`).`,
+        `- exit 2  → coverage/assert preflight failed (usually a missing/stale coverage.xml or an untested new line / weak assertion). Regenerate coverage / add the missing test or assertion ON DISK, then return { landed:false, needRelaunch:true } so the JS re-commits. This is yours to fix.`,
+        `- exit 3  → preflight gate crashed. Return landed=false, verdict ERROR, with the crash text in knownConcerns (NO needRelaunch).`,
         `- exit 1  → BLOCK. Read the hook output to tell which kind:`,
-        `    • "manifest auto-scaffolded" → fill .review/manifest.yaml (group files <=300 prod lines/chunk, <=12 chunks) and re-commit.`,
+        `    • "manifest auto-scaffolded" → fill .review/manifest.yaml (group files <=300 prod lines/chunk, <=12 chunks) ON DISK, then return { landed:false, needRelaunch:true }.`,
         `    • "Review BLOCKED" / "Chunked review BLOCKED" → parse the "### Upheld findings (blocking)" section. Each blocking line looks like "[F1] [CRITICAL] path:line — description". Those CRITICALs are what blocks the commit. The "### Warnings:" section lists advisory "[WARNING] ..." lines.`,
         ``,
-        `AUTONOMY RULES (no human is available) for an exit-1 review BLOCK:`,
-        `- gitleaks/semgrep secret hit: it is your own generated code — remove the secret, use an env var or an obviously-fake placeholder, and re-commit.`,
-        `- WARNINGs: fix the ones you can within this group's files, then re-commit (they are advisory but the directive says fix-in-one-pass).`,
-        `- An UPHELD CRITICAL you have already tried to fix once and judge to be a false positive: add a SCOPED override (a note in .claude/review_prompt.md, or a rule-id in .semgrep-exclude-rules) AND record the override + your reasoning in knownConcerns. Only then will the commit land.`,
-        `- An UPHELD CRITICAL in another coder's production logic that you cannot fix from this group's files: return landed=false with it in blockingFindings — set { id, severity:"CRITICAL", file (the path:line from the finding), description } so the loop routes it to the owner.`,
+        `AUTONOMY RULES (no human is available) for an exit-1 review BLOCK — apply ONLY the LOCAL on-disk fix, then signal needRelaunch (NEVER commit in your own turn):`,
+        `- gitleaks/semgrep secret hit: it is your own generated code — remove the secret ON DISK (use an env var or an obviously-fake placeholder), then return { landed:false, needRelaunch:true }.`,
+        `- WARNINGs: fix the ones you can within this group's files ON DISK, then return { landed:false, needRelaunch:true } (advisory, but the directive says fix-in-one-pass).`,
+        `- An UPHELD CRITICAL you have already tried to fix once and judge to be a false positive: add a SCOPED override (a note in .claude/review_prompt.md, or a rule-id in .semgrep-exclude-rules) ON DISK AND record the override + your reasoning in knownConcerns, then return { landed:false, needRelaunch:true } so the re-commit lands.`,
+        `- An UPHELD CRITICAL in another coder's production logic that you CANNOT fix from this group's files: return landed=false with it in blockingFindings — set { id, severity:"CRITICAL", file (the path:line from the finding), description } and NO needRelaunch, so the loop routes it to the owner.`,
         ``,
-        `Return COMMIT_RESULT: landed, verdict (CLEAN/BLOCKED/ERROR), shaSummary, blockingFindings (each with id+file+description), warnings, overridesAdded, knownConcerns.`,
+        `Return COMMIT_RESULT: landed, verdict (CLEAN/BLOCKED/ERROR), shaSummary, blockingFindings (each with id+file+description), warnings, overridesAdded, knownConcerns, and needRelaunch when (and only when) you applied a local fix and want the JS to re-commit.`,
       ].join('\n'),
-      { agentType: 'general-purpose', label: `land:commit:${gi + 1}:${gateRound}`, phase: 'Land', schema: COMMIT_RESULT_SCHEMA },
+      { agentType: 'general-purpose', label: `land:collect:${gi + 1}:${gateRound}`, phase: 'Land', schema: COMMIT_RESULT_SCHEMA },
     )
-    knownConcerns.push(...(cr.knownConcerns || []))
-    if (cr.landed) {
-      commitLedger.push({ message: g.message, shaSummary: cr.shaSummary, warnings: cr.warnings, overridesAdded: cr.overridesAdded })
-      landed = true
-    } else if (cr.blockingFindings && cr.blockingFindings.length) {
-      // Backstop: if the SAME gate findings persist for STALL_ROUNDS rounds the
-      // committer's own fix+override path is not converging — stop retrying this
-      // group, record it, and move on rather than loop toward the 1000-agent cap.
-      const keys = new Set(cr.blockingFindings.map(fpKey))
-      for (const k of keys) gatePersist.set(k, (gatePersist.get(k) || 0) + 1)
-      for (const k of Array.from(gatePersist.keys())) if (!keys.has(k)) gatePersist.delete(k)
-      if (cr.blockingFindings.every(f => (gatePersist.get(fpKey(f)) || 0) >= STALL_ROUNDS)) {
-        knownConcerns.push(`Commit group "${g.message}" did not pass the gate after ${STALL_ROUNDS} rounds; left uncommitted. Findings: ${cr.blockingFindings.map(f => f.description).join('; ')}`)
-        break
-      }
-      log(`Commit group ${gi + 1} blocked by gate: ${cr.blockingFindings.length} finding(s) → routing.`)
-      await routeFixes(cr.blockingFindings)
-    } else {
-      // verdict ERROR with no actionable findings — record and stop retrying this group
-      knownConcerns.push(`Commit group "${g.message}" could not be landed automatically (committer verdict ${cr.verdict}).`)
-      break
-    }
+    return landGroupViaGate({ launch: landLaunch, collect: landCollect, label: `land:commit:${gi + 1}:${gateRound}`, phaseName: 'Land' })
   }
+  await landGroupLoop(viaGate, routeFixes, { knownConcerns, commitLedger, log, g, gi })
  }
 }
 

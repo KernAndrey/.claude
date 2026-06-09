@@ -354,7 +354,7 @@ hint needs no Change Control entry.
 
      ### b-N — <short title>
      - **status**: open | resolved-by-user
-     - **raised-by**: spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | lead (Phase 1 / Phase 3)
+     - **raised-by**: spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise | lead (Phase 1 / Phase 3)
      - **raised-on**: YYYY-MM-DD
      - **expertise-needed**: business | architecture | testing | security | ux | unknown
      - **context**: <what was found, what's ambiguous>

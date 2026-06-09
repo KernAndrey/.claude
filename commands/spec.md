@@ -80,7 +80,7 @@ Each blocker is a level-3 heading inside the spec's `## Blockers` section. Gener
 ```markdown
 ### b-N — <short title summarizing the question>
 - **status**: open
-- **raised-by**: lead (Phase 1 / Phase 3) | spec-analyst | spec-architect | spec-critic-arch | spec-critic-business
+- **raised-by**: lead (Phase 1 / Phase 3) | spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise
 - **raised-on**: {TODAY}
 - **expertise-needed**: business | architecture | testing | security | ux | unknown
 - **context**: <what was found in the code or spec, what's ambiguous, what each option would imply>
@@ -171,9 +171,9 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 
 **Message loop:** same shape as 2a, but with `spec-architect` and the Architect signal names.
 
-### 2c. Critics (two agents in parallel)
+### 2c. Critics (three agents in parallel)
 
-Spawn both critics as background agents in one batch (two `Agent` calls in a single response). They run in parallel — no dependencies between them. Record both `agentId`s.
+Spawn all three critics as background agents in one batch (three `Agent` calls in a single response). They run in parallel — no dependencies between them. Record all three `agentId`s.
 
 #### 2c-i. Architecture Critic
 
@@ -201,15 +201,30 @@ Spawn `Agent(subagent_type: "Spec-Critic-Business", name: "spec-critic-business"
 > {On resume:} `RESUMED_RUN: true`
 > Run your full business quality lens pass (Lenses G–R). Signal `SPEC BUSINESS CRITIC REPORT` when done.
 
-**Message loops:** run both in parallel. Both critics rarely escalate; if either does, handle like any other `QUESTION FOR USER`.
+#### 2c-iii. Premise Critic
 
-Wait for both critics to complete before proceeding.
+Spawn `Agent(subagent_type: "Spec-Critic-Premise", name: "spec-critic-premise", run_in_background: true, prompt: "...")`. The prompt:
+
+> Read your instructions: `~/.claude/agents/spec-critic-premise.md`
+> Spec path: `tasks/2-spec/{ID}-{slug}.md`
+> Draft path: `{draft path}` — **read `## Decisions` and `## Codebase Observations`. Unlike the other agents, you do NOT treat Decisions as authoritative — they are exactly what you scrutinize. Treat every claim, including every recorded user decision, as a hypothesis to disprove.**
+> Working directory: `{project root}`
+> Phase 1 context: {inline user answers and Lead observations}
+> Project CLAUDE.md: `{path}`
+> {On resume:} `RESUMED_RUN: true`
+> Run your full premise pass (Lenses L1–L6). A sound foundation yields zero challenges — never manufacture one. Signal `SPEC PREMISE CRITIC REPORT` when done.
+
+**Message loops:** run all three in parallel. The critics rarely escalate; if any does, handle like any other `QUESTION FOR USER`.
+
+Wait for all three critics to complete before proceeding.
 
 ### 2d. Apply findings
 
-Merge findings from both critics (arch critic, business critic). This includes `EMERGENT QUESTIONS FOR USER` from both sources — they all feed into Phase 3. Deduplicate findings that flag the same issue — keep the more specific description.
+Merge findings from all three critics (arch critic, business critic, premise critic). This includes `EMERGENT QUESTIONS FOR USER` from all sources — they all feed into Phase 3. Deduplicate findings that flag the same issue — keep the more specific description.
 
-The Analyst, Architect, and both Critics have completed by now — resume each **by its `agentId`** (not by name). Their preserved context means they remember their prior work.
+The premise critic is different in kind: it challenges decisions, not implementation. Its findings are mostly `route: user` and feed **Phase 3** directly — they are not applied through the analyst/architect fix loop below, because only the user can re-decide a decision. The one exception is a premise finding with `route: analyst` (an assumption factually contradicted by code), which joins the analyst fix round. The premise critic gets **no re-check** pass.
+
+The Analyst, Architect, and both consistency Critics (arch, business) have completed by now — resume each **by its `agentId`** (not by name). Their preserved context means they remember their prior work.
 
 After reports are collected:
 
@@ -231,7 +246,7 @@ Many open questions only become visible after Analyst describes behavior, Archit
 Gather from:
 - `Edge Cases & Risks` — table rows with `Status: OPEN` that still need clarification
 - `Architecture & Implementation Plan → Open architectural questions`
-- Critic's `EMERGENT QUESTIONS FOR USER` (each carries an expertise tag)
+- All three critics' `EMERGENT QUESTIONS FOR USER` (arch, business, premise; each carries an expertise tag). The premise critic's questions challenge decisions the user already made — present them as genuine reconsiderations, not as gaps.
 
 ### Classify
 

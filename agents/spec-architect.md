@@ -105,7 +105,8 @@ The Work breakdown tells `/implement` how to parallelize Coders. Every spec has 
 
 - Even single-coder tasks list one coder (`coder-1`) with the full scope. Keeps the format uniform.
 - Split into multiple Coders only when work streams touch **different files** with **no shared logic** (separate models, independent endpoints, unrelated UI components). Tightly coupled work stays with one Coder.
-- Every file under "Files to create" and "Files to modify" must appear in **exactly one** Coder's files: list — no overlaps, no gaps. The union of all Coder file lists equals the full file map.
+- Every **production** file under "Files to create" and "Files to modify" must appear in **exactly one** Coder's files: list — no overlaps, no gaps. The union of all Coder file lists equals the full **production** file map.
+- **Test files belong to the Tester, never a Coder.** Keep every test path (`tests/…`, `*_test.*`, `*.spec.*`, `test_*`) and every `tests/__init__.py` registration out of all Coder files: lists. The single Tester (spawned by `/implement`) writes and owns all tests; the AC → Implementation map's test targets are its brief. A test file in a Coder's list makes that Coder write its own tests, which defeats the independent-Tester check (a Tester that did not write the production code cannot share the Coder's blind spot).
 - Stable names: `coder-1`, `coder-2`, … (single-coder tasks use `coder-1`, not `coder`).
 - Do not list Tester — there is always a single Tester spawned by the `/implement` lead. Parallel testers conflict on shared test infrastructure.
 - **Size cap: ~3000 lines of expected diff per Coder.** If your estimate exceeds the cap (rough heuristic: files × typical change size + size of new files), split further into tightly-cohesive sub-scopes. The cap reflects reviewer attention limits and the commit-review hook's hard rejection threshold.
@@ -115,7 +116,7 @@ The Work breakdown tells `/implement` how to parallelize Coders. Every spec has 
 Walk this checklist in order. If any item fails, fix it before signalling.
 
 1. Every AC in the spec has a row in AC → Implementation map.
-2. Every file in "Files to create" is covered by exactly one coder; "Files to modify" files exist in the project.
+2. Every **production** file in "Files to create" is covered by exactly one coder; **no test file is assigned to any coder** (the Tester owns them); "Files to modify" files exist in the project.
 3. Every framework/library API named in the plan carries a `ctx7:` or `src:` verification tag.
 4. The three Exploration evidence artifacts (analogous features, vendor classes, integration call-sites) are filled and attached to the Done message below.
 

@@ -737,3 +737,66 @@ test('test_prereview_mainloop_exhausted_degrades', async () => {
   assert.strictEqual(notDegraded, false, 'a normal pre-review result does NOT degrade')
   assert.strictEqual(kc2.length, 0, 'no Known Concern recorded on the normal path')
 })
+
+// isTestPath — single source of truth for "is this a test path", used to keep
+// test files out of a Coder's owned-files list (Phase 1a) and to route test
+// review findings to the Tester (Phase 3). The Coder/Tester separation breaks
+// silently if a real test path slips through, so the classifier — especially
+// the `test_*` prefix convention the earlier regex missed — is asserted directly.
+test('test_isTestPath_classifies_test_and_production_paths', async () => {
+  const mod = await loadEngine()
+
+  const TEST_PATHS = [
+    'test_orders.py',              // bare test_* prefix (the convention the old regex missed)
+    'tms/tests/test_orders.py',    // test_* under a tests/ dir
+    'module/test_helpers.py',      // test_* prefix in a subdirectory
+    'tests/__init__.py',           // test-package registration
+    'app/tests/conftest.py',       // anything under a tests/ dir
+    'app/test/legacy_spec.rb',     // singular test/ dir
+    'order_test.py',               // *_test.* suffix
+    'widget.test.js',              // *.test.* (JS)
+    'widget.spec.tsx',             // *.spec.* (TS)
+  ]
+  for (const p of TEST_PATHS) {
+    assert.strictEqual(mod.isTestPath(p), true, `expected ${p} to be classified as a test path`)
+  }
+
+  const PROD_PATHS = [
+    'models/order.py',             // ordinary production module
+    'src/widget.js',
+    'contest_helpers.py',          // contains "test" but NOT at a path boundary — must NOT match
+    'fastest.py',                  // substring "test", no test_ prefix and no tests/ dir
+    '',                            // empty / undefined-ish path is not a test path
+  ]
+  for (const p of PROD_PATHS) {
+    assert.strictEqual(mod.isTestPath(p), false, `expected ${p || '<empty>'} to be classified as a production path`)
+  }
+
+  // Guards the `p || ''` fallback against null/undefined inputs.
+  assert.strictEqual(mod.isTestPath(undefined), false, 'undefined is not a test path')
+  assert.strictEqual(mod.isTestPath(null), false, 'null is not a test path')
+})
+
+// prodFilesOnly — the filter Phase 1a applies to a coder's owned-files list so
+// the "Files you own (production only)" prompt never tells a Coder to author
+// its own tests. Asserted directly (not just via isTestPath) because it is the
+// artifact that produces the feature's output: test paths must drop while every
+// production path survives in order.
+test('test_prodFilesOnly_drops_test_paths_keeps_production', async () => {
+  const mod = await loadEngine()
+
+  assert.deepStrictEqual(
+    mod.prodFilesOnly(['models/order.py', 'test_order.py', 'tests/__init__.py', 'api/views.py']),
+    ['models/order.py', 'api/views.py'],
+    'drops every test path and keeps production files in order',
+  )
+  // A coder list with no test paths is returned unchanged.
+  assert.deepStrictEqual(
+    mod.prodFilesOnly(['a/models.py', 'a/service.py']),
+    ['a/models.py', 'a/service.py'],
+    'production-only input is preserved',
+  )
+  // Missing / empty file list is tolerated (the `c.files || []` guard).
+  assert.deepStrictEqual(mod.prodFilesOnly(undefined), [], 'undefined files → empty list')
+  assert.deepStrictEqual(mod.prodFilesOnly([]), [], 'empty files → empty list')
+})

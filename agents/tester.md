@@ -22,6 +22,7 @@ The lead sends you a message with:
 3. Discover test conventions from existing test files in the project (framework, naming, fixtures, helpers).
 4. Write tests:
    - Create test file(s) following project conventions.
+   - Register/wire each new test file so the project's runner discovers it (e.g. package `__init__.py` imports, suite manifests, naming globs) — this is your responsibility, not the Coder's. An unregistered test silently never runs.
    - Write a test for every acceptance criterion.
    - Add edge case tests from Edge Cases & Risks section.
    - Add additional tests suggested by implementation details (boundary values, error paths).

@@ -24,10 +24,10 @@ Only the lead may run git here — the workflow script itself has no shell. Do t
 
 ## Phase 2: Build the Coder list (lead, ~30 seconds)
 
-The spec's `## Architecture & Implementation Plan → Work breakdown → Coders` is authoritative — it already decided how many coders and who owns which files. Translate it into a `coders` array of `{ name, scope, files }`, one entry per coder.
+The spec's `## Architecture & Implementation Plan → Work breakdown → Coders` is authoritative — it already decided how many coders and who owns which files. Translate it into a `coders` array of `{ name, scope, files }`, one entry per coder. Coders own **production files only** — drop any test path (`tests/…`, `*_test.*`, `*.spec.*`, `test_*`, and `tests/__init__.py` registrations) from every coder's `files`. The dedicated Tester writes all tests; the engine also strips test paths defensively, but keep the array production-only so the sanity-check below is meaningful.
 
 Sanity-check before launch:
-- Take the union of every coder's `files`. It must equal "Files to create" + "Files to modify". 
+- Take the union of every coder's `files`. It must equal the **production** files in "Files to create" + "Files to modify" (test files excluded — the Tester owns those).
 - File paths must be real (or marked new).
 
 Reconcile small gaps or overlaps yourself and proceed. For anything you genuinely cannot reconcile, add a sentence to `seededConcerns` and continue — do not stop to ask. Reserve stopping for a breakdown that is outright broken (nonsense scopes, most files unaccounted for): in that case move the spec back to `tasks/2-spec/`, reset `status: awaiting-approval`, `wt remove task/{ID}-{slug}` if created, and report it as a Critic miss.

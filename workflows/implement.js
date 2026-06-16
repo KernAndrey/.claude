@@ -93,7 +93,26 @@ const POLL_EXHAUSTED = Symbol('POLL_EXHAUSTED')
 const MAX_NEEDRELAUNCH_ROUNDS = 20
 
 const FRONTEND_RE = /\.(x?html?|css|s[ac]ss|less|jsx?|tsx?|vue|svelte|qweb|mako|jinja2)$/i
-const TEST_PATH_RE = /(^|\/)tests?\/|_test\.|\.test\.|\.spec\./i
+const TEST_PATH_RE = /(^|\/)tests?\/|(^|\/)test_|_test\.|\.test\.|\.spec\./i
+
+// True when `p` is a test file or test-package registration. The dedicated
+// Tester owns every test file; a Coder writes production code only. Single
+// source of truth for "is this a test path", used to strip test paths from a
+// coder's owned-files list (Phase 1a) and to route test review findings to the
+// Tester (Phase 3). The `(^|\/)test_` branch covers the `test_*.py` convention
+// (and `tests/__init__.py` via the `tests?/` branch); the boundary anchor keeps
+// production names that merely contain "test" (e.g. contest_helpers.py) out.
+function isTestPath(p) {
+  return TEST_PATH_RE.test(p || '')
+}
+
+// A Coder's owned-files list with every test path removed. Phase 1a feeds the
+// result to the Coder as "Files you own (production only)" so the Coder never
+// authors its own tests — the dedicated Tester does, preserving the
+// independent-Tester check. Extracted (not inline) so it is unit-testable.
+function prodFilesOnly(files) {
+  return (files || []).filter(f => !isTestPath(f))
+}
 
 // Stable content fingerprint for a finding — survives id renumbering across
 // rounds, so set-shrink / persistence detection is reliable.
@@ -732,6 +751,8 @@ function preReviewDegrade(pr, round, pendingLen, knownConcerns) {
 // ReferenceErrors and never bails.
 if (typeof __IMPL_TEST__ !== 'undefined' && __IMPL_TEST__) {
   return {
+    isTestPath,
+    prodFilesOnly,
     awaitDetachedJob,
     spawnWithBudget,
     runPreReviewWait,
@@ -769,19 +790,25 @@ phase('Code')
 log(`Spawning ${CODERS.length} coder(s) from the Work breakdown.`)
 
 const coderResults = (await parallel(
-  CODERS.map((c, i) => () =>
-    agent(
+  CODERS.map((c, i) => () => {
+    // Defense in depth: a Coder writes PRODUCTION code only. The dedicated Tester
+    // (next phase) writes ALL tests. Strip any test paths the Work breakdown
+    // assigned to this coder so the "Files you own" list never tells a coder to
+    // author its own tests — that would defeat the independent-Tester check.
+    const prodFiles = prodFilesOnly(c.files)
+    return agent(
       [
         preamble('Coder'),
         `Read your role instructions: ~/.claude/agents/coder.md`,
         `Your scope (Work breakdown → ${c.name}): ${c.scope}`,
-        `Files you own: ${(c.files || []).join(', ')}`,
+        `Files you own (production only): ${prodFiles.join(', ')}`,
         `Do NOT touch any other files — they belong to other coders.`,
+        `Implement production code only. A dedicated Tester writes ALL tests in the next phase, so do NOT create or edit any test file (tests/…, *_test.*, *.spec.*, test_*).`,
         `Implement your scope fully. Return changedFiles + implementationSummary.`,
       ].join('\n'),
       { agentType: 'Coder', label: `code:${c.name}`, phase: 'Code', schema: CODER_SCHEMA },
-    ),
-  ),
+    )
+  }),
 )).filter(Boolean)
 
 let changedFiles = []
@@ -900,7 +927,7 @@ async function routeFixes(findings) {
   const byCoder = new Map()
   const testFindings = []
   for (const f of findings) {
-    if (f.file && TEST_PATH_RE.test(f.file)) testFindings.push(f)
+    if (f.file && isTestPath(f.file)) testFindings.push(f)
     else {
       const owner = ownerOf(f.file)
       if (!byCoder.has(owner.name)) byCoder.set(owner.name, [])

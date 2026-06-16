@@ -49,9 +49,8 @@ review/logs/
 # Project-local (nested) claude config when running inside ~/.claude
 /.claude/
 
-# Project session logs (keep memory and CLAUDE.md, ignore session files)
-projects/**//*.jsonl
-projects/**/*-*-*-*-*
+# Claude Code runtime data (session transcripts + per-project memory) — state, not config
+projects/
 
 # Transcripts
 transcripts/

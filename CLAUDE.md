@@ -5,6 +5,9 @@ Ubuntu 24.04, user: kern.
 
 <critical>
 When a test fails, fix the bug in production code, not the assertion.
+Fix any test that fails — including one that was already failing before your
+change. A test's origin is irrelevant: "it was already broken" / "pre-existing"
+/ "not caused by my change" never justifies leaving a failure unfixed.
 If unsure how to fix, report to the user. Loosening assertions masks real bugs.
 </critical>
 

@@ -121,6 +121,8 @@ Record the `agentId` from every spawn into a small registry (`name | agentId | r
 
 **Addressing:** running agent → `SendMessage(to: "spec-analyst")`; completed agent → `SendMessage(to: "{agentId}")`. The completion notification is your done signal — do not poll for it.
 
+**Liveness:** a dead agent sends no completion notification and nothing else wakes you. Follow `~/.claude/templates/liveness-protocol.md`: arm a dead-man timer per phase (`Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_ANALYST")` — likewise `WATCHDOG_ARCHITECT`, `WATCHDOG_CRITICS`), audit on every wake-up, recover via ping-by-`agentId` first, respawn as escalation.
+
 Shared context to pass in every agent prompt:
 - Draft path (or existing spec path on resume) — **instruct agents to read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified facts about the codebase) from the draft file. These two sections are the persistent source of truth — inline prompt context is supplementary.**
 - User's Phase 1 answers (new runs) or resolved-blocker answers (resume runs) — inline as supplementary context
@@ -152,7 +154,7 @@ Shared context to pass in every agent prompt:
 Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 - On `SPEC ANALYST QUESTION FOR USER`: extract topic, context, question, options, expertise. Format for the user using the defer-aware prompt (embed context as the "Вопрос N/M" background). On answer → `SendMessage(to: "spec-analyst", "ANSWER: <text>")`. On defer → create a `### b-N` entry in the spec's Blockers section via Edit, then `SendMessage(to: "spec-analyst", "DEFERRED: b-N")`.
 - On `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`: break.
-- If no completion notification after ~15 min: send `STATUS CHECK` by `name` (it is still running). On second silence, surface to the user.
+- On `WATCHDOG_ANALYST` firing with no completion: run the liveness check from the protocol — `TaskList` status, then ping by `agentId` (a dead agent is not reachable by `name`), respawn as escalation.
 
 ### 2b. Architect
 
@@ -174,6 +176,8 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 ### 2c. Critics (three agents in parallel)
 
 Spawn all three critics as background agents in one batch (three `Agent` calls in a single response). They run in parallel — no dependencies between them. Record all three `agentId`s.
+
+Arm one watchdog for the batch: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")`.
 
 #### 2c-i. Architecture Critic
 

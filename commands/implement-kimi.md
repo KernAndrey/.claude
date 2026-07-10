@@ -300,7 +300,7 @@ UI-Reviewer gets two extra lines in its prompt:
 > Changed files: {combined_changed_files}
 > URL hints: {any relevant URLs or pages you can identify from the spec}
 
-The completion notification is your done signal — do not poll for it. Each reviewer reports with the standard `REVIEWER:`/`VERDICT:`/`DEPTH:`/`FINDINGS:`/`SUMMARY:` block. Reject reports without a DEPTH block — re-run that reviewer (resume by `agentId` or spawn a fresh instance). Same rule if DEPTH counts look implausibly low for the diff.
+The completion notification is your done signal — do not poll for it. A dead reviewer sends no notification: whenever you await reviewer reports (initial pass and re-review rounds), keep a dead-man timer armed per `~/.claude/templates/liveness-protocol.md` — `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_REVIEW")`, audit on every wake-up, ping by `agentId` first, respawn as escalation. Each reviewer reports with the standard `REVIEWER:`/`VERDICT:`/`DEPTH:`/`FINDINGS:`/`SUMMARY:` block. Reject reports without a DEPTH block — re-run that reviewer (resume by `agentId` or spawn a fresh instance). Same rule if DEPTH counts look implausibly low for the diff.
 
 If UI-Reviewer reports `VERDICT: BLOCKED` (cannot start dev server, browser unavailable): spawn a replacement with a troubleshooting hint (check port, install deps, alternative start command). Retry up to 3 times. After 3 failures: document the reason in Known Concerns, add a manual UI check to Steps for Manual Review, and continue.
 

@@ -29,9 +29,9 @@ code-review | a5d6-...     | Code-Reviewer | —
 
 Append a row immediately after each spawn. This table is how you reach completed agents in later phases.
 
-### Liveness backstop
+### Liveness protocol
 
-Completion notifications cover the normal case. If an agent produces no completion notification after ~15 minutes, send `STATUS CHECK: progress? blockers?` by `name`. If still no response after one more interval, the lead investigates directly: read the agent's last output and the relevant files, then either resume it with a specific hint or take over the task. Max **3 restart attempts** per role; after that the lead does the work directly.
+A dead agent (transient API error) sends no completion notification, and nothing else wakes you — the old "check after ~15 minutes" backstop never fired because your turn had already ended. Read and follow `~/.claude/templates/liveness-protocol.md`: keep a dead-man timer armed whenever you await agent messages, audit the registry on every wake-up, and recover missing agents — ping by `agentId` first (usually sufficient), fresh respawn as escalation. 3 recovery cycles per agent; no cap in AFK mode. Each phase below names its watchdog.
 
 ## Quality mandate
 
@@ -93,6 +93,8 @@ Implement your scope. Your final message must be `CODER DONE.` with the list of 
 
 For single-coder tasks (one entry in Work breakdown), the spawn is the same — just one agent, scope and file list copied from the spec.
 
+Right after the spawn wave, arm the phase watchdog: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CODE")` (liveness protocol). `TaskStop` it when the phase completes.
+
 **Phase 1a is complete when every Coder has sent its completion notification with `CODER DONE.`** and a changed-files list.
 
 ---
@@ -120,6 +122,8 @@ Write tests for the implementation. Your final message must be `TESTER DONE.` wi
 If you find a production bug, message me with `PRODUCTION BUG FOUND` and details, including the affected file path so I can route the fix to the right coder."
 )
 ```
+
+Arm the phase watchdog: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_TEST")`. Keep it armed through bug-fix rounds — you are awaiting agent messages the whole time.
 
 If the Tester reports `PRODUCTION BUG FOUND`:
 - Map the affected file → owning Coder via the registry's `files_owned`. Resume that Coder by `agentId` with the bug details.
@@ -176,6 +180,8 @@ Review prompts: if `.claude/review_prompt.md` exists, read it — it contains pr
 Report findings in the format from your agent file."
 )
 ```
+
+Arm the phase watchdog: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_REVIEW")`.
 
 UI-Reviewer gets two extra lines in its prompt:
 
@@ -239,6 +245,8 @@ Resume the Tester by `agentId` with all test fixes (if any):
 
 > These test findings need to be fixed. For each item: severity, source reviewer, test file, description.
 > Re-run all tests after fixes. Then your message must be `TESTER FIX ROUND DONE.`
+
+Fix rounds await agent messages like any phase — arm `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_FIX")` per round.
 
 #### Step 3: Verification (re-review)
 

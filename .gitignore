@@ -25,9 +25,9 @@ file-history/
 telemetry/
 
 # Tasks and todos (ephemeral)
-tasks/
-todos/
-plans/
+/tasks/
+/todos/
+/plans/
 .tasks.toml
 
 # Debug

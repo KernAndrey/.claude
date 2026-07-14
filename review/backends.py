@@ -23,11 +23,10 @@ do not change.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import tempfile
 from abc import ABC, abstractmethod
-from pathlib import Path
-
-_KIMI_AGENT_FILE = str(Path(__file__).parent / "agents" / "kimi-pre-commit-reviewer.yaml")
 
 
 class Backend(ABC):
@@ -152,6 +151,34 @@ class ClaudeBackend(Backend):
 class KimiBackend(Backend):
     name = "kimi"
 
+    @staticmethod
+    def _parse_stream_json(raw: str) -> str:
+        """Extract the reviewer's text from kimi-code ``--output-format stream-json``.
+
+        Each stdout line is one JSON object tagged by ``role``:
+          * ``{"role":"assistant","tool_calls":[...]}`` → a tool call, skip
+          * ``{"role":"assistant","content":"..."}``    → reviewer text, keep
+          * ``{"role":"tool"|"meta", ...}``             → tool result / footer, skip
+        Concatenate every assistant ``content`` string in order — a long review
+        may arrive as several assistant messages — to reconstruct the full text.
+        Lines that are not JSON (defensive) are ignored.
+        """
+        parts: list[str] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("role") != "assistant":
+                continue
+            content = event.get("content")
+            if isinstance(content, str) and content.strip():
+                parts.append(content)
+        return "\n".join(parts).strip()
+
     def run(
         self,
         system_prompt: str,
@@ -159,52 +186,65 @@ class KimiBackend(Backend):
         model: str,
         timeout: int,
     ) -> tuple[str, str, int]:
-        # Kimi has no --system-prompt flag → concatenate system + user the
-        # same way OpencodeBackend does. The combined prompt is delivered on
-        # STDIN (`--input-format text` makes kimi read the user prompt from
-        # stdin under --print), NOT on argv: chunked-path prompts (cached
-        # block + manifest + full diff) routinely exceed Linux MAX_ARG_STRLEN
-        # (~128KB per single argv arg) and `--prompt <huge>` fails instantly
-        # with `[Errno 7] Argument list too long`. Symmetric with how
-        # OpencodeBackend and ClaudeBackend pipe the prompt via stdin.
+        # Kimi has no --system-prompt flag → concatenate system + user the same
+        # way OpencodeBackend does.
         #
-        # No anti-browsing preamble: kimi reviews with full read-only file
-        # access, mirroring ClaudeBackend (--tools Read,Grep,Glob) and
-        # OpencodeBackend (--agent pre-commit-reviewer). The hook runs from
-        # the repo root (git invokes it there; neither the hook nor this
-        # backend overrides cwd), so combined.md's "ground every finding in
-        # real code — use Read/Grep/Glob" instruction resolves repo-relative
-        # paths and kimi can pull context beyond the diff, like Sonnet did.
-        # Read-only containment still holds via --agent-file (see below).
+        # kimi-code (0.24.1) dropped --quiet / --agent-file / --input-format and
+        # the stdin prompt channel: `-p` takes the prompt as a single argv value,
+        # and review prompts (cached block + manifest + full diff) routinely
+        # exceed Linux MAX_ARG_STRLEN (~128KB per arg) → `[Errno 7] Argument list
+        # too long`. So the full prompt is staged in a temp file and kimi is given
+        # a short instruction to Read it; kimi pulls it in via its Read tool (the
+        # same file-driven pattern the kimi skill uses). Verified: kimi Reads an
+        # absolute /tmp path from the repo-root cwd without --add-dir.
+        #
+        # Read-only containment: KIMI_REVIEW_READONLY=1 arms
+        # ~/.kimi/hooks/review_readonly.py (a PreToolUse deny hook) for THIS run
+        # only — it denies Write/Edit/Bash/FetchURL/WebSearch, replacing the
+        # kimi-cli --agent-file allowlist that kimi-code removed. `-p` runs under
+        # the `auto` permission policy (auto-approves tool calls), so this hook is
+        # what keeps the reviewer from mutating the tree or reaching the network.
+        # Pairs with the write-tree/read-tree index backstop in
+        # ~/.claude/git-hooks/pre-commit. Thread-safe: all state is local; mkstemp
+        # gives each concurrent chunked-path call its own file.
+        #
+        # stream-json (not text): `--output-format text` interleaves `•` reasoning
+        # lines with the answer and a resume footer — painful to parse. stream-json
+        # is line-delimited JSON we split cleanly in _parse_stream_json.
         full_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
-        # `--quiet` is `--print --output-format text --final-message-only` —
-        # gives clean stdout (just the final assistant reply) instead of the
-        # event-stream dump `--print` alone produces. `--print` implicitly
-        # enables --yolo (auto-approve all tool calls), so `--agent-file`
-        # loads our restricted agent definition (no Shell, no write tools,
-        # no network egress) — the only thing keeping the reviewer from
-        # mutating the working tree or exfiltrating data during diff
-        # investigation. Symmetric with `opencode --agent pre-commit-reviewer`
-        # and pairs with the write-tree/read-tree backstop in
-        # ~/.claude/git-hooks/pre-commit.
-        cmd = [
-            "kimi",
-            "--quiet",
-            "--model",
-            model,
-            "--agent-file",
-            _KIMI_AGENT_FILE,
-            "--input-format",
-            "text",
-        ]
-        result = subprocess.run(
-            cmd,
-            input=full_prompt,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return result.stdout.strip(), result.stderr.strip(), result.returncode
+        fd, prompt_path = tempfile.mkstemp(suffix=".md", prefix="kimi-review-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(full_prompt)
+            instruction = (
+                f"Read the file {prompt_path} in full using the Read tool. It contains a "
+                "code-review system prompt followed by the diff to review. Follow those "
+                "instructions exactly and output ONLY the review text in the format they "
+                "specify. Do not modify, create, or delete any file."
+            )
+            cmd = [
+                "kimi",
+                "-p",
+                instruction,
+                "--model",
+                model,
+                "--output-format",
+                "stream-json",
+            ]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**os.environ, "KIMI_REVIEW_READONLY": "1"},
+            )
+            review = self._parse_stream_json(result.stdout) if result.stdout else ""
+            return review, result.stderr.strip(), result.returncode
+        finally:
+            try:
+                os.unlink(prompt_path)
+            except OSError:
+                pass
 
 
 def _build_registry(*backends: Backend) -> dict[str, Backend]:

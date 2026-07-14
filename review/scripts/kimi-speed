@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""revspeed — toggle which kimi channel the pre-commit reviewer uses.
+
+    revspeed                 show the current speed
+    revspeed show            show the current speed
+    revspeed fast            switch to highspeed  (aliases: highspeed, high)
+    revspeed std             switch to standard   (aliases: standard, slow, normal)
+    revspeed toggle          flip between the two
+
+Writes review/.review/kimi-speed, which review/config.py re-reads on every
+commit (fresh process per commit), so a flip takes effect on the next commit.
+Single source of truth for the file path + valid values is review/config.py.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# review/scripts/ → review/ ; import the shared resolver + constants so the
+# state-file path and model aliases never drift from what the hook actually reads.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from config import (  # noqa: E402  (path insert must precede this import)
+    KIMI_SPEED_FILE,
+    _KIMI_HIGHSPEED,
+    _KIMI_STANDARD,
+    kimi_review_model,
+)
+
+FAST_WORDS = {"fast", "highspeed", "high"}
+STD_WORDS = {"std", "standard", "slow", "normal"}
+
+
+def current_speed() -> str:
+    return "highspeed" if kimi_review_model() == _KIMI_HIGHSPEED else "standard"
+
+
+def show() -> None:
+    speed = current_speed()
+    alias = _KIMI_HIGHSPEED if speed == "highspeed" else _KIMI_STANDARD
+    print(f"review kimi model: {speed} ({alias})")
+
+
+def write_speed(speed: str) -> None:
+    KIMI_SPEED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    KIMI_SPEED_FILE.write_text(speed + "\n", encoding="utf-8")
+
+
+def main(argv: list[str]) -> int:
+    arg = (argv[1] if len(argv) > 1 else "show").lower()
+    if arg in ("show", ""):
+        show()
+        return 0
+    if arg == "toggle":
+        new = "standard" if current_speed() == "highspeed" else "highspeed"
+    elif arg in FAST_WORDS:
+        new = "highspeed"
+    elif arg in STD_WORDS:
+        new = "standard"
+    else:
+        print(f"revspeed: unknown speed {arg!r}; use fast | std | toggle | show", file=sys.stderr)
+        return 2
+    write_speed(new)
+    show()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

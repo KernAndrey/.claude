@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -133,6 +134,62 @@ def error(msg: str) -> None:
 
 def info(msg: str) -> None:
     print(f"\033[36mℹ️  [code-review] {msg}\033[0m", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Fallback visibility
+# ---------------------------------------------------------------------------
+# When a primary reviewer errors (rc!=0 / empty / timeout / unreachable) the
+# hook transparently falls back to FALLBACK (config.py). That fail-open is
+# correct — a broken reviewer must never block a commit — but it is DANGEROUS
+# when silent: the kimi backend was dead for three weeks (stale kimi-cli CLI
+# flags after the kimi-code migration) and every commit quietly ran on Sonnet
+# instead, unnoticed. These helpers make any fallback LOUD and put it in the
+# review report body (stdout + saved log), not just a scroll-by stderr line.
+_FALLBACK_LOCK = threading.Lock()
+_FALLBACK_EVENTS: list[str] = []  # "primary → fallback: reason", one per fired fallback
+
+
+def record_fallback(primary: str, fallback: str, reason: str) -> None:
+    """Thread-safe: called from every path (small / chunked fan-out worker)."""
+    with _FALLBACK_LOCK:
+        _FALLBACK_EVENTS.append(f"{primary} → {fallback}: {reason}")
+
+
+def fallback_banner() -> str | None:
+    """A loud, plain-text banner if any primary reviewer failed over, else None.
+
+    Prepended to the review report so it appears in both the commit output and
+    the saved log/*.md — impossible to miss and durable for later inspection.
+    """
+    with _FALLBACK_LOCK:
+        events = list(_FALLBACK_EVENTS)
+    if not events:
+        return None
+    counts: dict[str, int] = {}
+    for ev in events:
+        counts[ev] = counts.get(ev, 0) + 1
+    bar = "=" * 66
+    lines = [
+        bar,
+        "⚠️  PRIMARY REVIEWER FAILED — the configured reviewer did not run.",
+        "-" * 66,
+        "This commit was reviewed by the FALLBACK backend (or not at all, if that",
+        "also failed — see messages above). Findings below are NOT from your",
+        "intended primary reviewer. Fix it — a silent fallback hides the breakage",
+        "(see review/config.py).",
+    ]
+    for ev, n in counts.items():
+        lines.append(f"  • {ev}" + (f"  (×{n})" if n > 1 else ""))
+    lines.append(bar)
+    return "\n".join(lines)
+
+
+def emit_fallback_stderr() -> None:
+    """Print the fallback banner to stderr in red, if any. Call once, last."""
+    banner = fallback_banner()
+    if banner:
+        print(f"\033[31m{banner}\033[0m", file=sys.stderr)
 
 
 def read_file(path: Path | str) -> str:
@@ -459,9 +516,11 @@ def run_with_fallback(
         return review, stderr, rc, primary.backend
 
     if primary_failed_reason is not None:
-        warn(f"{primary_failed_reason}, falling back to {fallback.backend}")
+        reason = primary_failed_reason
     else:
-        warn(f"{primary.backend} failed (rc={rc}), falling back to {fallback.backend}")
+        reason = f"{primary.backend} exited rc={rc} with error/empty output"
+    warn(f"{reason} — falling back to {fallback.backend}")
+    record_fallback(primary.backend, fallback.backend, reason)
 
     review, stderr, rc = run_reviewer(fallback, system_prompt, user_prompt)
     return review, stderr, rc, fallback.backend
@@ -1369,8 +1428,19 @@ def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
     )
 
     if use_fanout:
-        return _run_fanout_with_arbiter(diff, files, is_merge)
-    return _run_single_call(diff, files, is_merge)
+        display, verdict = _run_fanout_with_arbiter(diff, files, is_merge)
+    else:
+        display, verdict = _run_single_call(diff, files, is_merge)
+    # These legacy paths call run_with_fallback (which records the fallback) but
+    # write their own logs; surface any fallback on the returned display + stderr
+    # for parity with the production _run_multi_backend_pipeline. Saved-log
+    # inlining stays on the production path — these are test-surface routes.
+    if display is not None:
+        banner = fallback_banner()
+        if banner:
+            display = f"{banner}\n\n{display}"
+    emit_fallback_stderr()
+    return display, verdict
 
 
 def _summarize_results_label(results: list) -> str:
@@ -1596,6 +1666,9 @@ def _run_chunked_path(diff: str, files: str, is_merge: bool) -> str:
     except OSError as exc:
         warn(f"Failed to write review artifacts: {exc} — continuing with verdict")
     display = _format_chunked_display(result)
+    banner = fallback_banner()
+    if banner:
+        display = f"{banner}\n\n{display}"
 
     if result.upheld_clusters:
         verdict = "BLOCK"
@@ -1607,25 +1680,42 @@ def _run_chunked_path(diff: str, files: str, is_merge: bool) -> str:
         info(display)
 
     save_log(verdict, files=files, diff=diff, review=display)
+    emit_fallback_stderr()
     return verdict
 
 
 def _run_multi_backend_pipeline(diff: str, files: str, is_merge: bool) -> str:
     """Run orchestrator → consolidation → log + stats. Returns verdict."""
     from consolidation import consolidate
-    from orchestrator import run_multi_backend
+    from orchestrator import run_multi_backend, total_failure_reason
 
     results = run_multi_backend(diff, files, is_merge)
+    # The orchestrator (this — the production — path) falls back by appending a
+    # FALLBACK result when all primaries fail; it dispatches via run_reviewer,
+    # NOT run_with_fallback, so it never touches record_fallback. Bridge that
+    # result-based signal into the shared accumulator here, or fallback_banner()
+    # below would stay empty and the fallback would go unsurfaced.
+    fb_reason = total_failure_reason(results)
+    if fb_reason is not None and FALLBACK is not None:
+        record_fallback(", ".join(c.backend for c in PRIMARIES), FALLBACK.backend, fb_reason)
     any_ok = any(r.status == "ok" and r.review_text and r.review_text.strip() for r in results)
     if not any_ok:
-        warn("All reviewers (and fallback if configured) failed — allowing commit")
+        error(
+            "All reviewers (and fallback if configured) FAILED — allowing commit (fail-open); this diff was NOT reviewed."
+        )
+        emit_fallback_stderr()
         cons = consolidate(results, diff)
-        _persist_run("EMPTY", files, diff, "", results, cons, error_msg="no reviewer produced output")
+        _persist_run(
+            "EMPTY", files, diff, fallback_banner() or "", results, cons, error_msg="no reviewer produced output"
+        )
         return "EMPTY"
 
     cons = consolidate(results, diff)
     verdict = "BLOCK" if cons.upheld_clusters else "OK"
     display = _render_consolidation_display(results, cons)
+    banner = fallback_banner()
+    if banner:
+        display = f"{banner}\n\n{display}"
     _persist_run(verdict, files, diff, display, results, cons)
 
     if verdict == "BLOCK":
@@ -1634,6 +1724,7 @@ def _run_multi_backend_pipeline(diff: str, files: str, is_merge: bool) -> str:
         info(_BLOCK_TRADEOFF_DIRECTIVE)
     elif extract_warning_lines(display):
         warn(f"Review notes (non-blocking warnings):\n{display}")
+    emit_fallback_stderr()
     return verdict
 
 

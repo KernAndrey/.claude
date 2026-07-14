@@ -8,6 +8,29 @@ from here.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+
+# --- revspeed: which kimi channel the reviewer uses -----------------------
+_KIMI_STANDARD = "kimi-code/kimi-for-coding"
+_KIMI_HIGHSPEED = "kimi-code/kimi-for-coding-highspeed"
+# `revspeed` (review/scripts/kimi-speed) writes "standard" or "highspeed" here
+# to switch the reviewer's kimi channel by hand — e.g. drop to highspeed when
+# the standard quota runs low. The pre-commit hook is a fresh process per
+# commit, so config.py re-reads this on every commit and a flip takes effect on
+# the next one. Missing / unreadable / unrecognized content → standard.
+KIMI_SPEED_FILE = Path(__file__).parent / ".review" / "kimi-speed"
+
+
+def kimi_review_model() -> str:
+    """Resolve the kimi model alias for review runs from the revspeed state file."""
+    try:
+        speed = KIMI_SPEED_FILE.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        speed = ""
+    return _KIMI_HIGHSPEED if speed == "highspeed" else _KIMI_STANDARD
+
+
+_KIMI_MODEL = kimi_review_model()
 
 
 @dataclass(frozen=True)
@@ -52,8 +75,8 @@ class RunnerConfig:
 #     ]
 PRIMARIES: list[RunnerConfig] = [
     RunnerConfig(
-        "kimi", "kimi-code/kimi-for-coding"
-    ),  # Kimi K2 is the sole primary reviewer; requires `kimi login`. Model alias must match ~/.kimi/config.toml [models.*] key. KimiBackend pins review/agents/kimi-pre-commit-reviewer.yaml automatically. review-note: no startup capability probe by design — this hook only runs on the owner's machine (~/.claude is single-user config), the reviewer fail-opens on backend errors (hook.py:1525+, fallback to claude/sonnet on total primary failure), and a probe per commit would burn ~1-2s for no real safety on a misconfigured machine the user would notice immediately anyway.
+        "kimi", _KIMI_MODEL
+    ),  # Kimi is the sole primary reviewer; requires `kimi login`. Model alias (standard or highspeed via `revspeed`) must match ~/.kimi-code/config.toml [models.*] key. Read-only containment is enforced by ~/.kimi/hooks/review_readonly.py (KimiBackend arms it via KIMI_REVIEW_READONLY=1). review-note: no startup capability probe by design — this hook only runs on the owner's machine (~/.claude is single-user config), the reviewer fail-opens on backend errors (fallback to claude/sonnet on total primary failure, now surfaced by hook.fallback_banner), and a probe per commit would burn ~1-2s for no real safety on a misconfigured machine the user would notice immediately anyway.
     # RunnerConfig("claude", "sonnet"),  # uncomment to add a parallel second reviewer
 ]
 
@@ -118,7 +141,7 @@ ALLOWED_LENSES: frozenset[str] = frozenset({"bugs", "architecture", "tests"})
 # Total parallel jobs ≤ MAX_CHUNKS * len(CHUNKED_BACKENDS) +
 #                       len(ALLOWED_LENSES) * len(CHUNKED_BACKENDS).
 CHUNKED_BACKENDS: list[RunnerConfig] = [
-    RunnerConfig("kimi", "kimi-code/kimi-for-coding"),
+    RunnerConfig("kimi", _KIMI_MODEL),  # standard or highspeed via `revspeed` (see kimi_review_model)
     # RunnerConfig("claude", "sonnet"),
 ]
 

@@ -509,88 +509,318 @@ def test_claude_backend_forwards_timeout() -> None:
     assert mock_run.call_args.kwargs["timeout"] == 333
 
 
-def _patched_backends_subprocess(
+def _capture_kimi_invocation(
     stdout: str = "", stderr: str = "", returncode: int = 0
-) -> AbstractContextManager[MagicMock]:
-    """Patch backends.subprocess.run with a mock returning given values.
+) -> tuple[dict, AbstractContextManager[MagicMock]]:
+    """Patch backends.subprocess.run and capture the real kimi-code invocation.
 
-    Replaces the four-line MagicMock+patch scaffold each KimiBackend test
-    would otherwise repeat. Yields the MagicMock for `with ... as mock_run`
-    so callers can inspect ``mock_run.call_args``.
+    KimiBackend stages the full prompt in a temp file and hands kimi a short
+    ``-p`` instruction to Read it, then unlinks the file in ``finally``. The
+    mock's side_effect runs *during* subprocess.run — before that unlink — so it
+    reads the staged prompt back out. Returns ``(captured, ctx)`` where
+    ``captured`` gains keys ``cmd`` / ``kwargs`` / ``prompt`` once the ``with``
+    block runs.
     """
-    mock_result = MagicMock()
-    mock_result.stdout = stdout
-    mock_result.stderr = stderr
-    mock_result.returncode = returncode
-    return patch("backends.subprocess.run", return_value=mock_result)
+    captured: dict = {}
+
+    def side_effect(cmd: list[str], **kwargs: object) -> MagicMock:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        instruction = cmd[cmd.index("-p") + 1]
+        path = instruction.split("Read the file ", 1)[1].split(" in full", 1)[0]
+        captured["prompt"] = Path(path).read_text(encoding="utf-8")
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    return captured, patch("backends.subprocess.run", side_effect=side_effect)
 
 
-def test_kimi_backend_builds_correct_command() -> None:
-    with _patched_backends_subprocess(stdout="kimi review body") as mock_run:
+def test_kimi_backend_builds_kimi_code_command() -> None:
+    captured, ctx = _capture_kimi_invocation(stdout='{"role":"assistant","content":"body"}')
+    with ctx:
         stdout, stderr, rc = KimiBackend().run("sys", "user", "kimi-for-coding", 600)
 
-    cmd = mock_run.call_args[0][0]
+    cmd = captured["cmd"]
     assert cmd[0] == "kimi"
-    # --quiet = --print --output-format text --final-message-only.
-    # The shortcut keeps stdout to just the final assistant message instead
-    # of the event-stream dump `--print` alone produces.
-    assert "--quiet" in cmd
-    model_idx = cmd.index("--model")
-    assert cmd[model_idx + 1] == "kimi-for-coding"
-    # Prompt is delivered on STDIN, not argv — `--input-format text` + a
-    # piped `input=`. argv `--prompt <huge>` hit MAX_ARG_STRLEN (~128KB) and
-    # failed with `[Errno 7] Argument list too long` on chunked-path prompts.
-    assert "--prompt" not in cmd
-    assert cmd[cmd.index("--input-format") + 1] == "text"
-    # KimiBackend concatenates system + user prompt verbatim (no anti-browsing
-    # preamble) so kimi follows combined.md just like ClaudeBackend — full
-    # read-only file access, ground findings in real code. The sent prompt is
-    # exactly "<system>\n\n<user>".
-    sent = mock_run.call_args.kwargs["input"]
-    assert sent == "sys\n\nuser"
-    assert "Do **not** call `ReadFile`" not in sent
-    assert mock_run.call_args.kwargs["timeout"] == 600
-    assert (stdout, stderr, rc) == ("kimi review body", "", 0)
+    assert cmd[cmd.index("--model") + 1] == "kimi-for-coding"
+    # stream-json (not text): clean line-delimited JSON we parse deterministically.
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json"
+    assert "-p" in cmd
+    # The dead kimi-cli flags must never come back — kimi-code rejects them and
+    # the review silently fell back to Sonnet for weeks when they were present.
+    for dead in ("--quiet", "--agent-file", "--input-format"):
+        assert dead not in cmd
+    # Read-only containment is armed for THIS run only via the env flag that
+    # review_readonly.py keys on — replaces the removed --agent-file allowlist.
+    assert captured["kwargs"]["env"]["KIMI_REVIEW_READONLY"] == "1"
+    # The full "<system>\n\n<user>" prompt is staged verbatim in the temp file
+    # kimi is told to Read (argv would blow past MAX_ARG_STRLEN on big diffs).
+    assert captured["prompt"] == "sys\n\nuser"
+    assert captured["kwargs"]["timeout"] == 600
+    # stdout is parsed out of the stream-json envelope.
+    assert (stdout, stderr, rc) == ("body", "", 0)
 
 
-def test_kimi_backend_pins_agent_file() -> None:
-    """The kimi invocation must pin --agent-file at our project-shipped YAML
-    so the LLM cannot reach Shell/WriteFile/StrReplaceFile/SearchWeb/FetchURL
-    and silently mutate the working tree during diff investigation. Kimi's
-    --print mode implicitly enables --yolo (auto-approve all tool calls), so
-    the agent-file is the only constraint keeping the reviewer read-only.
-    Pairs with the write-tree/read-tree backstop in
-    ~/.claude/git-hooks/pre-commit. The YAML file must also exist on disk —
-    a test-only mock would let a future refactor delete it without warning.
-    """
-    with _patched_backends_subprocess() as mock_run:
-        KimiBackend().run("sys", "user", "kimi-for-coding", 60)
-
-    cmd = mock_run.call_args[0][0]
-    agent_idx = cmd.index("--agent-file")
-    agent_path = cmd[agent_idx + 1]
-    assert Path(agent_path).is_absolute()
-    assert agent_path.endswith("review/agents/kimi-pre-commit-reviewer.yaml")
-    assert Path(agent_path).is_file()
+def test_kimi_backend_parses_stream_json() -> None:
+    """_parse_stream_json keeps assistant text, drops tool_calls / tool / meta."""
+    stream = "\n".join(
+        [
+            '{"role":"assistant","tool_calls":[{"type":"function","id":"t1","function":{"name":"Read","arguments":"{}"}}]}',
+            '{"role":"tool","tool_call_id":"t1","content":"raw file body — must be dropped"}',
+            '{"role":"assistant","content":"- [CRITICAL] a.py:1 — boom"}',
+            '{"role":"assistant","content":"Summary: 1 critical"}',
+            '{"role":"meta","type":"session.resume_hint","content":"To resume: kimi -r x"}',
+        ]
+    )
+    assert KimiBackend._parse_stream_json(stream) == "- [CRITICAL] a.py:1 — boom\nSummary: 1 critical"
 
 
-def test_kimi_backend_empty_system_prompt_sends_user_prompt_only() -> None:
-    """With an empty system_prompt KimiBackend sends just the user prompt
-    (no preamble, mirroring OpencodeBackend's `... if system_prompt else
-    user_prompt` branch). Guards against a regression that re-introduces a
-    bare preamble or an empty-leading-separator artefact."""
-    with _patched_backends_subprocess(stdout="ok") as mock_run:
+def test_kimi_backend_empty_system_prompt_stages_user_only() -> None:
+    """With an empty system_prompt, only the user prompt is staged (no preamble
+    / leading-separator artefact) — mirrors OpencodeBackend's branch."""
+    captured, ctx = _capture_kimi_invocation(stdout='{"role":"assistant","content":"ok"}')
+    with ctx:
         KimiBackend().run("", "user", "kimi-for-coding", 60)
 
-    sent = mock_run.call_args.kwargs["input"]
-    assert sent == "user"
+    assert captured["prompt"] == "user"
 
 
 def test_kimi_backend_forwards_timeout() -> None:
-    with _patched_backends_subprocess(stdout="ok") as mock_run:
+    captured, ctx = _capture_kimi_invocation(stdout='{"role":"assistant","content":"ok"}')
+    with ctx:
         KimiBackend().run("sys", "user", "kimi-for-coding", 333)
 
-    assert mock_run.call_args.kwargs["timeout"] == 333
+    assert captured["kwargs"]["timeout"] == 333
+
+
+# ---------------------------------------------------------------------------
+# Fallback visibility — record_fallback / fallback_banner
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_banner_none_when_no_fallback() -> None:
+    """No fallback recorded → no banner (the common healthy path)."""
+    import hook
+
+    assert hook.fallback_banner() is None
+
+
+def test_fallback_banner_surfaces_primary_failure_with_count() -> None:
+    """A recorded fallback yields a loud banner; duplicate reasons collapse to a
+    count. This is the signal that was missing when kimi silently ran on Sonnet
+    for three weeks."""
+    import hook
+
+    hook.record_fallback("kimi", "claude/sonnet", "kimi exited rc=1 with error/empty output")
+    hook.record_fallback("kimi", "claude/sonnet", "kimi exited rc=1 with error/empty output")
+    banner = hook.fallback_banner()
+    assert banner is not None
+    assert "PRIMARY REVIEWER FAILED" in banner
+    assert "kimi → claude/sonnet" in banner
+    assert "(×2)" in banner
+
+
+def test_emit_fallback_stderr_prints_banner(capsys: pytest.CaptureFixture[str]) -> None:
+    import hook
+
+    hook.record_fallback("kimi", "claude/sonnet", "kimi exited rc=1")
+    hook.emit_fallback_stderr()
+    assert "PRIMARY REVIEWER FAILED" in capsys.readouterr().err
+
+
+def test_emit_fallback_stderr_silent_when_clean(capsys: pytest.CaptureFixture[str]) -> None:
+    import hook
+
+    hook.emit_fallback_stderr()
+    assert capsys.readouterr().err == ""
+
+
+def test_multi_backend_pipeline_prepends_banner_on_fallback() -> None:
+    import hook
+
+    hook.record_fallback("kimi", "claude/sonnet", "kimi exited rc=1")
+    ok = MagicMock(status="ok", review_text="body")
+    seen: dict[str, str] = {}
+    with (
+        patch("orchestrator.run_multi_backend", return_value=[ok]),
+        patch("consolidation.consolidate", return_value=MagicMock(upheld_clusters=[])),
+        patch("hook._render_consolidation_display", return_value="REVIEW BODY"),
+        patch("hook._persist_run", side_effect=lambda v, f, d, disp, *a, **k: seen.__setitem__("d", disp)),
+        patch("hook.extract_warning_lines", return_value=[]),
+        patch("hook.info"),
+    ):
+        verdict = hook._run_multi_backend_pipeline("diff", "files", False)
+    assert verdict == "OK"
+    assert "PRIMARY REVIEWER FAILED" in seen["d"]
+    assert "REVIEW BODY" in seen["d"]
+
+
+def test_multi_backend_pipeline_no_banner_when_clean() -> None:
+    import hook
+
+    ok = MagicMock(status="ok", review_text="body")
+    seen: dict[str, str] = {}
+    with (
+        patch("orchestrator.run_multi_backend", return_value=[ok]),
+        patch("consolidation.consolidate", return_value=MagicMock(upheld_clusters=[])),
+        patch("hook._render_consolidation_display", return_value="REVIEW BODY"),
+        patch("hook._persist_run", side_effect=lambda v, f, d, disp, *a, **k: seen.__setitem__("d", disp)),
+        patch("hook.extract_warning_lines", return_value=[]),
+        patch("hook.info"),
+    ):
+        verdict = hook._run_multi_backend_pipeline("diff", "files", False)
+    assert verdict == "OK"
+    assert "PRIMARY REVIEWER FAILED" not in seen["d"]
+
+
+def test_multi_backend_pipeline_empty_surfaces_fallback() -> None:
+    import hook
+
+    hook.record_fallback("kimi", "claude/sonnet", "kimi exited rc=1")
+    bad = MagicMock(status="error", review_text="")
+    seen: dict[str, str] = {}
+    with (
+        patch("orchestrator.run_multi_backend", return_value=[bad]),
+        patch("consolidation.consolidate", return_value=MagicMock(upheld_clusters=[])),
+        patch("hook._persist_run", side_effect=lambda v, f, d, disp, *a, **k: seen.__setitem__("d", disp)),
+        patch("hook.error"),
+    ):
+        verdict = hook._run_multi_backend_pipeline("diff", "files", False)
+    assert verdict == "EMPTY"
+    assert "PRIMARY REVIEWER FAILED" in seen["d"]
+
+
+def test_chunked_path_prepends_banner_on_fallback() -> None:
+    import chunked
+    import hook
+
+    hook.record_fallback("kimi", "claude/sonnet", "kimi exited rc=1")
+    result = chunked.ChunkedResult(
+        status="ok",
+        validation=chunked.ValidationResult(),
+        job_results=[],
+        arbiter_raw="",
+        arbiter_status="ran",
+        arbiter_error=None,
+        clusters=[],
+        upheld_clusters=[],
+        blocking_text="",
+        findings_json_text="{}",
+        metrics={},
+        started_at=0.0,
+        ended_at=1.0,
+    )
+    seen: dict[str, str] = {}
+    with (
+        patch("chunked.run_chunked_review", return_value=result),
+        patch("chunked.write_artifacts"),
+        patch("hook.info"),
+        patch("hook.save_log", side_effect=lambda v, **k: seen.__setitem__("review", k.get("review", ""))),
+    ):
+        verdict = hook._run_chunked_path("diff", "files", False)
+    assert verdict == "OK"
+    assert "PRIMARY REVIEWER FAILED" in seen["review"]
+
+
+def test_parse_stream_json_skips_blank_and_malformed_lines() -> None:
+    stream = "\n".join(["", "not json at all", '{"role":"assistant","content":"the review"}', "   "])
+    assert KimiBackend._parse_stream_json(stream) == "the review"
+
+
+def test_kimi_backend_unlink_failure_is_swallowed() -> None:
+    """A failure to delete the temp prompt file must not break the run."""
+    real_unlink = os.unlink
+
+    def delete_then_raise(p: str) -> None:
+        real_unlink(p)
+        raise OSError("simulated cleanup failure")
+
+    _captured, ctx = _capture_kimi_invocation(stdout='{"role":"assistant","content":"ok"}')
+    with ctx, patch("backends.os.unlink", side_effect=delete_then_raise):
+        stdout, _stderr, rc = KimiBackend().run("sys", "user", "kimi-for-coding", 60)
+    assert (stdout, rc) == ("ok", 0)
+
+
+def test_multi_backend_pipeline_records_orchestrator_fallback() -> None:
+    """The orchestrator falls back via an appended FALLBACK result (not
+    run_with_fallback), so the production path must bridge that into the
+    accumulator itself — else the banner never fires on real commits."""
+    import hook
+
+    primary = MagicMock(status="error", review_text="", fallback_used=False, error="boom")
+    primary.cfg = MagicMock(backend="kimi", model="m")
+    fb = MagicMock(status="ok", review_text="body", fallback_used=True)
+    fb.cfg = MagicMock(backend="claude", model="sonnet")
+    seen: dict[str, str] = {}
+    with (
+        patch("orchestrator.run_multi_backend", return_value=[primary, fb]),
+        patch("consolidation.consolidate", return_value=MagicMock(upheld_clusters=[])),
+        patch("hook._render_consolidation_display", return_value="BODY"),
+        patch("hook._persist_run", side_effect=lambda v, f, d, disp, *a, **k: seen.__setitem__("d", disp)),
+        patch("hook.extract_warning_lines", return_value=[]),
+        patch("hook.info"),
+    ):
+        verdict = hook._run_multi_backend_pipeline("diff", "files", False)
+    assert verdict == "OK"
+    # banner present with NO pre-recorded event — it was bridged from the results
+    assert "PRIMARY REVIEWER FAILED" in seen["d"]
+
+
+def test_run_with_fallback_records_fallback_event() -> None:
+    """run_with_fallback must record the fallback so fallback_banner() surfaces it."""
+    import hook
+    from config import RunnerConfig
+
+    primary = RunnerConfig("kimi", "m")
+    fallback = RunnerConfig("claude", "sonnet")
+
+    def fake_run_reviewer(cfg: RunnerConfig, _s: str, _u: str) -> tuple[str, str, int]:
+        return ("", "boom", 1) if cfg is primary else ("review body", "", 0)
+
+    with patch("hook.run_reviewer", side_effect=fake_run_reviewer), patch("hook.warn"):
+        _review, _stderr, rc, used = hook.run_with_fallback(primary, fallback, "sys", "user")
+    assert (used, rc) == ("claude", 0)
+    assert any("kimi → claude" in e for e in hook._FALLBACK_EVENTS)
+
+
+def test_run_review_surfaces_banner_on_legacy_path() -> None:
+    """Legacy run_review surfaces a recorded fallback on its returned display too."""
+    import hook
+
+    hook.record_fallback("kimi", "claude/sonnet", "kimi exited rc=1")
+    with (
+        patch("hook.applicable_lenses", return_value=["bugs"]),
+        patch("hook.count_added_production_lines", return_value=1),
+        patch("hook._run_single_call", return_value=("REVIEW", "OK")),
+        patch("hook.info"),
+    ):
+        display, verdict = hook.run_review("diff", "files", False)
+    assert verdict == "OK"
+    assert display is not None
+    assert "PRIMARY REVIEWER FAILED" in display
+
+
+def test_kimi_backend_empty_stdout_returns_empty_review() -> None:
+    """An empty stdout from kimi yields an empty review, not a parse crash."""
+    _captured, ctx = _capture_kimi_invocation(stdout="")
+    with ctx:
+        review, _stderr, rc = KimiBackend().run("sys", "user", "kimi-for-coding", 60)
+    assert (review, rc) == ("", 0)
+
+
+def test_parse_stream_json_ignores_non_string_content() -> None:
+    """Non-string assistant `content` (null, list) is skipped, not concatenated."""
+    stream = "\n".join(
+        [
+            '{"role":"assistant","content":null}',
+            '{"role":"assistant","content":["a","b"]}',
+            '{"role":"assistant","content":"real review"}',
+        ]
+    )
+    assert KimiBackend._parse_stream_json(stream) == "real review"
 
 
 def test_default_primaries_pin_kimi_only() -> None:
@@ -604,7 +834,12 @@ def test_default_primaries_pin_kimi_only() -> None:
     reviewer; requires `kimi login`). The arbiter and total-failure fallback
     remain claude/sonnet."""
     assert len(PRIMARIES) == 1
-    assert (PRIMARIES[0].backend, PRIMARIES[0].model) == ("kimi", "kimi-code/kimi-for-coding")
+    assert PRIMARIES[0].backend == "kimi"
+    # Model is the revspeed-resolved kimi channel — standard by default,
+    # highspeed when toggled (config.kimi_review_model / test_config_kimi_speed).
+    from config import _KIMI_HIGHSPEED, _KIMI_STANDARD
+
+    assert PRIMARIES[0].model in (_KIMI_STANDARD, _KIMI_HIGHSPEED)
 
 
 def test_config_defaults_pinned() -> None:

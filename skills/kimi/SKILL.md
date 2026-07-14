@@ -1,6 +1,6 @@
 ---
 name: kimi
-description: Delegate work to the Kimi CLI agent (Moonshot AI's `kimi`, 256k context, runs locally with PreToolUse safety hooks and rule injection). Use this skill whenever the user says "use kimi", "delegate to kimi", "let kimi do it", "ask kimi to ...", "send to kimi", or hands off any of these jobs: implementation/refactor of a well-scoped change; read-only security/perf/anti-pattern/dead-code audit; research and explanation of how some part of the codebase works (with `path:line` citations); peer review / second opinion on a ready diff; deterministic transform tasks (translate comments, generate docs from code, reverse-spec, generate tests). Also use proactively whenever the user wants to "explore", "audit", "review", "describe", "map", or "summarize" a sizeable codebase region — kimi's 256k window can chew through 30+ files without polluting your own context. Supports parallel fan-out for independent multi-angle work. Runs `kimi --quiet --prompt` in the background with rule injection from `~/.kimi/lib/build_context.py` so kimi follows the same `CLAUDE.md` and `.claude/rules/*` you do; waits for the `=== KIMI_DONE` marker; returns kimi's output verbatim.
+description: Delegate work to the Kimi CLI agent (Moonshot AI's `kimi`, 256k context, runs locally with PreToolUse safety hooks and rule injection). Use this skill whenever the user says "use kimi", "delegate to kimi", "let kimi do it", "ask kimi to ...", "send to kimi", or hands off any of these jobs: implementation/refactor of a well-scoped change; read-only security/perf/anti-pattern/dead-code audit; research and explanation of how some part of the codebase works (with `path:line` citations); peer review / second opinion on a ready diff; deterministic transform tasks (translate comments, generate docs from code, reverse-spec, generate tests). Also use proactively whenever the user wants to "explore", "audit", "review", "describe", "map", or "summarize" a sizeable codebase region — kimi's 256k window can chew through 30+ files without polluting your own context. Supports parallel fan-out for independent multi-angle work. Runs `kimi -p` (kimi-code ≥0.19) in the background with rule injection from `~/.kimi/lib/build_context.py` so kimi follows the same `CLAUDE.md` and `.claude/rules/*` you do; waits for the `=== KIMI_DONE` marker; returns kimi's output verbatim.
 ---
 
 # kimi — delegate to Kimi CLI
@@ -8,7 +8,7 @@ description: Delegate work to the Kimi CLI agent (Moonshot AI's `kimi`, 256k con
 You are a dispatcher: gather inputs, fire `kimi` in the background with rule injection, return its output verbatim.
 
 <critical>
-- Use the spawn block in §Procedure unchanged. Substitute only `<PURPOSE>` and `<TASK_BODY>`.
+- Use the spawn block in §Procedure unchanged. Substitute only `<PURPOSE>`, `<TASK_BODY>`, and `<MODEL_FLAG>` (see §Model speed).
 - Pre-investigation is kimi's job. `Glob` to verify a path exists is fine; `Read`/`Grep`/`Bash(cat/ls/find)` of task content is not.
 - Pass kimi's stdout verbatim to the user. No summary, no rewording — the output IS the deliverable.
 </critical>
@@ -33,8 +33,18 @@ No:
 - **Intent** — one sentence: what's true after
 - **Genre** — pick one template below (write / audit / research / peer-review / transform)
 - **Constraints** — version, channel, format, anything non-obvious
+- **Model speed** — default standard; use highspeed only on explicit request (see §Model speed)
 
 If paths are missing for a concrete task, ask once, then proceed.
+
+## Model speed
+
+Kimi exposes two channels of the same coding model. Pass the channel explicitly via `<MODEL_FLAG>` so the choice is deterministic (the CLI's own `default_model` can drift).
+
+- **Standard (default):** `<MODEL_FLAG>` = `-m kimi-code/kimi-for-coding`
+- **Highspeed (explicit request only):** `<MODEL_FLAG>` = `-m kimi-code/kimi-for-coding-highspeed`
+
+Switch to highspeed when the user asks for it — "fast", "highspeed", "быстро", "быстрая модель". Highspeed trades quota for lower latency, so keep it opt-in per request; otherwise stay on standard.
 
 ## Procedure
 
@@ -56,7 +66,7 @@ PARENT_TASK_EOF
 cd "$PROJECT_ROOT"
 FULL=$(cat "$CTX" "$TASK")
 echo "=== KIMI_START $(date -Iseconds) project=$PROJECT_ROOT log=$LOG purpose=<PURPOSE> ==="
-kimi --quiet --prompt "$FULL" > "$LOG" 2>&1
+kimi <MODEL_FLAG> -p "$FULL" > "$LOG" 2>&1
 RC=$?
 rm -f "$CTX" "$TASK"
 echo "=== KIMI_DONE rc=$RC log=$LOG ==="
@@ -64,15 +74,17 @@ echo "=== KIMI_DONE rc=$RC log=$LOG ==="
 
 `<PURPOSE>` is a semantic label, not a timestamp: `audit-security`, `review-pr-42`, `transform-i18n-ru`. An hour later, `kimi-audit-security-1234.log` is readable; `kimi-1777652445-1926442.log` is not.
 
+Invocation is `kimi <MODEL_FLAG> -p "$FULL"` (kimi-code ≥0.19), where `<MODEL_FLAG>` always carries an explicit `-m` (see §Model speed). The one-shot `-p` flag runs read tools (Read/Grep/Glob) non-interactively without a TTY and prints the response. Do NOT add `--quiet` (removed) or `-y`/`--yolo`/`--auto` — `-p` rejects combining with them ("Cannot combine --prompt with --yolo"). A first-run `auth.login_required: OAuth provider "managed:kimi-code"` error means kimi is not authenticated — the user must run `kimi login` once (interactive device-code flow); you cannot do it for them.
+
 **Step 2 — notify and wait.** Tell the user `Kimi running in background (purpose: <X>, log: <LOG>).` Poll the background shell's stdout until `=== KIMI_DONE rc=<N>` appears. Typical 30–90 s; heavy audits 3–5 min. If the user asks "what's it doing?" mid-flight, run `tail -30 "$LOG"`.
 
-**Step 3 — present** based on `rc` and stdout shape:
-- `rc=0` + healthy (≥100 bytes, no refusal in line 1) → paste stdout verbatim
-- `rc=0` + suspicious (<100 bytes OR starts with `I cannot` / `I'm sorry, but` / `Unable to` / `Error:` / `refused`) → mark `KIMI_SUSPICIOUS`, show full stdout, offer one of: retry with sharper prompt / switch template / handle manually
-- `rc≠0` → present as `KIMI_FAILED (exit <rc>):` + log content. `429` = rate limit (wait for next quota period; don't retry). `139` = SIGSEGV (point user at `~/.kimi/logs/kimi.log`).
+**Step 3 — present** based on `rc` and stdout shape. Note: kimi-code wraps the answer with `•` reasoning lines and a trailing `To resume this session: kimi -r <id>` footer — strip that footer (and leading `•` scratch lines) when presenting verbatim; the answer body is the deliverable.
+- `rc=0` + healthy (≥100 bytes, no refusal in line 1) → paste the answer body verbatim
+- `rc=0` + suspicious (<100 bytes OR starts with `I cannot` / `I'm sorry, but` / `Unable to` / `Error:` / `refused` / `auth.login_required` / `error: unknown option`) → mark `KIMI_SUSPICIOUS`, show full stdout. `auth.login_required` → ask the user to run `kimi login` (one-time, interactive). `error: unknown option` → CLI flags drifted; re-check `kimi --help`.
+- `rc≠0` → present as `KIMI_FAILED (exit <rc>):` + log content. `429` = rate limit (wait for next quota period; don't retry). `139` = SIGSEGV (point user at `~/.kimi-code/logs/kimi-code.log`).
 - output >30 KB → first 2000 chars + "full output at `<LOG>`"
 
-For the write genre, you may then read the modified files to confirm the diff matches intent. Kimi runs under `--yolo`; PreToolUse hooks at `~/.kimi/hooks/` blocked the obvious garbage during the run, but logical correctness is yours to verify.
+For the write genre, you may then read the modified files to confirm the diff matches intent. In `-p` mode kimi runs tools without per-action prompts; whatever PreToolUse guards are configured under `~/.kimi-code/` apply, but logical correctness is yours to verify.
 
 </procedure>
 
@@ -201,6 +213,6 @@ When the task splits into independent angles — security + perf + anti-patterns
 ## Reminders
 
 - Output is the deliverable — pass it verbatim. The one exception: synthesis on top of fan-out, with verbatim quotes under each purpose.
-- Always background. Always run `build_context.py` first. Always `kimi --quiet --prompt` (never bare `kimi -p` — that hangs waiting for a TTY).
+- Always background. Always run `build_context.py` first. Invoke with `kimi <MODEL_FLAG> -p "$FULL"` (kimi-code ≥0.19) — `<MODEL_FLAG>` always carries an explicit `-m` (§Model speed, default standard); never `--quiet` (removed) and never combine `-p` with `-y`/`--auto` (rejected).
 - `<PURPOSE>` = semantic label (`audit-security`), never a timestamp.
 - Failure precedent: a previous subagent-based wrapper in this repo made 15 tool calls "exploring" the project and never invoked kimi at all. The procedure above prevents that — follow it as written.

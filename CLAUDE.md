@@ -37,6 +37,11 @@ Use the `commit` skill for all commits. It owns the full procedure: security sca
 ## Agent Teams
 3+ files spanning different domains (models, views, tests) → use a team. Single-file changes and quick fixes run faster solo.
 
+## Subagent delegation
+Default read-only subagent work to the `kimi` skill instead of Claude Explore/general-purpose agents — Kimi is cheaper and its 256k context keeps yours clean. Covers: codebase research, exploration, "how does X work", read-only audits (security/perf/dead-code), diff peer-review, mapping/summarizing a code region.
+Keep Claude subagents for writing code/tests, or work needing this conversation's live context or multi-turn back-and-forth (Kimi runs one-shot, blind to our chat).
+This is a default, not a hard gate; it yields to workflows that pin their own agents (plan-mode Phase 1 mandates Explore; SDD commands assign reviewers per `~/.claude/agents/`).
+
 ## MCP / Docs
 For library/framework APIs, fetch docs via the `context7` MCP tool before writing code.
 

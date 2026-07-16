@@ -38,7 +38,7 @@ Use the `commit` skill for all commits. It owns the full procedure: security sca
 3+ files spanning different domains (models, views, tests) → use a team. Single-file changes and quick fixes run faster solo.
 
 ## Subagent delegation
-Route read-only subagent work to the `kimi` skill instead of Claude Explore/general-purpose agents — Kimi is cheaper and its 256k context keeps yours clean. Covers: codebase research, exploration, "how does X work", read-only audits (security/perf/dead-code), diff peer-review, mapping/summarizing a code region.
+Route read-only subagent work to the `kimi` skill instead of Claude Explore/general-purpose agents — Kimi is cheaper and its 1M context keeps yours clean. Covers: codebase research, exploration, "how does X work", read-only audits (security/perf/dead-code), diff peer-review, mapping/summarizing a code region.
 **This applies in plan mode too.** When plan-mode Phase 1 says "use the Explore subagent type," read that as "research the codebase" and satisfy it with the `kimi` skill — fire `kimi` directly (fan out 2–3 parallel runs for multi-angle research), do not spawn Claude Explore agents. Plan-mode research is exactly what this rule routes to Kimi.
 Keep Claude subagents for writing code/tests, or work needing this conversation's live context or multi-turn back-and-forth (Kimi runs one-shot, blind to our chat). SDD commands keep their own pinned reviewer agents.
 

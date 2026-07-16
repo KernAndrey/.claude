@@ -80,9 +80,8 @@ user-level), with a `> NOTE:` line documenting what was truncated.
   `<file>:<func>`" or "delegate to kimi" or "ask kimi to summarize what
   `tms_core/invoicing/` does". Claude auto-loads the skill via description match.
 - **Explicit** — `/kimi <task; include explicit file paths>`.
-- **Model speed** — standard channel by default; say "fast"/"highspeed" to run on
-  `kimi-code/kimi-for-coding-highspeed` (trades quota for latency). See §Model
-  speed in `skills/kimi/SKILL.md`.
+- **Model** — every run is pinned to Kimi K3 (`-m kimi-code/k3`, 1M context). See
+  §Model in `skills/kimi/SKILL.md` for the quota escape hatch.
 - **Background by default** — Claude fires kimi via `run_in_background: true`,
   tells you the log path, then waits for the `=== KIMI_DONE rc=<N>` marker before
   presenting the result.
@@ -155,15 +154,33 @@ Live end-to-end hook check (costs a few cents — makes one kimi call): ask kimi
 
 ## Open caveats
 
-- **Durability — the live hook config is untracked.** The corrected matchers and
-  the `review_readonly` registration live in `~/.kimi-code/config.toml`, which
-  `kimi migrate` generates. A future kimi-code upgrade / re-migrate can regenerate
-  it and **silently drop all of it**, restoring the dead-hooks state (matchers
-  under old tool names → no safety hooks, no reviewer containment). There is no
-  tracked installer to protect it. **After any kimi-code upgrade, re-run smoke
-  steps 2 + 5 + 6 above** to confirm the hooks are still live. If they fail,
-  re-apply: matchers `Bash` / `Write|Edit` / `Write|Edit|Bash|FetchURL|WebSearch`,
-  scripts under `~/.kimi/hooks/`.
+- **Durability — the live config is untracked.** The corrected matchers, the
+  `review_readonly` registration, and the **`kimi-code/k3` model registration**
+  all live in `~/.kimi-code/config.toml`, which `kimi migrate` generates. A future
+  kimi-code upgrade / re-migrate can regenerate it and **silently drop all of it**,
+  restoring the dead-hooks state (matchers under old tool names → no safety hooks,
+  no reviewer containment) and unregistering k3 (every kimi call in `~/.claude`
+  pins `-m kimi-code/k3` and would fail with `config.invalid: Model
+  "kimi-code/k3" is not configured`). There is no tracked installer to protect it.
+  **After any kimi-code upgrade, re-run smoke steps 2 + 5 + 6 above** to confirm
+  the hooks are still live. If they fail, re-apply: matchers `Bash` /
+  `Write|Edit` / `Write|Edit|Bash|FetchURL|WebSearch`, scripts under
+  `~/.kimi/hooks/`, plus the model block:
+
+  ```toml
+  default_model = "kimi-code/k3"
+
+  [models."kimi-code/k3"]
+  provider = "managed:kimi-code"
+  model = "k3"
+  max_context_size = 1048576   # Allegretto+; Moderato caps at 262144
+  capabilities = [ "thinking", "always_thinking", "image_in", "video_in", "tool_use" ]
+  display_name = "Kimi K3"
+  ```
+
+  Leave `reasoning_effort` unset: unset maps to `max`, while any value outside
+  `{max, high, low, none}` is a hard HTTP 400. Verify with
+  `kimi -m kimi-code/k3 -p "Reply with exactly: OK"`.
 - **Hooks are user-global.** `safety_shell` + `protect_secrets` fire for every
   kimi session on this host. Project-local hooks aren't supported yet.
 - **`-p` runs under the `auto` permission policy** — it auto-approves tool calls;

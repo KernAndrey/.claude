@@ -48,7 +48,7 @@ PARENT_TASK_EOF
 cd "$PROJECT_ROOT"
 FULL=$(cat "$CTX" "$TASK")
 echo "=== KIMI_START $(date -Iseconds) project=$PROJECT_ROOT log=$LOG purpose=impl-{ID}-{purpose} ==="
-kimi --quiet --prompt "$FULL" > "$LOG" 2>&1
+kimi -m kimi-code/k3 -p "$FULL" > "$LOG" 2>&1
 RC=$?
 rm -f "$CTX" "$TASK"
 echo "=== KIMI_DONE rc=$RC log=$LOG ==="

@@ -541,11 +541,11 @@ def _capture_kimi_invocation(
 def test_kimi_backend_builds_kimi_code_command() -> None:
     captured, ctx = _capture_kimi_invocation(stdout='{"role":"assistant","content":"body"}')
     with ctx:
-        stdout, stderr, rc = KimiBackend().run("sys", "user", "kimi-for-coding", 600)
+        stdout, stderr, rc = KimiBackend().run("sys", "user", "kimi-code/k3", 600)
 
     cmd = captured["cmd"]
     assert cmd[0] == "kimi"
-    assert cmd[cmd.index("--model") + 1] == "kimi-for-coding"
+    assert cmd[cmd.index("--model") + 1] == "kimi-code/k3"
     # stream-json (not text): clean line-delimited JSON we parse deterministically.
     assert cmd[cmd.index("--output-format") + 1] == "stream-json"
     assert "-p" in cmd
@@ -583,7 +583,7 @@ def test_kimi_backend_empty_system_prompt_stages_user_only() -> None:
     / leading-separator artefact) — mirrors OpencodeBackend's branch."""
     captured, ctx = _capture_kimi_invocation(stdout='{"role":"assistant","content":"ok"}')
     with ctx:
-        KimiBackend().run("", "user", "kimi-for-coding", 60)
+        KimiBackend().run("", "user", "kimi-code/k3", 60)
 
     assert captured["prompt"] == "user"
 
@@ -591,7 +591,7 @@ def test_kimi_backend_empty_system_prompt_stages_user_only() -> None:
 def test_kimi_backend_forwards_timeout() -> None:
     captured, ctx = _capture_kimi_invocation(stdout='{"role":"assistant","content":"ok"}')
     with ctx:
-        KimiBackend().run("sys", "user", "kimi-for-coding", 333)
+        KimiBackend().run("sys", "user", "kimi-code/k3", 333)
 
     assert captured["kwargs"]["timeout"] == 333
 
@@ -740,7 +740,7 @@ def test_kimi_backend_unlink_failure_is_swallowed() -> None:
 
     _captured, ctx = _capture_kimi_invocation(stdout='{"role":"assistant","content":"ok"}')
     with ctx, patch("backends.os.unlink", side_effect=delete_then_raise):
-        stdout, _stderr, rc = KimiBackend().run("sys", "user", "kimi-for-coding", 60)
+        stdout, _stderr, rc = KimiBackend().run("sys", "user", "kimi-code/k3", 60)
     assert (stdout, rc) == ("ok", 0)
 
 
@@ -807,7 +807,7 @@ def test_kimi_backend_empty_stdout_returns_empty_review() -> None:
     """An empty stdout from kimi yields an empty review, not a parse crash."""
     _captured, ctx = _capture_kimi_invocation(stdout="")
     with ctx:
-        review, _stderr, rc = KimiBackend().run("sys", "user", "kimi-for-coding", 60)
+        review, _stderr, rc = KimiBackend().run("sys", "user", "kimi-code/k3", 60)
     assert (review, rc) == ("", 0)
 
 
@@ -830,16 +830,15 @@ def test_default_primaries_pin_kimi_only() -> None:
     pre-commit behavior without any failing test. Pin the default so
     drift is caught at test time, not at commit time.
 
-    Current default: kimi only (the owner uses Kimi K2 as the sole primary
+    Current default: kimi only (the owner uses Kimi K3 as the sole primary
     reviewer; requires `kimi login`). The arbiter and total-failure fallback
     remain claude/sonnet."""
     assert len(PRIMARIES) == 1
     assert PRIMARIES[0].backend == "kimi"
-    # Model is the revspeed-resolved kimi channel — standard by default,
-    # highspeed when toggled (config.kimi_review_model / test_config_kimi_speed).
-    from config import _KIMI_HIGHSPEED, _KIMI_STANDARD
-
-    assert PRIMARIES[0].model in (_KIMI_STANDARD, _KIMI_HIGHSPEED)
+    # Pin the literal, not `_KIMI_MODEL` — asserting the constant against
+    # itself passes for any value and would not catch a repin. The alias must
+    # also stay in sync with a [models."…"] key in ~/.kimi-code/config.toml.
+    assert PRIMARIES[0].model == "kimi-code/k3"
 
 
 def test_config_defaults_pinned() -> None:

@@ -166,7 +166,7 @@ Add a new lens by:
    `LENS_APPLICABILITY` in `hook.py`. `LENS_NAMES` is derived from
    the dict, so order is the dict's insertion order.
 
-## Kimi K2 (current primary reviewer)
+## Kimi K3 (current primary reviewer)
 
 `KimiBackend` is the sole primary reviewer in `config.py` (both
 `PRIMARIES` and `CHUNKED_BACKENDS`). The arbiter and the total-failure

@@ -193,7 +193,7 @@ Live end-to-end hook check (costs a few cents — makes one kimi call): ask kimi
   ```bash
   ~/.kimi/lib/build_context.py "$(pwd)" > /tmp/ctx.md
   echo "your task..." > /tmp/task.md
-  kimi -p "$(cat /tmp/ctx.md /tmp/task.md)"
+  kimi -m kimi-code/k3 -p "$(cat /tmp/ctx.md /tmp/task.md)"
   ```
 - **Context blob capped at 80 KB.** Lowest-priority sections truncated with a
   `> NOTE:` annotation if `~/.claude/CLAUDE.md` + project rules exceed it.

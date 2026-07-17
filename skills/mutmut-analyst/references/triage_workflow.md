@@ -6,13 +6,13 @@ This is the step-by-step process for handling survived mutants when there are ma
 
 The single most important rule: **never start with individual mutants**. Always start with distribution.
 
-```bash
-mutmut results > /tmp/mutmut_results.txt
-mutmut show all > /tmp/mutmut_show_all.txt
+`parse_results.py` reads `mutants/` straight off disk — it needs no `mutmut
+results` / `mutmut show all` capture at all (and `mutmut show all` no longer
+exists in 3.5; only `mutmut show <id>` does).
 
+```bash
 python ~/.claude/skills/mutmut-analyst/scripts/parse_results.py \
-  --results-output /tmp/mutmut_results.txt \
-  --show-output /tmp/mutmut_show_all.txt \
+  --mutants-dir mutants \
   --out /tmp/mutmut_parsed.json
 
 python ~/.claude/skills/mutmut-analyst/scripts/triage_classifier.py \
@@ -42,24 +42,21 @@ paths_to_mutate = ["src/"]  # narrow the scope
 
 Re-run mutmut. The survived count typically drops 20-50% just from this.
 
-### Action 0.2: skip noise operators via pre_mutation hook
+### Action 0.2: silence noise on logging / message lines
 
-If many SBR survived mutants are on logging / telemetry / metric calls:
+⚠️ **There is no `pre_mutation` hook and no `mutmut_config.py` in mutmut 3** — both were removed, and `context.skip` does not exist. Any recipe that "skips operators per line" via a hook is v1/v2 advice that will silently do nothing.
 
-```python
-# mutmut_config.py
-def pre_mutation(context):
-    line = context.current_source_line.strip()
-    skip_prefixes = (
-        "logger.", "logging.", "log.",
-        "metrics.", "tracer.", "stats.",
-        "print(", "sys.stderr",
-    )
-    if line.startswith(skip_prefixes):
-        context.skip = True
-```
+What mutmut 3 actually gives you:
 
-This is preferable to per-line pragmas — cleaner and applies project-wide.
+1. **`do_not_mutate`** — fnmatch patterns, matched against the *file path* (not line contents):
+   ```toml
+   [tool.mutmut]
+   do_not_mutate = ["*/migrations/*", "*/__manifest__.py"]
+   ```
+2. **`# pragma: no mutate`** — the only per-line control.
+3. **Nothing else.** You cannot exclude an operator, and you cannot skip by line prefix.
+
+So for the classic noise cluster — string/`arg_to_None` mutations on `logger.info(...)` and `raise SomeError(_("..."))` — the answer is **not** to suppress it. Those mutants are cheap and mostly get killed or are obvious in triage. Just **report them as their own bucket and exclude them from the verdict**. Reach for pragmas only when a specific line generates recurring noise you keep re-triaging.
 
 ### Action 0.3: enable mypy/pyrefly filter
 
@@ -93,7 +90,7 @@ Now sort remaining survived mutants by operator priority (see `operator_catalog.
 
 1. **HIGH signal first** — ROR, AOR, LCR, CRC boolean/None.
 2. **MEDIUM signal next** — numeric boundary, defensive checks.
-3. **LOW signal last** — string mutations, edge SBR.
+3. **LOW signal last** — string/message mutations, `arg_to_None` on logging and error text.
 
 For each HIGH-signal mutant:
 1. Read the diff: `mutmut show <id>`.

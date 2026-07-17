@@ -166,7 +166,7 @@ Add a new lens by:
    `LENS_APPLICABILITY` in `hook.py`. `LENS_NAMES` is derived from
    the dict, so order is the dict's insertion order.
 
-## Kimi K2 (current primary reviewer)
+## Kimi K3 (current primary reviewer)
 
 `KimiBackend` is the sole primary reviewer in `config.py` (both
 `PRIMARIES` and `CHUNKED_BACKENDS`). The arbiter and the total-failure
@@ -176,35 +176,35 @@ fallback stay on `claude`/`sonnet`. Requirements to keep it working:
 2. `kimi login` once for OAuth (no API-key env var is documented).
 3. Active Kimi membership subscription is required — Kimi Code is paywalled.
 
-The configured model alias is `kimi-code/kimi-for-coding`, which must
-match a `[models."…"]` key in `~/.kimi/config.toml`. If kimi is ever
+The configured model alias is `kimi-code/k3` (Kimi K3, 1M context), which
+must match a `[models."…"]` key in `~/.kimi-code/config.toml` — the live
+config. (`~/.kimi/config.toml` is versioned but inert; kimi-code no longer
+reads it, so edits there have no effect.) An unregistered alias fails fast
+with `config.invalid: Model "…" is not configured`. If kimi is ever
 unreachable on a commit, the orchestrator fails open to the
 `claude`/`sonnet` fallback, so a broken kimi never blocks a commit on
 its own.
 
-The backend invokes `kimi --quiet --model <m> --agent-file <path>
---input-format text` and pipes the combined system+user prompt on
-**stdin** (`--input-format text` makes kimi read the prompt from stdin
-under `--print`). Stdin rather than a `--prompt` argv argument because
-chunked-path prompts exceed Linux `MAX_ARG_STRLEN` (~128KB per single
-arg) and `--prompt <huge>` fails instantly with `[Errno 7] Argument list
-too long` — the same reason `OpencodeBackend`/`ClaudeBackend` pipe via
-stdin. `--quiet` expands to `--print --output-format text
---final-message-only`; `--print` implicitly enables `--yolo`
-(auto-approve all tool calls), so the project-shipped agent file at
-`review/agents/kimi-pre-commit-reviewer.yaml` is the only thing keeping
-the reviewer from writing to the working tree during diff investigation.
-The YAML narrows the parent's `tools:` allowlist to the read-only set
-(`ReadFile`, `Glob`, `Grep`) and locks the dispatch sub-agents down the
-same way, so `Shell`, `WriteFile`, `StrReplaceFile`, `SearchWeb`,
-`FetchURL` stay unreachable (kimi 1.40 ignores top-level `exclude_tools`,
-so the allowlist is the real guard).
+The backend invokes `kimi -p <instruction> --model <m> --output-format
+stream-json`. kimi-code (0.24.1) dropped `--quiet` / `--agent-file` /
+`--input-format` and the stdin prompt channel, so the full system+user
+prompt is staged in a temp file and kimi gets a short instruction to `Read`
+it — review prompts (cached block + manifest + full diff) routinely exceed
+Linux `MAX_ARG_STRLEN` (~128KB per single arg), which would fail instantly
+with `[Errno 7] Argument list too long` if passed as one argv value.
+`stream-json` is line-delimited JSON parsed by `_parse_stream_json`; the
+`text` format interleaves `•` reasoning lines and a resume footer with the
+answer.
 
-If the kimi CLI rejects the YAML on first run (the schema is only partially
-documented — `exclude_tools` may need to land on a sub-agent rather than the
-top-level agent), tighten the YAML against the actual stderr. The
-orchestrator will fail-soft to `FALLBACK` while you iterate, so a broken
-kimi never blocks a commit on its own.
+Read-only containment comes from `KIMI_REVIEW_READONLY=1`, which
+`KimiBackend` sets for that run only. It arms the PreToolUse deny hook at
+`~/.kimi/hooks/review_readonly.py` (registered in `~/.kimi-code/config.toml`),
+denying `Write`/`Edit`/`Bash`/`FetchURL`/`WebSearch` and leaving the reviewer
+only `Read`/`Grep`/`Glob`/`ReadMediaFile`. This replaces the old
+`--agent-file` tool allowlist, since `-p` auto-approves tool calls. It pairs
+with the write-tree/read-tree index backstop in `~/.claude/git-hooks/pre-commit`.
+The YAML files under `review/agents/` are leftovers from the kimi-cli era and
+are no longer read.
 
 ## Skipping the gate
 

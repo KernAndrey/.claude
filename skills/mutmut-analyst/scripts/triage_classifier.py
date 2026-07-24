@@ -27,14 +27,13 @@ import re
 import sys
 from pathlib import Path
 
+from parse_results import HIGH_SIGNAL_OPERATORS, NOISE_OPERATORS
+
 
 # --- Heuristic rules -------------------------------------------------------
 
-NOISE_OPERATORS = {
-    # Almost always equivalent or insignificant
-    "string_literal": "string mutations rarely indicate test gaps unless string is part of business logic",
-    "loop_break_to_continue": "performance optimization mutation, behaviour usually identical",
-}
+# Imported, never re-declared: parse_results.infer_operator emits these labels
+# and therefore owns the taxonomy. A local copy silently no-ops every rule below.
 
 EQUIVALENT_BOUNDARY_PAIRS = [
     # (operator_label, reason)
@@ -63,30 +62,11 @@ NOISE_LINE_PATTERNS = [
     (r'^\s*[+-]\s*"""', "docstring mutation"),
 ]
 
-HIGH_SIGNAL_OPERATORS = {
-    "ROR_gt_to_ge",
-    "ROR_ge_to_gt",
-    "ROR_lt_to_le",
-    "ROR_le_to_lt",
-    "ROR_eq_to_ne",
-    "ROR_ne_to_eq",
-    "AOR_plus_to_minus",
-    "AOR_minus_to_plus",
-    "AOR_mul_to_div",
-    "AOR_div_to_mul",
-    "LCR_and_to_or",
-    "LCR_or_to_and",
-    "LCR_not_removal",
-    "CRC_boolean_swap",
-    "CRC_None",
-}
-
 
 def classify(mutant: dict) -> dict:
     """Classify a single mutant. Returns dict with category, confidence, reason."""
     operator = mutant.get("operator") or "unknown"
     file_path = mutant.get("file", "")
-    raw_diff = mutant.get("raw_diff", "")
     diff_lines = mutant.get("diff_lines", [])
 
     # Layer 1: noise file patterns (strongest signal)
@@ -116,7 +96,9 @@ def classify(mutant: dict) -> dict:
             "category": "known_noise",
             "confidence": "medium",
             "reason": NOISE_OPERATORS[operator],
-            "action": "review and pragma if equivalent, or add to exclude_operators",
+            # mutmut 3 has no operator-level exclusion (`exclude_operators` is
+            # silently ignored). The only real levers are pragma and do_not_mutate.
+            "action": "review; if noise, `# pragma: no mutate` the line or add its path to `do_not_mutate`",
         }
 
     # Layer 4: candidate equivalent mutants — high signal operator that often has equivalence
@@ -156,7 +138,7 @@ def classify(mutant: dict) -> dict:
     }
 
 
-def main() -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "input",
@@ -175,7 +157,11 @@ def main() -> int:
         action="store_true",
         help="Print only the summary breakdown, not per-mutant classification",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = _build_arg_parser().parse_args()
 
     if args.input == "-":
         data = json.load(sys.stdin)
@@ -205,9 +191,7 @@ def main() -> int:
             "equivalent_candidate": counts["equivalent_candidate"],
             "known_noise": counts["known_noise"],
         },
-        "actions_by_frequency": dict(
-            sorted(by_action.items(), key=lambda kv: kv[1], reverse=True)
-        ),
+        "actions_by_frequency": dict(sorted(by_action.items(), key=lambda kv: kv[1], reverse=True)),
         "classified_mutants": [] if args.summary_only else classified,
     }
 
@@ -225,18 +209,16 @@ def main() -> int:
         file=sys.stderr,
     )
     print(
-        f"  real_test_gap:        {counts['real_test_gap']:4d} "
-        f"({counts['real_test_gap']*100//total}%)",
+        f"  real_test_gap:        {counts['real_test_gap']:4d} ({counts['real_test_gap'] * 100 // total}%)",
         file=sys.stderr,
     )
     print(
         f"  equivalent_candidate: {counts['equivalent_candidate']:4d} "
-        f"({counts['equivalent_candidate']*100//total}%)",
+        f"({counts['equivalent_candidate'] * 100 // total}%)",
         file=sys.stderr,
     )
     print(
-        f"  known_noise:          {counts['known_noise']:4d} "
-        f"({counts['known_noise']*100//total}%)",
+        f"  known_noise:          {counts['known_noise']:4d} ({counts['known_noise'] * 100 // total}%)",
         file=sys.stderr,
     )
 

@@ -217,16 +217,29 @@ If MAX_RETRIES mutates to 4, `call_count` becomes 4, test fails.
 
 If the constant is genuinely arbitrary (a sentinel ID, a version number, an indent width), pragma it — see `false_positive_patterns.md`.
 
-## Recipe: SBR (statement removal)
+## Recipe: arg_to_None / arg_dropped (`operator_arg_removal`)
 
-**Mutation pattern:** entire statement removed.
+⚠️ **mutmut 3.5 has no statement-removal operator** — it never deletes a line. If you are looking for "SBR", the closest real operator is `operator_arg_removal`, which either replaces one call argument with `None` or (when the call has >1 arg) drops it:
 
-This is the trickiest because mutmut removes the whole line. The killing test must observe the side effect of that statement.
+```python
+audit_log.record(account, amount)
+# mutants: record(None, amount) / record(account, None) / record(amount) / record(account)
+```
 
+**Whether it's a real gap depends on the call, not the operator:**
+
+*Noise* — the call is a message or a log; nulling an argument changes nothing observable:
+```python
+raise UserError(_("Cannot move a deduction."))   # -> UserError(None)
+_logger.info("Processing %s", record.name)       # -> _logger.info(None, record.name)
+```
+Tests assert the exception *type*, which is the right design. Leave them; don't assert exact wording.
+
+*Real gap* — the argument carries behaviour, and the mutant still passes:
 ```python
 def update_balance(account, amount):
     account.balance += amount
-    audit_log.record(account, amount)  # mutmut removes this line
+    audit_log.record(account, amount)   # -> record(account, None) survives
 ```
 
 **Insufficient test:**
@@ -236,17 +249,15 @@ def test_balance_updated():
     assert acc.balance == 100
 ```
 
-This passes both with and without the audit_log line — mutant survives.
-
-**Good test:**
+**Good test** — observe the side effect, with a value that distinguishes `None`:
 ```python
 def test_audit_logged_on_balance_change():
     update_balance(acc, 100)
     assert acc.balance == 100
-    assert audit_log.contains_entry(acc, 100)  # observes the side effect
+    assert audit_log.contains_entry(acc, 100)   # None-amount entry would fail
 ```
 
-If the side effect is genuinely unobservable (logging, telemetry that tests don't care about), pragma. Don't bend tests around unimportant side effects.
+If the side effect is genuinely unobservable (logging, telemetry tests don't care about), leave it. Don't bend tests around unimportant side effects.
 
 ## Recipe: string literal mutation
 
@@ -283,5 +294,5 @@ The mutation `ROLE_ADMIN = "XXadminXX"` makes `is_admin("admin")` return `False`
 | LCR not | Test both truthy and falsy with different expected results | Single-case test |
 | CRC boolean | Observe behaviour difference of flag | Testing function output without flag-specific assertions |
 | CRC numeric | Exact value matters in observable behaviour | "Returns a number" assertion |
-| SBR | Assert side effect of removed statement | Test only main return value |
+| arg_to_None / arg_dropped | Assert the side effect, with a value a `None` arg could not produce | Test only main return value |
 | String literal | Exact string used in data context | None — pragma if display-only |

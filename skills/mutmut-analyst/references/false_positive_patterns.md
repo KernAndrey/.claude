@@ -37,23 +37,30 @@ TAB_WIDTH = 4
 
 **Fix:** pragma the line.
 
-## Pattern 3: break ↔ continue in early-exit loops
+## Pattern 3: `break` → `return` in early-exit loops
+
+⚠️ mutmut 3.5 does **not** swap `break` ↔ `continue`. Its `_keyword_mapping` is
+`break → return`, `continue → break` (plus `is`↔`is not`, `in`↔`not in`). These are
+asymmetric and **usually NOT equivalent** — treat a survivor here as a real gap
+until proven otherwise, the opposite of the old break↔continue advice.
 
 ```python
 for item in items:
     if matches(item):
         result = item
-        break  # mutant: continue
+        break        # mutant: return  -> returns None, skipping the code below
 return result
 ```
 
-**Why it's often equivalent:** if `matches` is true once, both `break` and `continue` produce the correct result — `continue` just iterates needlessly through remaining items. Behaviour identical, performance worse.
+**Why `break` → `return` usually IS a real gap:** the mutated function returns early — normally `None` — skipping everything after the loop. If your tests still pass, they never assert the value the function returns on the match path. That is worth a test.
 
-**When it's NOT equivalent:**
-- If the loop has side effects in remaining iterations (e.g., counter, accumulation).
-- If subsequent iterations would also match and overwrite `result`.
+**Why `continue` → `break` usually IS a real gap:** it stops the loop at the first item that would have been skipped, so any later item is never processed. Tests pass only if no test has a skipped item followed by a meaningful one.
 
-**Fix:** pragma if you've verified equivalence:
+**When either IS equivalent (rare):**
+- `break` → `return` where the loop is the last statement and the function's return value is genuinely unused.
+- `continue` → `break` where the skip condition can only ever be true for a trailing run of items.
+
+**Fix:** write the test. Pragma only after verifying equivalence:
 ```python
 break  # pragma: no mutate
 ```
@@ -65,19 +72,45 @@ logger.info("Processing started")
 metrics.increment("processed_count")
 ```
 
-**Mutmut produces:** statement removal (SBR) or string mutation.
+**Mutmut produces:** string mutation of the message (`"XX...XX"`, case swap) and `operator_arg_removal` — each argument replaced by `None`, or dropped. It does **not** remove the statement: mutmut 3.5 has no statement-removal operator.
 
-**Why it's noise:** behaviour shouldn't change if logging is removed. Telemetry calls usually don't have observable test impact unless tests specifically assert on metric values.
+**Why it's noise:** the message text and its arguments carry no behaviour. Telemetry calls usually have no observable test impact unless tests specifically assert on metric values.
+
+⚠️ One exception worth checking before dismissing: `arg_to_None` on a *logging* call is noise, but the same operator on a real call (`create(vals)` → `create(None)`) is a genuine gap. Classify by the call, not by the operator alone.
 
 **Fix options:**
-- Pragma the line.
-- Use `pre_mutation` hook in `mutmut_config.py`:
-  ```python
-  def pre_mutation(context):
-      line = context.current_source_line.strip()
-      if line.startswith(('log.', 'logger.', 'logging.', 'metrics.', 'tracer.', 'print(')):
-          context.skip = True
-  ```
+- Report them as a separate "message/logging noise" bucket and leave the code alone — this is the right default.
+- `# pragma: no mutate` on a line that keeps coming back in triage.
+
+⚠️ There is **no** `pre_mutation` hook / `mutmut_config.py` / `context.skip` in mutmut 3 — that API was removed. You cannot skip by line prefix or by operator. `do_not_mutate` exists but matches **file paths** only:
+```toml
+[tool.mutmut]
+do_not_mutate = ["*/migrations/*", "*/settings.py"]
+```
+
+## Pattern 4b: ORM/descriptor type coercion (Odoo, Django, SQLAlchemy, pydantic)
+
+The single biggest source of equivalent mutants in ORM code: **the field coerces the mutated value back to the original**. `operator_name` (`False`→`True`) and `arg_to_None` fire constantly on field assignments, and the ORM quietly normalises them.
+
+Verified against Odoo 19 (`convert_to_cache`) — check the equivalent table for your ORM before triaging, **do not guess**:
+
+| Field type | `False` → | `True` → | `None` → | Mutant equivalent? |
+|---|---|---|---|---|
+| `Many2one` | `None` | `None` | `None` | **YES** — `{'user_id': False}` → `{'user_id': True}` changes nothing |
+| `Integer` (`int(value or 0)`) | `0` | `1` | `0` | `None` **YES**; `True` no (`0`→`1`) |
+| `Char` | `None` | `'True'` | `None` | **NO** — a real gap, the field ends up the string `"True"` |
+| `Boolean` | `False` | `True` | `False` | `True` no; `None` **YES** |
+
+So in one real audit, `self.write({"void_date": False, "void_by": False, "void_reason": False, "sent_by": False, "paid_by": False})` produced 4 survivors — and only **one** (`void_reason`, a `Char`) was a genuine test gap. The three `Many2one` ones were equivalent, even though the tests *did* assert those fields were cleared. Reporting all four as gaps would have been wrong.
+
+**How to check fast** — ask the ORM, don't reason about it:
+```python
+f = env["my.model"]._fields["void_by"]
+f.convert_to_cache(True, env["my.model"]), f.convert_to_cache(False, env["my.model"])
+# equal => equivalent mutant
+```
+
+**Rule:** before filing any `False`→`True` / `arg_to_None` survivor on a field assignment as a gap, resolve the field's type and coercion. Same-result => equivalent, close it.
 
 ## Pattern 5: Defensive None checks for impossible cases
 
@@ -192,7 +225,7 @@ If your tests only pass `str` and `int`, the `else` branch is dead from tests' p
 When triaging a survived mutant, check in order:
 1. Is the file in pattern 8 (auto-generated)? → exclude path.
 2. Does the line match pattern 1, 2, 4, or 6 (version, indent, log, error msg)? → pragma.
-3. Is it pattern 3 (break↔continue)? → analyze equivalence, pragma if equivalent.
+3. Is it pattern 3 (`break`→`return` / `continue`→`break`)? → treat as a real gap; only pragma if you prove equivalence.
 4. Is it pattern 7 (config declaration)? → exclude or pragma.
 5. Otherwise → assume real test gap, write the test.
 

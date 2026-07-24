@@ -21,13 +21,14 @@ Record the `agentId` (format `a...-...`) returned by every `Agent` spawn into yo
 Maintain a small table in your working context, one row per spawn:
 
 ```
-name        | agentId      | role          | files_owned
-coder-1     | a1b2-...     | Coder         | models/order.py, ...
-tester      | a3c4-...     | Tester        | tests/
-code-review | a5d6-...     | Code-Reviewer | —
+name          | agentId      | role                  | files_owned
+coder-1       | a1b2-...     | Coder                 | models/order.py, ...
+tester        | a3c4-...     | Tester                | tests/
+code-reviewer | a5d6-...     | Code-Reviewer         | —
+kimi-code     | a7e8-...     | Kimi-Mirror (code)    | —
 ```
 
-Append a row immediately after each spawn. This table is how you reach completed agents in later phases.
+Append a row immediately after each spawn. This table is how you reach completed agents in later phases. In Phase 2 each dimension has **two** rows — the native reviewer and its Kimi mirror — so the table roughly doubles.
 
 ### Liveness protocol
 
@@ -136,11 +137,13 @@ If the Tester reports `PRODUCTION BUG FOUND`:
 
 ---
 
-### Phase 2: Review (4–5 parallel reviewers)
+### Phase 2: Review (dual-track — native Claude reviewers + Kimi mirrors)
 
-Say: **"Code and tests are done. Spawning 4-5 reviewers in parallel. I will wait for all reports before proceeding."**
+Say: **"Code and tests are done. Spawning the reviewers in parallel — each dimension gets a native Claude reviewer AND a Kimi mirror running the same procedure, for two independent passes. I will wait for all reports before proceeding."**
 
 This phase runs after Phase 1 regardless of time spent or code quality. All reviewers must report. Hooks, automated linters, CI checks, or prior review rounds do not substitute for Phase 2.
+
+**Two engines per dimension.** For every native reviewer below except the UI-Reviewer, you also spawn a `Kimi-Mirror` that runs the *same* audit procedure on the Kimi CLI. Two independent passes catch more than one — "ревью много не бывает". The UI-Reviewer has no Kimi mirror (Kimi cannot drive a browser).
 
 **Start only after Phase 1b is complete.**
 
@@ -155,17 +158,23 @@ If all changes are purely backend (`.py`, `.sql`, config `.json`) — skip UI-Re
 
 #### Reviewer list
 
-| Reviewer | subagent_type | name | scope |
-|---|---|---|---|
-| Code-Reviewer | `Code-Reviewer` | `code-reviewer` | production code quality |
-| Test-Reviewer | `Test-Reviewer` | `test-reviewer` | test quality and coverage |
-| Spec-Auditor | `Spec-Auditor` | `spec-auditor` | spec compliance |
-| Security-Reviewer | `Security-Reviewer` | `security-reviewer` | security and architecture |
-| UI-Reviewer | `UI-Reviewer` | `ui-reviewer` | visual verification *(only if frontend files changed)* |
+Each row is a **pair**: the native Claude reviewer and its Kimi mirror. The mirror is always the
+`Kimi-Mirror` subagent_type; what differs per row is its `name`, its `PURPOSE`, and the `MIRROR_OF`
+native file it re-runs.
+
+| Dimension | Native subagent_type | Native name | Kimi-Mirror name | Kimi `MIRROR_OF` / `PURPOSE` |
+|---|---|---|---|---|
+| production code quality | `Code-Reviewer` | `code-reviewer` | `kimi-code` | `~/.claude/agents/code-reviewer.md` / `review-code` |
+| test quality and coverage | `Test-Reviewer` | `test-reviewer` | `kimi-test` | `~/.claude/agents/test-reviewer.md` / `review-test` |
+| spec compliance | `Spec-Auditor` | `spec-auditor` | `kimi-spec-audit` | `~/.claude/agents/spec-auditor.md` / `review-spec-audit` |
+| security and architecture | `Security-Reviewer` | `security-reviewer` | `kimi-security` | `~/.claude/agents/security-reviewer.md` / `review-security` |
+| visual verification *(only if frontend files changed)* | `UI-Reviewer` | `ui-reviewer` | — *(no Kimi mirror — browser)* | — |
 
 #### Spawn reviewers in parallel
 
-Spawn all reviewers in one batch (multiple `Agent` calls in a single response). Record each `agentId`. Each spawn uses:
+Spawn **all natives and all mirrors in one batch** (multiple `Agent` calls in a single response). Record each `agentId`.
+
+Each **native** spawn uses:
 
 ```
 Agent(
@@ -181,9 +190,29 @@ Report findings in the format from your agent file."
 )
 ```
 
+Each **Kimi mirror** spawn (one per native reviewer except UI-Reviewer) uses:
+
+```
+Agent(
+  subagent_type: "Kimi-Mirror",
+  name: "{kimi-name}",
+  run_in_background: true,
+  prompt: "Read your instructions: ~/.claude/agents/kimi-mirror.md
+MIRROR_OF: {native agent file, e.g. ~/.claude/agents/security-reviewer.md}
+PURPOSE: {review-code | review-test | review-spec-audit | review-security}
+Working directory (WORKTREE): {worktree_path}
+Base branch for diff: {base_branch}
+Spec file: {spec_path}
+Review prompts: if `.claude/review_prompt.md` exists, tell Kimi to read and apply it.
+Mirror the native procedure exactly and relay Kimi's report verbatim, with ` (Kimi)` appended to the REVIEWER line."
+)
+```
+
 Arm the phase watchdog: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_REVIEW")`.
 
-UI-Reviewer gets two extra lines in its prompt:
+**Kimi concurrency.** The mirrors each fire a background Kimi run; 4 at once may exceed Kimi's rate cap (`rc=429`). `~/.claude/templates/kimi-reviewer.md` already waits for the next quota window and re-fires, so the mirrors simply serialize — this is non-blocking, not a failure. Do not cancel a mirror for being slow; the watchdog covers genuine stalls.
+
+UI-Reviewer gets two extra lines in its prompt (no Kimi mirror for it):
 
 > Changed files: {combined changed files from all coders}
 > URL hints: {any relevant URLs or pages you can identify from the spec}
@@ -203,7 +232,17 @@ FINDINGS: ...
 SUMMARY: X findings (Y MUST FIX, Z NIT/CONCERN)
 ```
 
-**Reject reports without a DEPTH block.** The DEPTH counts are how you detect shallow reviews. If a reviewer reports `VERDICT` and `FINDINGS` but omits `DEPTH`, re-run that reviewer. Same rule if counts look implausibly low for the diff (e.g. "Methods audited: 2" on a 20-method diff). To re-run, resume the reviewer by `agentId` and ask for the missing DEPTH block, or spawn a fresh instance.
+Mirror reports are identical in format but carry ` (Kimi)` in the `REVIEWER:` line (e.g. `REVIEWER: Security-Reviewer (Kimi)`).
+
+**Reject reports without a DEPTH block** — this applies to native and mirror reports alike. The DEPTH counts are how you detect shallow reviews. If a reviewer reports `VERDICT` and `FINDINGS` but omits `DEPTH`, re-run that reviewer. Same rule if counts look implausibly low for the diff (e.g. "Methods audited: 2" on a 20-method diff). To re-run, resume the reviewer by `agentId` and ask for the missing DEPTH block, or spawn a fresh instance. A Kimi mirror that returns `KIMI_SUSPICIOUS` / `KIMI_FAILED` instead of a report is re-run the same way.
+
+#### Merge the two passes per dimension
+
+You now hold up to **two** reports per dimension — the native pass and its Kimi mirror. Merge them before acting:
+
+- **Dedup**: same `file:line` + same issue class = **one** finding. Keep the more specific description.
+- **Union of severity**: a `MUST FIX` / `CRITICAL` raised by *either* engine counts — one pass missing it does not downgrade it. The merged MUST FIX / CRITICAL set feeds a **single** fix round in Phase 3.
+- **Divergence is signal, not noise**: if one engine flags something the other missed, keep it. That extra catch is the whole point of running two.
 
 #### UI-Reviewer troubleshooting
 
@@ -212,7 +251,7 @@ If UI-Reviewer reports `VERDICT: BLOCKED` (cannot start dev server, browser unav
 - Retry up to **3 times**, each with a different hint.
 - After 3 failed attempts: document the reason in Known Concerns, add a manual UI check to Steps for Manual Review, and continue.
 
-**Phase 2 is complete when every spawned reviewer has reported with a valid DEPTH block.**
+**Phase 2 is complete when every spawned agent — each native reviewer AND each Kimi mirror — has reported with a valid DEPTH block.**
 
 ---
 
@@ -224,11 +263,11 @@ Precondition: All spawned Phase 2 reviewers must have reported.
 
 #### Step 1: Assess
 
-From all reviewer reports, build two fix lists:
-- **Coder fixes**: `MUST FIX` / `CRITICAL` findings from Code-Reviewer, Spec-Auditor, Security-Reviewer, UI-Reviewer
-- **Tester fixes**: `MUST FIX` findings from Test-Reviewer, missing coverage from Spec-Auditor
+Work from the **merged, deduped** findings (Phase 2 "Merge the two passes"). A `(Kimi)` mirror report routes to the same bucket as its native — `Security-Reviewer (Kimi)` → Coder fixes, `Test-Reviewer (Kimi)` → Tester fixes, etc. Build two fix lists:
+- **Coder fixes**: `MUST FIX` / `CRITICAL` findings from Code-Reviewer, Spec-Auditor, Security-Reviewer, UI-Reviewer — and their Kimi mirrors
+- **Tester fixes**: `MUST FIX` findings from Test-Reviewer, missing coverage from Spec-Auditor — and their Kimi mirrors
 
-If zero `MUST FIX` / `CRITICAL` across all reviewers — skip to Finalization.
+If zero `MUST FIX` / `CRITICAL` across all reviewers (native and mirror) — skip to Finalization.
 
 **Conflict resolution priority:** Security CRITICAL > Spec compliance > Code quality.
 
@@ -250,7 +289,7 @@ Fix rounds await agent messages like any phase — arm `Bash(run_in_background: 
 
 #### Step 3: Verification (re-review)
 
-Resume — by `agentId` — every reviewer that had `MUST FIX` or `CRITICAL` findings (their preserved context means they remember their findings):
+Resume — by `agentId` — every reviewer **and every Kimi mirror** that had `MUST FIX` or `CRITICAL` findings (a resumed native remembers its findings via preserved context; a resumed mirror fires a fresh Kimi re-review run per `kimi-mirror.md` §Re-review). If a finding was raised by only one engine of a pair, re-reviewing that one engine is enough — but if both flagged the dimension, re-review both:
 
 > This is a **re-review** after fixes.
 >
@@ -284,11 +323,11 @@ Say: **"Fix rounds complete. Running gate check, final test suite, then committi
 
 - Phase 1a — **every** Coder from Work breakdown sent `CODER DONE`? If NO → resume the missing one(s) by `agentId` NOW.
 - Phase 1b — Tester sent `TESTER DONE` with test count? If NO → resume Tester NOW.
-- Phase 2 — Code-Reviewer reported? If NO → spawn NOW.
-- Phase 2 — Test-Reviewer reported? If NO → spawn NOW.
-- Phase 2 — Spec-Auditor reported? If NO → spawn NOW.
-- Phase 2 — Security-Reviewer reported? If NO → spawn NOW.
-- Phase 2 — UI-Reviewer reported? (only if spawned) If NO → spawn NOW.
+- Phase 2 — Code-Reviewer **and** its `kimi-code` mirror reported (both with DEPTH)? If NO → spawn the missing one NOW.
+- Phase 2 — Test-Reviewer **and** `kimi-test` reported? If NO → spawn NOW.
+- Phase 2 — Spec-Auditor **and** `kimi-spec-audit` reported? If NO → spawn NOW.
+- Phase 2 — Security-Reviewer **and** `kimi-security` reported? If NO → spawn NOW.
+- Phase 2 — UI-Reviewer reported? (only if spawned; no Kimi mirror) If NO → spawn NOW.
 - Phase 3 — Fix iterations completed (or no MUST FIX items)? If NO → run NOW.
 
 ### Final test run

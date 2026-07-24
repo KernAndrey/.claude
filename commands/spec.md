@@ -173,11 +173,13 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 
 **Message loop:** same shape as 2a, but with `spec-architect` and the Architect signal names.
 
-### 2c. Critics (three agents in parallel)
+### 2c. Critics (three critics + three Kimi mirrors, in parallel)
 
-Spawn all three critics as background agents in one batch (three `Agent` calls in a single response). They run in parallel — no dependencies between them. Record all three `agentId`s.
+Each critic runs on **two engines**: the native Claude critic AND a `Kimi-Mirror` running the same lens pass on the Kimi CLI — two independent passes per critic, "ревью много не бывает". Spawn all **six** as background agents in one batch (six `Agent` calls in a single response). They run in parallel — no dependencies. Record all six `agentId`s (three critics + three mirrors).
 
-Arm one watchdog for the batch: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")`.
+Arm one watchdog for the whole batch — critics and mirrors: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")`.
+
+The three native critic spawns are 2c-i / 2c-ii / 2c-iii below. Each also gets a mirror via the template in **2c-iv**.
 
 #### 2c-i. Architecture Critic
 
@@ -218,13 +220,40 @@ Spawn `Agent(subagent_type: "Spec-Critic-Premise", name: "spec-critic-premise", 
 > {On resume:} `RESUMED_RUN: true`
 > Run your full premise pass (Lenses L1–L6). A sound foundation yields zero challenges — never manufacture one. Signal `SPEC PREMISE CRITIC REPORT` when done.
 
-**Message loops:** run all three in parallel. The critics rarely escalate; if any does, handle like any other `QUESTION FOR USER`.
+#### 2c-iv. Kimi mirrors (one per critic)
 
-Wait for all three critics to complete before proceeding.
+In the same batch, spawn a `Kimi-Mirror` for each of the three critics. Each mirror reads its native critic file and re-runs the same lens pass on Kimi, relaying a report labelled `(Kimi)`:
+
+| Mirrors critic | Kimi-Mirror name | `MIRROR_OF` | `PURPOSE` |
+|---|---|---|---|
+| Architecture Critic | `kimi-critic-arch` | `~/.claude/agents/spec-critic-arch.md` | `critic-arch` |
+| Business Critic | `kimi-critic-business` | `~/.claude/agents/spec-critic-business.md` | `critic-business` |
+| Premise Critic | `kimi-critic-premise` | `~/.claude/agents/spec-critic-premise.md` | `critic-premise` |
+
+Each mirror spawn:
+
+```
+Agent(
+  subagent_type: "Kimi-Mirror",
+  name: "{kimi-critic-name}",
+  run_in_background: true,
+  prompt: "Read your instructions: ~/.claude/agents/kimi-mirror.md
+MIRROR_OF: {native critic file}
+PURPOSE: {critic-arch | critic-business | critic-premise}
+Working directory (WORKTREE): {project root}
+Spec path: tasks/2-spec/{ID}-{slug}.md
+Draft path: {draft path}
+Mirror the native critic's lens pass exactly and relay Kimi's report verbatim, with ` (Kimi)` appended to the report's identifier line (e.g. `SPEC ARCH CRITIC REPORT (Kimi)`)."
+)
+```
+
+**Message loops:** run all three critics — and their mirrors — in parallel. The critics rarely escalate; if any (native or mirror) does, handle like any other `QUESTION FOR USER`. A mirror returning `KIMI_SUSPICIOUS` / `KIMI_FAILED` instead of a report is re-run per `kimi-mirror.md`.
+
+Wait for all three critics **and all three mirrors** to complete before proceeding.
 
 ### 2d. Apply findings
 
-Merge findings from all three critics (arch critic, business critic, premise critic). This includes `EMERGENT QUESTIONS FOR USER` from all sources — they all feed into Phase 3. Deduplicate findings that flag the same issue — keep the more specific description.
+You now hold **six** reports — three native critics and their three Kimi mirrors. Merge them: first fold each mirror into its native pair (arch native + `kimi-critic-arch`, business + `kimi-critic-business`, premise + `kimi-critic-premise`), then merge across critics. **Dedup** — findings that flag the same issue (within a pair or across critics) collapse to one, keeping the more specific description. **Union of severity** — a finding raised by *either* engine counts; a mirror-only catch is still a catch. This includes `EMERGENT QUESTIONS FOR USER` from all sources (native and mirror) — they all feed into Phase 3. The premise mirror's questions dedup against the native premise critic's before Phase 3.
 
 The premise critic is different in kind: it challenges decisions, not implementation. Its findings are mostly `route: user` and feed **Phase 3** directly — they are not applied through the analyst/architect fix loop below, because only the user can re-decide a decision. The one exception is a premise finding with `route: analyst` (an assumption factually contradicted by code), which joins the analyst fix round. The premise critic gets **no re-check** pass.
 

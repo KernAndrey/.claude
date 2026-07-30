@@ -155,17 +155,20 @@ Live end-to-end hook check (costs a few cents — makes one kimi call): ask kimi
 ## Open caveats
 
 - **Durability — the live config is untracked.** The corrected matchers, the
-  `review_readonly` registration, and the **`kimi-code/k3` model registration**
-  all live in `~/.kimi-code/config.toml`, which `kimi migrate` generates. A future
+  `review_readonly` registration, and **both model registrations
+  (`kimi-code/k3` and `kimi-code/kimi-for-coding`)** all live in
+  `~/.kimi-code/config.toml`, which `kimi migrate` generates. A future
   kimi-code upgrade / re-migrate can regenerate it and **silently drop all of it**,
   restoring the dead-hooks state (matchers under old tool names → no safety hooks,
-  no reviewer containment) and unregistering k3 (every kimi call in `~/.claude`
-  pins `-m kimi-code/k3` and would fail with `config.invalid: Model
-  "kimi-code/k3" is not configured`). There is no tracked installer to protect it.
+  no reviewer containment) and unregistering the models. Both aliases are load-
+  bearing: the kimi delegation skill pins `-m kimi-code/k3`, while the pre-commit
+  reviewer (`review/config.py`) pins `kimi-code/kimi-for-coding` — an unregistered
+  alias fails with `config.invalid: Model "…" is not configured`.
+  There is no tracked installer to protect it.
   **After any kimi-code upgrade, re-run smoke steps 2 + 5 + 6 above** to confirm
   the hooks are still live. If they fail, re-apply: matchers `Bash` /
   `Write|Edit` / `Write|Edit|Bash|FetchURL|WebSearch`, scripts under
-  `~/.kimi/hooks/`, plus the model block:
+  `~/.kimi/hooks/`, plus both model blocks:
 
   ```toml
   default_model = "kimi-code/k3"
@@ -176,11 +179,21 @@ Live end-to-end hook check (costs a few cents — makes one kimi call): ask kimi
   max_context_size = 1048576   # Allegretto+; Moderato caps at 262144
   capabilities = [ "thinking", "always_thinking", "image_in", "video_in", "tool_use" ]
   display_name = "Kimi K3"
+
+  # K2.7 Code — the pre-commit reviewer's model (cheaper than K3; review needs
+  # neither K3's strength nor its 1M window). See review/config.py:_KIMI_MODEL.
+  [models."kimi-code/kimi-for-coding"]
+  provider = "managed:kimi-code"
+  model = "kimi-for-coding"
+  max_context_size = 262144
+  capabilities = [ "thinking", "always_thinking", "image_in", "video_in", "tool_use" ]
+  display_name = "kimi-for-coding"
   ```
 
   Leave `reasoning_effort` unset: unset maps to `max`, while any value outside
   `{max, high, low, none}` is a hard HTTP 400. Verify with
-  `kimi -m kimi-code/k3 -p "Reply with exactly: OK"`.
+  `kimi -m kimi-code/k3 -p "Reply with exactly: OK"` and
+  `kimi -m kimi-code/kimi-for-coding -p "Reply with exactly: OK"`.
 - **Hooks are user-global.** `safety_shell` + `protect_secrets` fire for every
   kimi session on this host. Project-local hooks aren't supported yet.
 - **`-p` runs under the `auto` permission policy** — it auto-approves tool calls;

@@ -12,7 +12,14 @@ from dataclasses import dataclass
 # --- which kimi model the reviewer uses -----------------------------------
 # Must match a [models."…"] key in ~/.kimi-code/config.toml — the LIVE config.
 # (~/.kimi/config.toml is versioned but inert; kimi-code no longer reads it.)
-_KIMI_MODEL = "kimi-code/k3"
+# review-note: user explicitly repinned this from kimi-code/k3 to K2.7 Code
+# ("kimi-for-coding") — K3 is strong but expensive and overkill for review.
+# Deliberate cost trade-off owned by the user. Applies to both review paths
+# (PRIMARIES = small-commit path, CHUNKED_BACKENDS = chunked path). K2.7 caps
+# at 256k context vs K3's 1M, which is ample here: a chunked commit is bounded
+# by MAX_CHUNKS * MAX_PROD_LINES added production lines. The kimi *delegation*
+# skill (~/.claude/skills/kimi) still pins K3 — different subsystem.
+_KIMI_MODEL = "kimi-code/kimi-for-coding"
 
 
 @dataclass(frozen=True)

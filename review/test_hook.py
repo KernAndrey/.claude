@@ -830,15 +830,15 @@ def test_default_primaries_pin_kimi_only() -> None:
     pre-commit behavior without any failing test. Pin the default so
     drift is caught at test time, not at commit time.
 
-    Current default: kimi only (the owner uses Kimi K3 as the sole primary
-    reviewer; requires `kimi login`). The arbiter and total-failure fallback
-    remain claude/sonnet."""
+    Current default: kimi only (the owner uses Kimi K2.7 Code as the sole
+    primary reviewer; requires `kimi login`). The arbiter and total-failure
+    fallback remain claude/sonnet."""
     assert len(PRIMARIES) == 1
     assert PRIMARIES[0].backend == "kimi"
     # Pin the literal, not `_KIMI_MODEL` — asserting the constant against
     # itself passes for any value and would not catch a repin. The alias must
     # also stay in sync with a [models."…"] key in ~/.kimi-code/config.toml.
-    assert PRIMARIES[0].model == "kimi-code/k3"
+    assert PRIMARIES[0].model == "kimi-code/kimi-for-coding"
 
 
 def test_config_defaults_pinned() -> None:

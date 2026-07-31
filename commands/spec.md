@@ -29,6 +29,7 @@ This phase is **mandatory** for new runs and cannot be skipped.
 4. Ask questions **one at a time** using the defer-aware prompt format below.
 5. **After each answer**, immediately append the decision to the draft file under a `## Decisions` section using `Edit`. Number each decision sequentially. Format: `N. **Short label**: decision text`. This section becomes the authoritative source of user decisions for all agents — inline prompt text is supplementary.
 6. After each answer, if it reveals new ambiguities, add follow-up questions to the queue. Continue until no questions remain — ask as many as genuinely matter, no padding to a count.
+7. When the queue is empty the draft is finished — commit it once, as commit 1 of `## Commits`. The `Edit` in step 5 is what persists each answer; the single commit lands them all as one history entry.
 
 **Rules for this phase:**
 - Frame questions in business/domain terms, except architectural topics which are technical by nature.
@@ -306,17 +307,34 @@ Each answer is reflected in the spec immediately:
 
 Create a new `### b-N` entry in `## Blockers` following the same format. Continue with the next question.
 
-## Progress commits
+## Commits
 
-Commit work-in-progress at these checkpoints to avoid losing progress:
+A `/spec` run produces exactly **two** commits: the finished draft, then the finished spec. Every intermediate state — each answer, each agent round, each fix round — lives in the working tree, where `Edit` already persisted it to disk. Two commits per task keep the history readable; a commit per answer or per agent buries real changes under a dozen work-in-progress entries.
 
-1. **After Phase 1** — draft with `## Decisions` and `## Codebase Observations`. Message: `spec({ID}): Phase 1 decisions and codebase observations`
-2. **After Analyst** — spec with business sections. Message: `spec({ID}): business sections (Analyst)`
-3. **After Architect** — spec with architecture. Message: `spec({ID}): architecture plan (Architect)`
-4. **After fix rounds** — spec with critic fixes. Message: `spec({ID}): apply critic findings`
-5. **After finalization** — final spec + archived draft. Message: `spec({ID}): finalize spec`
+**Commit 1 — end of Phase 1.** The draft holds every decision in `## Decisions` and every finding in `## Codebase Observations`; the question queue is empty.
 
-Use `git add` on specific files only (draft, spec). Run commits with `run_in_background: true` (pre-commit hook may take time).
+```
+git add tasks/1-draft/{ID}-{slug}.md
+git commit -m "spec({ID}): draft with decisions and codebase observations"
+```
+
+**Commit 2 — finalization.** The spec is verified and the draft has moved to the archive (§4, step 9).
+
+```
+git add -A -- tasks/2-spec/{ID}-{slug}.md tasks/archive/drafts/{ID}-{slug}.md
+git add -A -- tasks/1-draft/{ID}-{slug}.md 2>/dev/null || true
+git commit -m "spec({ID}): specification"
+```
+
+`-A` stages the draft's move as a rename (deletion + addition), so the archived draft lands together with the spec. The second `git add` is separate and error-tolerant on purpose: git aborts with exit 128 on a pathspec matching nothing, and the old draft path is absent on a resume run (the earlier run archived it) — a single combined command would kill the final commit of a 20-minute pipeline. A resume run produces commit 2 only, since Phase 1 is skipped and there is no draft to commit.
+
+Run both commits with `run_in_background: true` — the pre-commit review hook can take up to 20 minutes.
+
+<bad_pattern>
+❌ BAD THOUGHT: "Phase 2 finished, better checkpoint the spec before the critics run."
+✅ REALITY: `Edit` already wrote it to disk. A crash loses nothing; an extra commit permanently pollutes the history the user reads.
+⚠️ DETECTION: About to run `git commit` anywhere other than end-of-Phase-1 or finalization? → record it with `Edit` instead.
+</bad_pattern>
 
 ## 4. Finalization
 
@@ -328,12 +346,12 @@ Use `git add` on specific files only (draft, spec). Run commits with `run_in_bac
 6. Verify `## Key Constraints` has 3-7 items, each tracing to Behavior or AC.
 7. Verify `## Assumptions` is populated (not just the template placeholder).
 8. Verify exactly one `[SENTINEL]` marker exists in the Behavior section.
+9. Move the draft to `tasks/archive/drafts/` — it is consumed either way, blockers or not.
+10. Commit the spec and the archived draft together, as commit 2 of `## Commits`. This is the run's last action; the branches below only produce output.
 
 ### If open blockers > 0
 
-- Move the draft to `tasks/archive/drafts/` (the draft is consumed either way).
-- Leave the spec in `tasks/2-spec/` with `status: awaiting-approval` unchanged.
-- Output:
+The spec stays in `tasks/2-spec/` with `status: awaiting-approval` unchanged. Output:
 
   ```
   Spec {ID} saved with {N} open blockers in ## Blockers section.
@@ -350,7 +368,6 @@ Stop.
 
 ### If open blockers == 0
 
-- Move the draft to `tasks/archive/drafts/`.
 - Output:
   - Brief spec summary (3-5 sentences)
   - Number of acceptance criteria

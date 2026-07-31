@@ -29,6 +29,7 @@ This phase is **mandatory** for new runs and cannot be skipped.
 4. Ask questions **one at a time** using the defer-aware prompt format below.
 5. **After each answer**, immediately append the decision to the draft file under a `## Decisions` section using `Edit`. Number each decision sequentially. Format: `N. **Short label**: decision text`. This section becomes the authoritative source of user decisions for all agents — inline prompt text is supplementary.
 6. After each answer, if it reveals new ambiguities, add follow-up questions to the queue. Continue until no questions remain — ask as many as genuinely matter, no padding to a count.
+7. When the queue is empty the draft is finished — commit it once, as commit 1 of `## Commits`. The `Edit` in step 5 is what persists each answer; the single commit lands them all as one history entry.
 
 **Rules for this phase:**
 - Frame questions in business/domain terms, except architectural topics which are technical by nature.
@@ -173,11 +174,13 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 
 **Message loop:** same shape as 2a, but with `spec-architect` and the Architect signal names.
 
-### 2c. Critics (three agents in parallel)
+### 2c. Critics (three critics + three Kimi mirrors, in parallel)
 
-Spawn all three critics as background agents in one batch (three `Agent` calls in a single response). They run in parallel — no dependencies between them. Record all three `agentId`s.
+Each critic runs on **two engines**: the native Claude critic AND a `Kimi-Mirror` running the same lens pass on the Kimi CLI — two independent passes per critic, "ревью много не бывает". Spawn all **six** as background agents in one batch (six `Agent` calls in a single response). They run in parallel — no dependencies. Record all six `agentId`s (three critics + three mirrors).
 
-Arm one watchdog for the batch: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")`.
+Arm one watchdog for the whole batch — critics and mirrors: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")`.
+
+The three native critic spawns are 2c-i / 2c-ii / 2c-iii below. Each also gets a mirror via the template in **2c-iv**.
 
 #### 2c-i. Architecture Critic
 
@@ -218,13 +221,40 @@ Spawn `Agent(subagent_type: "Spec-Critic-Premise", name: "spec-critic-premise", 
 > {On resume:} `RESUMED_RUN: true`
 > Run your full premise pass (Lenses L1–L6). A sound foundation yields zero challenges — never manufacture one. Signal `SPEC PREMISE CRITIC REPORT` when done.
 
-**Message loops:** run all three in parallel. The critics rarely escalate; if any does, handle like any other `QUESTION FOR USER`.
+#### 2c-iv. Kimi mirrors (one per critic)
 
-Wait for all three critics to complete before proceeding.
+In the same batch, spawn a `Kimi-Mirror` for each of the three critics. Each mirror reads its native critic file and re-runs the same lens pass on Kimi, relaying a report labelled `(Kimi)`:
+
+| Mirrors critic | Kimi-Mirror name | `MIRROR_OF` | `PURPOSE` |
+|---|---|---|---|
+| Architecture Critic | `kimi-critic-arch` | `~/.claude/agents/spec-critic-arch.md` | `critic-arch` |
+| Business Critic | `kimi-critic-business` | `~/.claude/agents/spec-critic-business.md` | `critic-business` |
+| Premise Critic | `kimi-critic-premise` | `~/.claude/agents/spec-critic-premise.md` | `critic-premise` |
+
+Each mirror spawn:
+
+```
+Agent(
+  subagent_type: "Kimi-Mirror",
+  name: "{kimi-critic-name}",
+  run_in_background: true,
+  prompt: "Read your instructions: ~/.claude/agents/kimi-mirror.md
+MIRROR_OF: {native critic file}
+PURPOSE: {critic-arch | critic-business | critic-premise}
+Working directory (WORKTREE): {project root}
+Spec path: tasks/2-spec/{ID}-{slug}.md
+Draft path: {draft path}
+Mirror the native critic's lens pass exactly and relay Kimi's report verbatim, with ` (Kimi)` appended to the report's identifier line (e.g. `SPEC ARCH CRITIC REPORT (Kimi)`)."
+)
+```
+
+**Message loops:** run all three critics — and their mirrors — in parallel. The critics rarely escalate; if any (native or mirror) does, handle like any other `QUESTION FOR USER`. A mirror returning `KIMI_SUSPICIOUS` / `KIMI_FAILED` instead of a report is re-run per `kimi-mirror.md`.
+
+Wait for all three critics **and all three mirrors** to complete before proceeding.
 
 ### 2d. Apply findings
 
-Merge findings from all three critics (arch critic, business critic, premise critic). This includes `EMERGENT QUESTIONS FOR USER` from all sources — they all feed into Phase 3. Deduplicate findings that flag the same issue — keep the more specific description.
+You now hold **six** reports — three native critics and their three Kimi mirrors. Merge them: first fold each mirror into its native pair (arch native + `kimi-critic-arch`, business + `kimi-critic-business`, premise + `kimi-critic-premise`), then merge across critics. **Dedup** — findings that flag the same issue (within a pair or across critics) collapse to one, keeping the more specific description. **Union of severity** — a finding raised by *either* engine counts; a mirror-only catch is still a catch. This includes `EMERGENT QUESTIONS FOR USER` from all sources (native and mirror) — they all feed into Phase 3. The premise mirror's questions dedup against the native premise critic's before Phase 3.
 
 The premise critic is different in kind: it challenges decisions, not implementation. Its findings are mostly `route: user` and feed **Phase 3** directly — they are not applied through the analyst/architect fix loop below, because only the user can re-decide a decision. The one exception is a premise finding with `route: analyst` (an assumption factually contradicted by code), which joins the analyst fix round. The premise critic gets **no re-check** pass.
 
@@ -277,17 +307,34 @@ Each answer is reflected in the spec immediately:
 
 Create a new `### b-N` entry in `## Blockers` following the same format. Continue with the next question.
 
-## Progress commits
+## Commits
 
-Commit work-in-progress at these checkpoints to avoid losing progress:
+A `/spec` run produces exactly **two** commits: the finished draft, then the finished spec. Every intermediate state — each answer, each agent round, each fix round — lives in the working tree, where `Edit` already persisted it to disk. Two commits per task keep the history readable; a commit per answer or per agent buries real changes under a dozen work-in-progress entries.
 
-1. **After Phase 1** — draft with `## Decisions` and `## Codebase Observations`. Message: `spec({ID}): Phase 1 decisions and codebase observations`
-2. **After Analyst** — spec with business sections. Message: `spec({ID}): business sections (Analyst)`
-3. **After Architect** — spec with architecture. Message: `spec({ID}): architecture plan (Architect)`
-4. **After fix rounds** — spec with critic fixes. Message: `spec({ID}): apply critic findings`
-5. **After finalization** — final spec + archived draft. Message: `spec({ID}): finalize spec`
+**Commit 1 — end of Phase 1.** The draft holds every decision in `## Decisions` and every finding in `## Codebase Observations`; the question queue is empty.
 
-Use `git add` on specific files only (draft, spec). Run commits with `run_in_background: true` (pre-commit hook may take time).
+```
+git add tasks/1-draft/{ID}-{slug}.md
+git commit -m "spec({ID}): draft with decisions and codebase observations"
+```
+
+**Commit 2 — finalization.** The spec is verified and the draft has moved to the archive (§4, step 9).
+
+```
+git add -A -- tasks/2-spec/{ID}-{slug}.md tasks/archive/drafts/{ID}-{slug}.md
+git add -A -- tasks/1-draft/{ID}-{slug}.md 2>/dev/null || true
+git commit -m "spec({ID}): specification"
+```
+
+`-A` stages the draft's move as a rename (deletion + addition), so the archived draft lands together with the spec. The second `git add` is separate and error-tolerant on purpose: git aborts with exit 128 on a pathspec matching nothing, and the old draft path is absent on a resume run (the earlier run archived it) — a single combined command would kill the final commit of a 20-minute pipeline. A resume run produces commit 2 only, since Phase 1 is skipped and there is no draft to commit.
+
+Run both commits with `run_in_background: true` — the pre-commit review hook can take up to 20 minutes.
+
+<bad_pattern>
+❌ BAD THOUGHT: "Phase 2 finished, better checkpoint the spec before the critics run."
+✅ REALITY: `Edit` already wrote it to disk. A crash loses nothing; an extra commit permanently pollutes the history the user reads.
+⚠️ DETECTION: About to run `git commit` anywhere other than end-of-Phase-1 or finalization? → record it with `Edit` instead.
+</bad_pattern>
 
 ## 4. Finalization
 
@@ -299,12 +346,12 @@ Use `git add` on specific files only (draft, spec). Run commits with `run_in_bac
 6. Verify `## Key Constraints` has 3-7 items, each tracing to Behavior or AC.
 7. Verify `## Assumptions` is populated (not just the template placeholder).
 8. Verify exactly one `[SENTINEL]` marker exists in the Behavior section.
+9. Move the draft to `tasks/archive/drafts/` — it is consumed either way, blockers or not.
+10. Commit the spec and the archived draft together, as commit 2 of `## Commits`. This is the run's last action; the branches below only produce output.
 
 ### If open blockers > 0
 
-- Move the draft to `tasks/archive/drafts/` (the draft is consumed either way).
-- Leave the spec in `tasks/2-spec/` with `status: awaiting-approval` unchanged.
-- Output:
+The spec stays in `tasks/2-spec/` with `status: awaiting-approval` unchanged. Output:
 
   ```
   Spec {ID} saved with {N} open blockers in ## Blockers section.
@@ -321,7 +368,6 @@ Stop.
 
 ### If open blockers == 0
 
-- Move the draft to `tasks/archive/drafts/`.
 - Output:
   - Brief spec summary (3-5 sentences)
   - Number of acceptance criteria

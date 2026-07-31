@@ -205,11 +205,14 @@ The sections you own are read by non-technical stakeholders. Use domain language
 4. Commit:
 
    ```
-   git add tasks/2-spec/{ID}-{slug}.md tasks/archive/drafts/{ID}-{slug}.md
+   git add -A -- tasks/2-spec/{ID}-{slug}.md tasks/archive/drafts/{ID}-{slug}.md
+   git add -A -- tasks/1-draft/{ID}-{slug}.md 2>/dev/null || true
    git commit -m "spec-business({ID}): preliminary spec"
    ```
 
-   Run the commit with `run_in_background: true` (the pre-commit review hook can take up to 20 minutes).
+   The second `git add` stages the draft's move as a rename in the case where an earlier `/spec` run had already committed the draft. It stays separate and error-tolerant because the usual path — a draft straight from `/task` — leaves it untracked, and git aborts on a pathspec matching nothing.
+
+   One commit per run, as the last action. Run it with `run_in_background: true` (the pre-commit review hook can take up to 20 minutes).
 
 5. Output:
    - Spec path.

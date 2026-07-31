@@ -166,7 +166,7 @@ Add a new lens by:
    `LENS_APPLICABILITY` in `hook.py`. `LENS_NAMES` is derived from
    the dict, so order is the dict's insertion order.
 
-## Kimi K3 (current primary reviewer)
+## Kimi K2.7 Code (current primary reviewer)
 
 `KimiBackend` is the sole primary reviewer in `config.py` (both
 `PRIMARIES` and `CHUNKED_BACKENDS`). The arbiter and the total-failure
@@ -176,7 +176,9 @@ fallback stay on `claude`/`sonnet`. Requirements to keep it working:
 2. `kimi login` once for OAuth (no API-key env var is documented).
 3. Active Kimi membership subscription is required — Kimi Code is paywalled.
 
-The configured model alias is `kimi-code/k3` (Kimi K3, 1M context), which
+The configured model alias is `kimi-code/kimi-for-coding` (Kimi K2.7 Code,
+256k context — K3 is stronger but too expensive and overkill for routine
+review; the kimi delegation skill still runs K3). The alias
 must match a `[models."…"]` key in `~/.kimi-code/config.toml` — the live
 config. (`~/.kimi/config.toml` is versioned but inert; kimi-code no longer
 reads it, so edits there have no effect.) An unregistered alias fails fast

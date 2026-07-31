@@ -17,8 +17,30 @@ Skip this section on resume runs; jump to Phase 1.5.
 This phase is **mandatory** for new runs and cannot be skipped.
 
 1. Read the draft task carefully.
-2. Explore the project codebase: domain structure, existing behavior related to the draft, top-level architecture (modules/addons layout, conventions for similar features), constraints. **As you discover relevant facts, append them to the draft file under a `## Codebase Observations` section** — file paths, model names, API signatures, existing patterns, gotchas, performance notes. This section accumulates throughout Phase 1 and becomes the persistent knowledge base for all agents.
-3. Compile a list of clarifying questions. Topics to cover:
+2. **Research the codebase — fan out, and research yourself in parallel.** Spawn 2–3 `Spec-Researcher` agents in one batch, record their `agentId`s in the registry, and arm `WATCHDOG_RESEARCH` (`Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_RESEARCH")`). Use 2 angles for a draft inside one module, 3 when it spans modules:
+
+   | `RESEARCH_ANGLE` | Covers |
+   |---|---|
+   | `domain and data model` | entities, fields, states, relationships the draft touches |
+   | `existing behavior and call-sites` | what happens today, who calls it, where the change lands |
+   | `conventions and analogous features` | ≥2 similar features already built, how they are structured and tested |
+
+   Each spawn is `Agent(subagent_type: "Spec-Researcher", name: "researcher-{angle-slug}", run_in_background: true, prompt: "...")` with:
+
+   > Read your instructions: `~/.claude/agents/spec-researcher.md`
+   > RESEARCH_ANGLE: {angle}
+   > Draft path: `{draft path}`
+   > Working directory: `{project root}`
+   > Project CLAUDE.md: `{path}`
+   > Signal `SPEC RESEARCH REPORT [{angle}]` when done.
+
+   **Research yourself while they run** — do not wait idle. Delegating every angle leaves you judging questions from other agents' summaries, and a summary is exactly where an unverified premise slips through unnoticed.
+
+   Reject any report missing its DEPTH block, or carrying observations without `path:line`, and re-request a deeper pass — the same rule the critics get.
+
+3. **Merge into `## Codebase Observations`.** Fold every researcher report and your own findings into the draft's `## Codebase Observations` section via `Edit` — one line per fact, **each carrying `path:line`**. Copy `CONTRADICTIONS` across verbatim: a draft assumption the code disproves outranks anything you were about to ask the user. Then run a **gap check** — name the parts of the draft nobody covered, and spawn one follow-up researcher on any material dark area before moving to questions.
+
+4. Compile a list of clarifying questions. Topics to cover:
    - **Цель**: Какая бизнес-задача решается? Кому и как это поможет?
    - **Границы**: Что явно НЕ входит в задачу? Есть ли смежные фичи, которые трогать не нужно?
    - **Поведение**: Любые неоднозначные сценарии — спроси, не додумывай.
@@ -26,10 +48,10 @@ This phase is **mandatory** for new runs and cannot be skipped.
    - **Приоритет и ограничения**: Есть ли дедлайны, требования к производительности, зависимости от другой работы?
    - **Существующее поведение**: Если драфт меняет существующую функциональность — уточни, что сейчас и что именно должно измениться.
    - **Архитектура и интеграция**: Новый модуль или расширение существующего? Есть ли конвенция для похожих фич? Спрашивай ТОЛЬКО когда ответ не очевиден из кодовой базы.
-4. Ask questions **one at a time** using the defer-aware prompt format below.
-5. **After each answer**, immediately append the decision to the draft file under a `## Decisions` section using `Edit`. Number each decision sequentially. Format: `N. **Short label**: decision text`. This section becomes the authoritative source of user decisions for all agents — inline prompt text is supplementary.
-6. After each answer, if it reveals new ambiguities, add follow-up questions to the queue. Continue until no questions remain — ask as many as genuinely matter, no padding to a count.
-7. When the queue is empty the draft is finished — commit it once, as commit 1 of `## Commits`. The `Edit` in step 5 is what persists each answer; the single commit lands them all as one history entry.
+5. Ask questions **one at a time** using the defer-aware prompt format below. Every question passes the gate first.
+6. **After each answer**, immediately append the decision to the draft file under a `## Decisions` section using `Edit`. Number each decision sequentially. Format: `N. **Short label**: decision text`. This section becomes the authoritative source of user decisions for all agents — inline prompt text is supplementary.
+7. After each answer, if it reveals new ambiguities, add follow-up questions to the queue. Continue until no questions remain — ask as many as genuinely matter, no padding to a count.
+8. When the queue is empty the draft is finished — commit it once, as commit 1 of `## Commits`. The `Edit` in step 6 is what persists each answer; the single commit lands them all as one history entry.
 
 **Rules for this phase:**
 - Frame questions in business/domain terms, except architectural topics which are technical by nature.
@@ -39,10 +61,26 @@ This phase is **mandatory** for new runs and cannot be skipped.
 
 ## Before any question — the gate
 
-1. Dig the code first. Find the answer where it lives — models, call-sites, existing conventions — before forming a question.
-2. Resolve it yourself when you can. A purely technical point the code answers, or an obvious yes (e.g. "should I do the task at all?"), needs no question — decide and record it as context.
-3. Ask only genuine decisions — ones with downstream consequences where a wrong guess causes rework. When unsure which kind it is, ask: a 30-second question beats a silent wrong default.
-4. Ask as many as genuinely matter — never pad to a count.
+Run these five steps on **each** candidate question before it reaches the user. Phase 1 research tells you what the codebase contains; the gate confirms that *this specific question* is worth asking and correctly posed.
+
+1. **Locate.** Grep for where the answer would live — models, call-sites, existing conventions.
+2. **Verify the premise.** Confirm that everything the question presupposes actually exists. "Should X replace Y?" is void when `Y` does not exist. Cite what you found.
+3. **Verify your understanding.** State in one line what the code does today, with `path:line`. Being unable to state it means you are not ready to ask — go back to step 1.
+4. **Re-judge the question.** Three outcomes:
+   - The code answers it → resolve it yourself, record it in `## Codebase Observations` as context, and drop the question.
+   - The premise was wrong → rewrite the question against what the code actually does, or drop it. When the draft itself carried the wrong premise, tell the user that finding instead — it is worth more than the question was.
+   - It is a genuine decision, with downstream consequences where a wrong guess causes rework → ask it, carrying the evidence into the question's context slot.
+5. **Evidence requirement.** Every question you put to the user carries either ≥1 `path:line` citation, or an explicit "nothing in the codebase covers this — greped X, Y, Z". A question with neither is not ready.
+
+Ask as many as genuinely matter — never pad to a count, and never trim a real decision to look efficient. When you are unsure whether something is a genuine decision, ask: a 30-second question beats a silent wrong default.
+
+**Scope.** The gate applies to every question in every phase — Phase 1, Phase 1.5 blocker re-asks, agent escalations, and Phase 3.
+
+<bad_pattern>
+❌ BAD THOUGHT: "I broadly get what this module does — I'll ask the user and pick up the details from their answer."
+✅ REALITY: A question built on an unverified premise teaches the user nothing and costs a round trip. Worse, they answer it as posed — and now the wrong premise is a numbered Decision that every downstream agent treats as authoritative.
+⚠️ DETECTION: About to ask a question with no `path:line` in its context and no explicit "not in the codebase" note? → research it first.
+</bad_pattern>
 
 **Language.** Run the QA session in Russian — questions, options, and the +/− trade-offs the user reads and answers. Everything that persists is English — spec sections, plan, code, commit messages, and recorded Decisions/Blockers (translate the gist of the user's Russian answer).
 
@@ -107,7 +145,8 @@ When a blocker is later resolved, update the same entry in place:
 3. Announce: "Resuming spec {ID}. {N} open blockers from previous runs. I'll go through them — you can answer or defer again."
 4. For each open blocker, in order:
    - Print the stored `topic`, `question`, `context`, `expertise-needed`, and `deferred-history`.
-   - Ask the user using the defer-aware prompt format (reuse the stored context in the prompt, don't re-explore).
+   - **Re-verify the stored premise before re-asking.** One cheap grep: does everything the blocker references still exist under that name? A blocker recorded weeks ago may name a model that has since been renamed or deleted, and re-asking it verbatim wastes the user's answer. When the premise still holds, reuse the stored context as-is — this is a premise check, not a fresh exploration. When it no longer holds, rewrite the question against current code and note the change in `deferred-history`.
+   - Ask the user using the defer-aware prompt format.
    - On answer: update the blocker entry (status → `resolved-by-user`, append deferred-history line, fill resolution). Remember which agent to re-invoke based on who raised the blocker and the expertise-needed tag (`business` → Analyst, `architecture` → Architect, sometimes both).
    - On defer: append a new `deferred-history` line `{TODAY}: deferred again`. Keep `status: open`. Move to the next.
 5. Build a set of affected agents from the resolved blockers. If zero blockers got resolved, tell the user "No blockers were resolved this run. Spec unchanged; come back later." and stop.
@@ -122,7 +161,9 @@ Record the `agentId` from every spawn into a small registry (`name | agentId | r
 
 **Addressing:** running agent → `SendMessage(to: "spec-analyst")`; completed agent → `SendMessage(to: "{agentId}")`. The completion notification is your done signal — do not poll for it.
 
-**Liveness:** a dead agent sends no completion notification and nothing else wakes you. Follow `~/.claude/templates/liveness-protocol.md`: arm a dead-man timer per phase (`Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_ANALYST")` — likewise `WATCHDOG_ARCHITECT`, `WATCHDOG_CRITICS`), audit on every wake-up, recover via ping-by-`agentId` first, respawn as escalation.
+**Liveness:** a dead agent sends no completion notification and nothing else wakes you. Follow `~/.claude/templates/liveness-protocol.md`: arm a dead-man timer per phase (`Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_ANALYST")` — likewise `WATCHDOG_RESEARCH`, `WATCHDOG_ARCHITECT`, `WATCHDOG_CRITICS`), audit on every wake-up, recover via ping-by-`agentId` first, respawn as escalation.
+
+The Phase 1 researchers are background agents too: the registry, the addressing rules, and the liveness protocol above cover them under `WATCHDOG_RESEARCH`.
 
 Shared context to pass in every agent prompt:
 - Draft path (or existing spec path on resume) — **instruct agents to read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified facts about the codebase) from the draft file. These two sections are the persistent source of truth — inline prompt context is supplementary.**
@@ -292,6 +333,8 @@ Tag each question as **user-required** or **auto-resolvable**:
 **Rule of doubt:** if you are not sure which category, ask the user. A 30-second question is cheaper than a wrong default that surfaces during `/implement`. Per the project's requirement, no silent auto-resolution: even when you pick a safe default for an auto-resolvable question, present it to the user as one option among others and let them accept or override.
 
 ### Ask
+
+Every question passes **the gate** (§ *Before any question*) first — including the ones that arrived from a critic. These need it most: they come from another agent's summary rather than from code you read yourself, so their premises are the least verified in the run. Verify the premise against the codebase before putting a critic's question to the user.
 
 Use the defer-aware prompt format, one question at a time. Each question carries the full context: what was found in the code, what the spec says, why this question matters.
 

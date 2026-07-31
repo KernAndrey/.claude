@@ -28,7 +28,7 @@ code-reviewer | a5d6-...     | Code-Reviewer         | —
 kimi-code     | a7e8-...     | Kimi-Mirror (code)    | —
 ```
 
-Append a row immediately after each spawn. This table is how you reach completed agents in later phases. In Phase 2 each dimension has **two** rows — the native reviewer and its Kimi mirror — so the table roughly doubles.
+Append a row immediately after each spawn. This table is how you reach completed agents in later phases. In Phase 2 each fixed dimension has **two** rows — the native reviewer and its Kimi mirror — plus one row per adaptive lens, so the table roughly doubles.
 
 ### Liveness protocol
 
@@ -137,13 +137,15 @@ If the Tester reports `PRODUCTION BUG FOUND`:
 
 ---
 
-### Phase 2: Review (dual-track — native Claude reviewers + Kimi mirrors)
+### Phase 2: Review (fixed dimensions + Kimi mirrors + adaptive lenses)
 
-Say: **"Code and tests are done. Spawning the reviewers in parallel — each dimension gets a native Claude reviewer AND a Kimi mirror running the same procedure, for two independent passes. I will wait for all reports before proceeding."**
+Say: **"Code and tests are done. Spawning the reviewers in parallel — each fixed dimension gets a native Claude reviewer AND a Kimi mirror running the same procedure, plus the adaptive lenses I designed for this diff. I will wait for all reports before proceeding."**
 
 This phase runs after Phase 1 regardless of time spent or code quality. All reviewers must report. Hooks, automated linters, CI checks, or prior review rounds do not substitute for Phase 2.
 
 **Two engines per dimension.** For every native reviewer below except the UI-Reviewer, you also spawn a `Kimi-Mirror` that runs the *same* audit procedure on the Kimi CLI. Two independent passes catch more than one — "ревью много не бывает". The UI-Reviewer has no Kimi mirror (Kimi cannot drive a browser).
+
+**Plus angles only this diff needs.** The fixed dimensions are the ones every change gets. Design 2–4 more for this one (see *Adaptive lens design* below).
 
 **Start only after Phase 1b is complete.**
 
@@ -156,11 +158,22 @@ Check the changed files list from the Coders. If ANY file matches a frontend pat
 
 If all changes are purely backend (`.py`, `.sql`, config `.json`) — skip UI-Reviewer.
 
+#### Adaptive lens design (think before you spawn)
+
+The five dimensions below are what every change gets. What they cannot cover is the angle *this* diff needs — that depends on what the code actually does, and it is yours to work out.
+
+1. **Read the diff and the spec's Behavior first.** You cannot name the right angle for a change you have not looked at.
+2. **Choose 2–4 lenses**, scaled by the diff: 2 for a single-file change, 4 when it spans modules or touches data migration, concurrent access, permissions, or external integrations.
+3. **Write each lens** as four fields — `lens-id`, `angle` (the stance in one line), `justification` (why *this* diff needs it, citing a concrete `file:line` or spec behavior), `hunt` (the failure classes it should surface).
+4. **Prefer system-level angles.** Non-exhaustive seeds: tester's eyes, attacker's eyes, existing production data, concurrent actions, operations and observability, performance at real scale, permissions and multi-tenancy, failure and rollback. Do not restate a fixed dimension — a long method belongs to Code-Reviewer, a missing test to Test-Reviewer, spec drift to Spec-Auditor, a plain injection bug to Security-Reviewer.
+5. **Announce** the chosen lenses with one line of rationale each, then spawn. This is your call — do not wait for approval.
+
 #### Reviewer list
 
-Each row is a **pair**: the native Claude reviewer and its Kimi mirror. The mirror is always the
+Each fixed row is a **pair**: the native Claude reviewer and its Kimi mirror. The mirror is always the
 `Kimi-Mirror` subagent_type; what differs per row is its `name`, its `PURPOSE`, and the `MIRROR_OF`
-native file it re-runs.
+native file it re-runs. Adaptive lenses run on Claude only — the payoff is a new angle, not a second
+engine on an angle already covered.
 
 | Dimension | Native subagent_type | Native name | Kimi-Mirror name | Kimi `MIRROR_OF` / `PURPOSE` |
 |---|---|---|---|---|
@@ -169,6 +182,7 @@ native file it re-runs.
 | spec compliance | `Spec-Auditor` | `spec-auditor` | `kimi-spec-audit` | `~/.claude/agents/spec-auditor.md` / `review-spec-audit` |
 | security and architecture | `Security-Reviewer` | `security-reviewer` | `kimi-security` | `~/.claude/agents/security-reviewer.md` / `review-security` |
 | visual verification *(only if frontend files changed)* | `UI-Reviewer` | `ui-reviewer` | — *(no Kimi mirror — browser)* | — |
+| *this diff's angle* — one row per lens from *Adaptive lens design* | `Adaptive-Reviewer` | `adaptive-{lens-id}` | — *(no Kimi mirror — by design)* | — |
 
 #### Spawn reviewers in parallel
 
@@ -208,9 +222,29 @@ Mirror the native procedure exactly and relay Kimi's report verbatim, with ` (Ki
 )
 ```
 
-Arm the phase watchdog: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_REVIEW")`.
+Each **adaptive lens** spawn (one per lens from *Adaptive lens design*) uses:
 
-**Kimi concurrency.** The mirrors each fire a background Kimi run; 4 at once may exceed Kimi's rate cap (`rc=429`). `~/.claude/templates/kimi-reviewer.md` already waits for the next quota window and re-fires, so the mirrors simply serialize — this is non-blocking, not a failure. Do not cancel a mirror for being slow; the watchdog covers genuine stalls.
+```
+Agent(
+  subagent_type: "Adaptive-Reviewer",
+  name: "adaptive-{lens-id}",
+  run_in_background: true,
+  prompt: "Read your instructions: ~/.claude/agents/adaptive-reviewer.md
+LENS_ID: {lens-id}
+LENS_ANGLE: {angle}
+LENS_JUSTIFICATION: {why this diff needs it}
+LENS_HUNT: {failure classes to surface}
+Spec file: {spec_path}
+Working directory: {worktree_path}
+Base branch for diff: {base_branch}
+Review prompts: if `.claude/review_prompt.md` exists, read it and apply its rules.
+Report in the format from your agent file."
+)
+```
+
+Arm the phase watchdog: `Bash(run_in_background: true, command: "sleep 1500; echo WATCHDOG_REVIEW")`. The adaptive rows push this batch past the concurrency cap, so later spawns queue for slots — a 900s timer over the whole batch fires on healthy-but-queued agents, and the respawns it triggers make the contention worse.
+
+**Kimi concurrency.** The mirrors each fire a background Kimi run; 4 at once may exceed Kimi's rate cap (`rc=429`). `~/.claude/templates/kimi-reviewer.md` already waits for the next quota window and re-fires, so the mirrors simply serialize — this is non-blocking, not a failure. Do not cancel a mirror for being slow; the watchdog covers genuine stalls. The adaptive lenses add no Kimi load — they run on Claude only — so this cap analysis still holds at 4 mirrors; what they do add is Claude-side slot contention, which is what the raised `WATCHDOG_REVIEW` above accounts for.
 
 UI-Reviewer gets two extra lines in its prompt (no Kimi mirror for it):
 
@@ -238,11 +272,11 @@ Mirror reports are identical in format but carry ` (Kimi)` in the `REVIEWER:` li
 
 #### Merge the two passes per dimension
 
-You now hold up to **two** reports per dimension — the native pass and its Kimi mirror. Merge them before acting:
+You now hold up to **two** reports per fixed dimension — the native pass and its Kimi mirror — plus one report per adaptive lens. Merge them all before acting:
 
-- **Dedup**: same `file:line` + same issue class = **one** finding. Keep the more specific description.
-- **Union of severity**: a `MUST FIX` / `CRITICAL` raised by *either* engine counts — one pass missing it does not downgrade it. The merged MUST FIX / CRITICAL set feeds a **single** fix round in Phase 3.
-- **Divergence is signal, not noise**: if one engine flags something the other missed, keep it. That extra catch is the whole point of running two.
+- **Dedup**: same `file:line` + same issue class = **one** finding. Keep the more specific description. Dedup across adaptive lenses and fixed dimensions too, not only within a pair.
+- **Union of severity**: a `MUST FIX` / `CRITICAL` raised by *any* source counts — one pass missing it does not downgrade it. The merged MUST FIX / CRITICAL set feeds a **single** fix round in Phase 3.
+- **Divergence is signal, not noise**: if one source flags something the others missed, keep it. That extra catch is the whole point of running more than one.
 
 #### UI-Reviewer troubleshooting
 
@@ -251,7 +285,7 @@ If UI-Reviewer reports `VERDICT: BLOCKED` (cannot start dev server, browser unav
 - Retry up to **3 times**, each with a different hint.
 - After 3 failed attempts: document the reason in Known Concerns, add a manual UI check to Steps for Manual Review, and continue.
 
-**Phase 2 is complete when every spawned agent — each native reviewer AND each Kimi mirror — has reported with a valid DEPTH block.**
+**Phase 2 is complete when every spawned agent — each native reviewer, each Kimi mirror, and each adaptive lens — has reported with a valid DEPTH block.**
 
 ---
 
@@ -266,6 +300,7 @@ Precondition: All spawned Phase 2 reviewers must have reported.
 Work from the **merged, deduped** findings (Phase 2 "Merge the two passes"). A `(Kimi)` mirror report routes to the same bucket as its native — `Security-Reviewer (Kimi)` → Coder fixes, `Test-Reviewer (Kimi)` → Tester fixes, etc. Build two fix lists:
 - **Coder fixes**: `MUST FIX` / `CRITICAL` findings from Code-Reviewer, Spec-Auditor, Security-Reviewer, UI-Reviewer — and their Kimi mirrors
 - **Tester fixes**: `MUST FIX` findings from Test-Reviewer, missing coverage from Spec-Auditor — and their Kimi mirrors
+- **Adaptive lens findings** join whichever list matches the fix: a production-code failure goes to the Coder, an untested path to the Tester. Route by what the fix touches, not by which lens raised it.
 
 If zero `MUST FIX` / `CRITICAL` across all reviewers (native and mirror) — skip to Finalization.
 
@@ -289,7 +324,7 @@ Fix rounds await agent messages like any phase — arm `Bash(run_in_background: 
 
 #### Step 3: Verification (re-review)
 
-Resume — by `agentId` — every reviewer **and every Kimi mirror** that had `MUST FIX` or `CRITICAL` findings (a resumed native remembers its findings via preserved context; a resumed mirror fires a fresh Kimi re-review run per `kimi-mirror.md` §Re-review). If a finding was raised by only one engine of a pair, re-reviewing that one engine is enough — but if both flagged the dimension, re-review both:
+Resume — by `agentId` — every reviewer, **every Kimi mirror, and every adaptive lens** that had `MUST FIX` or `CRITICAL` findings (a resumed native or adaptive lens remembers its findings via preserved context; a resumed mirror fires a fresh Kimi re-review run per `kimi-mirror.md` §Re-review). An adaptive lens verifies its own findings — nobody else holds that angle. If a finding was raised by only one engine of a pair, re-reviewing that one engine is enough — but if both flagged the dimension, re-review both:
 
 > This is a **re-review** after fixes.
 >

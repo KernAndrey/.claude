@@ -119,7 +119,7 @@ Each blocker is a level-3 heading inside the spec's `## Blockers` section. Gener
 ```markdown
 ### b-N — <short title summarizing the question>
 - **status**: open
-- **raised-by**: lead (Phase 1 / Phase 3) | spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise
+- **raised-by**: lead (Phase 1 / Phase 3) | spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise | spec-critic-adaptive:{lens-id}
 - **raised-on**: {TODAY}
 - **expertise-needed**: business | architecture | testing | security | ux | unknown
 - **context**: <what was found in the code or spec, what's ambiguous, what each option would imply>
@@ -161,7 +161,7 @@ Record the `agentId` from every spawn into a small registry (`name | agentId | r
 
 **Addressing:** running agent → `SendMessage(to: "spec-analyst")`; completed agent → `SendMessage(to: "{agentId}")`. The completion notification is your done signal — do not poll for it.
 
-**Liveness:** a dead agent sends no completion notification and nothing else wakes you. Follow `~/.claude/templates/liveness-protocol.md`: arm a dead-man timer per phase (`Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_ANALYST")` — likewise `WATCHDOG_RESEARCH`, `WATCHDOG_ARCHITECT`, `WATCHDOG_CRITICS`), audit on every wake-up, recover via ping-by-`agentId` first, respawn as escalation.
+**Liveness:** a dead agent sends no completion notification and nothing else wakes you. Follow `~/.claude/templates/liveness-protocol.md`: arm a dead-man timer per phase (`Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_ANALYST")` — likewise `WATCHDOG_RESEARCH`, `WATCHDOG_ARCHITECT`, `WATCHDOG_CRITICS`, and `WATCHDOG_ADAPTIVE`), audit on every wake-up, recover via ping-by-`agentId` first, respawn as escalation.
 
 The Phase 1 researchers are background agents too: the registry, the addressing rules, and the liveness protocol above cover them under `WATCHDOG_RESEARCH`.
 
@@ -215,13 +215,36 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 
 **Message loop:** same shape as 2a, but with `spec-architect` and the Architect signal names.
 
-### 2c. Critics (three critics + three Kimi mirrors, in parallel)
+### 2c. Critics (3 fixed + 3 Kimi mirrors + 3–5 adaptive lenses, in parallel)
 
-Each critic runs on **two engines**: the native Claude critic AND a `Kimi-Mirror` running the same lens pass on the Kimi CLI — two independent passes per critic, "ревью много не бывает". Spawn all **six** as background agents in one batch (six `Agent` calls in a single response). They run in parallel — no dependencies. Record all six `agentId`s (three critics + three mirrors).
+Each fixed critic runs on **two engines**: the native Claude critic AND a `Kimi-Mirror` running the same lens pass on the Kimi CLI — two independent passes per critic, "ревью много не бывает". On top of those six, you design **3–5 adaptive lenses** for this specific spec (2c-0) and spawn one critic per lens.
 
-Arm one watchdog for the whole batch — critics and mirrors: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")`.
+Spawn everything — fixed critics, mirrors, and adaptive lenses — as background agents in **one batch** (all `Agent` calls in a single response). They run in parallel; there are no dependencies. Record every `agentId`.
 
-The three native critic spawns are 2c-i / 2c-ii / 2c-iii below. Each also gets a mirror via the template in **2c-iv**.
+Arm two watchdogs: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")` for the six fixed agents, and `Bash(run_in_background: true, command: "sleep 1500; echo WATCHDOG_ADAPTIVE")` for the adaptive ones. The batch now exceeds the concurrency cap, so the later spawns queue for slots — a single 900s timer over the whole batch fires on healthy-but-queued agents, and the respawns it triggers make the contention worse.
+
+The three native critic spawns are 2c-i / 2c-ii / 2c-iii below; each gets a mirror via the template in **2c-iv**; the adaptive lenses spawn via **2c-v**.
+
+#### 2c-0. Lens design (think before you spawn)
+
+The three fixed critics read the spec as a document. What they cannot do is cover the angle *this* spec needs — that depends on its domain, size, and complexity, and it is yours to work out. On the spec that motivated this phase, four self-designed angles found more than all the fixed passes combined, because they looked at the system rather than the text: through a tester's eyes, through an attacker's eyes, against existing production data, and against concurrent actions.
+
+1. **Read the fixed lens inventories** in `~/.claude/agents/spec-critic-{arch,business,premise}.md`. You are designing angles they do not cover, so you need to know what they do: arch Lens C already simulates state transitions and Lens D already covers data consistency after migration. Restating one of those spends a slot on covered ground.
+2. **Choose how many** — 3 for ≤5 ACs in a single module; 4 for 6–15 ACs; 5 for >15 ACs, or multi-module, or anything touching data migration, concurrent access, or external integrations.
+3. **Write each lens** as four fields:
+   - `lens-id` — short slug, e.g. `concurrent-actions`
+   - `angle` — the stance, in one line
+   - `justification` — why this spec needs it, **citing something concrete in the spec**: an AC number, a file path, a named state transition, a model name
+   - `hunt` — the failure classes this angle should surface
+4. **Prefer system-level angles over text-level ones.** Non-exhaustive seeds: tester's eyes, attacker's eyes, existing production data, concurrent actions, operations and observability, performance at real scale, permissions and multi-tenancy, failure and rollback, cost. Treat this as a starting point, not a menu — **at least one lens must be specific to this spec's domain and appear on no list.** The justification citation is what separates a designed angle from a picked one.
+5. **Announce** the chosen lenses to the user with one line of rationale each, then proceed. This is your call to make — do not wait for approval.
+6. **Record them** in the spec's `## Review Lenses` section via `Edit`, before spawning — appending your entries below the section's italic *"Review metadata — not requirements"* line and leaving that line in place, since it is what keeps `Spec-Auditor` from tracing lenses to code during `/implement`. The briefs otherwise live only in a spawn prompt, and a resume run would lose them.
+
+<bad_pattern>
+❌ BAD THOUGHT: "Architecture, business, premise — that's every angle there is. Spawn the batch."
+✅ REALITY: Those three are the angles every spec gets. The ones that pay for themselves are the ones only this spec needs, and nobody but you is positioned to name them.
+⚠️ DETECTION: About to spawn the critic batch with no `## Review Lenses` block in the spec? → design the lenses first.
+</bad_pattern>
 
 #### 2c-i. Architecture Critic
 
@@ -289,15 +312,43 @@ Mirror the native critic's lens pass exactly and relay Kimi's report verbatim, w
 )
 ```
 
-**Message loops:** run all three critics — and their mirrors — in parallel. The critics rarely escalate; if any (native or mirror) does, handle like any other `QUESTION FOR USER`. A mirror returning `KIMI_SUSPICIOUS` / `KIMI_FAILED` instead of a report is re-run per `kimi-mirror.md`.
+#### 2c-v. Adaptive lens critics (one per lens from 2c-0)
 
-Wait for all three critics **and all three mirrors** to complete before proceeding.
+In the same batch, spawn one `Spec-Critic-Adaptive` per lens designed in 2c-0. These run on Claude only — no Kimi mirrors. The payoff comes from a *new angle*, not a second engine on an angle already covered, and the batch is already at the concurrency cap.
+
+```
+Agent(
+  subagent_type: "Spec-Critic-Adaptive",
+  name: "adaptive-{lens-id}",
+  run_in_background: true,
+  prompt: "Read your instructions: ~/.claude/agents/spec-critic-adaptive.md
+LENS_ID: {lens-id}
+LENS_ANGLE: {angle}
+LENS_JUSTIFICATION: {why this spec needs it}
+LENS_HUNT: {failure classes to surface}
+Spec path: tasks/2-spec/{ID}-{slug}.md
+Draft path: {draft path} — read `## Decisions` and `## Codebase Observations` for the verified ground.
+Working directory: {project root}
+Phase 1 context: {inline user answers and Lead observations}
+Project CLAUDE.md: {path}
+{On resume:} RESUMED_RUN: true
+Run your lens pass. Signal `SPEC ADAPTIVE CRITIC REPORT [{lens-id}]` when done."
+)
+```
+
+**Message loops:** run the fixed critics, their mirrors, and the adaptive lenses in parallel. Critics rarely escalate; if any (native, mirror, or adaptive) does, handle it like any other `QUESTION FOR USER`. A mirror returning `KIMI_SUSPICIOUS` / `KIMI_FAILED` instead of a report is re-run per `kimi-mirror.md`. An adaptive report missing its DEPTH or VERIFIED OK block is rejected and re-requested, same as any critic report.
+
+Wait for **every** agent in the batch — three critics, three mirrors, and all adaptive lenses — to complete before proceeding.
 
 ### 2d. Apply findings
 
-You now hold **six** reports — three native critics and their three Kimi mirrors. Merge them: first fold each mirror into its native pair (arch native + `kimi-critic-arch`, business + `kimi-critic-business`, premise + `kimi-critic-premise`), then merge across critics. **Dedup** — findings that flag the same issue (within a pair or across critics) collapse to one, keeping the more specific description. **Union of severity** — a finding raised by *either* engine counts; a mirror-only catch is still a catch. This includes `EMERGENT QUESTIONS FOR USER` from all sources (native and mirror) — they all feed into Phase 3. The premise mirror's questions dedup against the native premise critic's before Phase 3.
+You now hold three native critic reports, their three Kimi mirrors, and one report per adaptive lens. Merge them: first fold each mirror into its native pair (arch native + `kimi-critic-arch`, business + `kimi-critic-business`, premise + `kimi-critic-premise`), then merge across all reports including the adaptive ones. **Dedup** — findings that flag the same issue (within a pair, across critics, or between a fixed critic and an adaptive lens) collapse to one, keeping the more specific description. **Union of severity** — a finding raised by *any* source counts; a mirror-only or lens-only catch is still a catch. This includes `EMERGENT QUESTIONS FOR USER` from every source — they all feed into Phase 3. The premise mirror's questions dedup against the native premise critic's before Phase 3.
+
+Adaptive findings carry the same `route:` tags and flow through the fix rounds below exactly like critic findings. Where an adaptive lens and a fixed critic disagree, keep both and let the fix round resolve it — divergence is signal.
 
 The premise critic is different in kind: it challenges decisions, not implementation. Its findings are mostly `route: user` and feed **Phase 3** directly — they are not applied through the analyst/architect fix loop below, because only the user can re-decide a decision. The one exception is a premise finding with `route: analyst` (an assumption factually contradicted by code), which joins the analyst fix round. The premise critic gets **no re-check** pass.
+
+The adaptive lenses also get **no re-check** pass. Their findings route to Analyst and Architect normally and land inside the existing 2-fix-round cap; re-checking each lens as well would multiply the rounds without adding coverage.
 
 The Analyst, Architect, and both consistency Critics (arch, business) have completed by now — resume each **by its `agentId`** (not by name). Their preserved context means they remember their prior work.
 
@@ -321,7 +372,7 @@ Many open questions only become visible after Analyst describes behavior, Archit
 Gather from:
 - `Edge Cases & Risks` — table rows with `Status: OPEN` that still need clarification
 - `Architecture & Implementation Plan → Open architectural questions`
-- All three critics' `EMERGENT QUESTIONS FOR USER` (arch, business, premise; each carries an expertise tag). The premise critic's questions challenge decisions the user already made — present them as genuine reconsiderations, not as gaps.
+- Every critic's `EMERGENT QUESTIONS FOR USER` — the three fixed ones (arch, business, premise), their mirrors, and each adaptive lens; each carries an expertise tag. The premise critic's questions challenge decisions the user already made — present them as genuine reconsiderations, not as gaps. An adaptive lens's questions carry its `lens-id`, so the user can see which angle raised them.
 
 ### Classify
 

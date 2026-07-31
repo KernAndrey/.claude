@@ -354,7 +354,7 @@ hint needs no Change Control entry.
 
      ### b-N — <short title>
      - **status**: open | resolved-by-user
-     - **raised-by**: spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise | lead (Phase 1 / Phase 3)
+     - **raised-by**: spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise | spec-critic-adaptive:{lens-id} | lead (Phase 1 / Phase 3)
      - **raised-on**: YYYY-MM-DD
      - **expertise-needed**: business | architecture | testing | security | ux | unknown
      - **context**: <what was found, what's ambiguous>
@@ -363,4 +363,23 @@ hint needs no Change Control entry.
      - **deferred-history**:
        - YYYY-MM-DD: deferred by user, note "<who should answer>"
      - **resolution**: <empty while open; filled on answer>
+-->
+
+## Review Lenses
+
+*Review metadata — not requirements. Nothing in this section is implemented or traced to code.*
+
+<!-- Keep the italic marker line above when filling this section — it is what tells
+     Spec-Auditor to skip these entries during /implement.
+
+     Filled by Lead in /spec §2c-0 before the critic batch spawns: the angles it
+     designed for this specific spec, on top of the three fixed critics. Recorded
+     here so a resume run can re-run or extend them instead of losing them.
+
+     Entry format:
+
+     ### {lens-id}
+     - **angle**: <the stance, one line>
+     - **justification**: <why this spec needs it, citing an AC / file / state / model>
+     - **hunt**: <failure classes this angle should surface>
 -->

@@ -17,14 +17,14 @@ Thoroughness over speed. A single kimi run takes 20–60 minutes (longer for big
 
 ## Setup
 
-1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
-2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`. `$ARGUMENTS` is just the task identifier.
+1. Read `.tasks.toml`, `CLAUDE.md`, and project structure. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory.
+2. Find the spec by `$ARGUMENTS` (ID or slug) in `{dir}/3-ready/`. `$ARGUMENTS` is just the task identifier.
 3. Read the full specification.
 4. Branch and worktree setup:
    - If `auto_branch = true`: fetch latest `dev` (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All kimi runs and reviewers operate inside the worktree.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root.
 5. **Review prompt setup:** if the project has `.claude/review_prompt.md`, reviewers will apply it as project-specific rules. Note its path to pass to reviewers.
-6. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
+6. Move spec to `{dir}/4-in-progress/`. Update `status: in-progress`.
 7. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers need it.
 8. **Scan project rules** (run inside `{worktree_path}`): `ls .claude/rules/*.md 2>/dev/null` and remember the filename list. You will match these against each kimi scope below. If the directory is empty/missing, note "no project rules directory" — `build_context.py` will still inject `CLAUDE.md`.
 9. **Detect project type** for rule heuristics: presence of `__manifest__.py` anywhere → Odoo project; `package.json` with `react`/`vue`/`svelte` → frontend project; etc. Used in the rule-matching table below.
@@ -107,7 +107,7 @@ On spawn, record `{purpose, log_path, bash_shell_id, spawned_at, strikes: 0, ret
    - `rc=139` (SIGSEGV) → respawn once; if it segfaults again, escalate to user with the `~/.kimi/logs/kimi.log` reference.
    - Other `rc≠0` → respawn with a sharper prompt.
 
-6. Retry budget — max 3 respawns per scope. After 3, escalate to user: "kimi failed/stalled 3× on {scope}. (A) lead writes manually, (B) abort task back to `tasks/3-ready/`."
+6. Retry budget — max 3 respawns per scope. After 3, escalate to user: "kimi failed/stalled 3× on {scope}. (A) lead writes manually, (B) abort task back to `{dir}/3-ready/`."
 
 7. Loopers — if successive respawns hit the same error, the prompt is wrong. Re-read the spec section, possibly split the scope, then respawn with a different framing.
 
@@ -121,7 +121,7 @@ The spec's `## Architecture & Implementation Plan → Work breakdown → Coders`
 
 ### Sanity check (lead, ~30 seconds)
 
-Same as `/implement`: union of `files:` lists matches "Files to create/modify"? Paths real? Scopes coherent? If broken — stop, report, ask whether to (a) patch the breakdown manually, or (b) send the spec back to `tasks/2-spec/`. If (b): move the spec back, reset `status: awaiting-approval`, and remove the worktree (no reviewers spawned yet at this phase).
+Same as `/implement`: union of `files:` lists matches "Files to create/modify"? Paths real? Scopes coherent? If broken — stop, report, ask whether to (a) patch the breakdown manually, or (b) send the spec back to `{dir}/2-spec/`. If (b): move the spec back, reset `status: awaiting-approval`, and remove the worktree (no reviewers spawned yet at this phase).
 
 ### Fire kimi runs from the breakdown
 
@@ -434,7 +434,7 @@ After 7 iterations with findings unresolved:
 - Lead takes over: read, diagnose, fix directly.
 - If lead cannot fix — ask user: "These findings remain after 7 fix rounds and my own attempt. Options:
   (A) Continue to manual review — remaining issues documented in Known Concerns.
-  (B) Abort — return spec to `tasks/3-ready/` with findings attached as implementation notes."
+  (B) Abort — return spec to `{dir}/3-ready/` with findings attached as implementation notes."
 - If (B): revert worktree changes, move spec back.
 
 ## Finalization (Lead)
@@ -472,7 +472,7 @@ Run inside the worktree directory when `auto_branch = true`:
    - `status: review`, `completed: {TODAY}`, `updated: {TODAY}`
    - `branch: task/{ID}-{slug}` (if `auto_branch = true`; otherwise current branch)
 
-3. Move file from `tasks/4-in-progress/` to `tasks/5-review/`.
+3. Move file from `{dir}/4-in-progress/` to `{dir}/5-review/`.
 
 4. Commit via the `commit` skill — mandatory. Invoke `Skill` with `skill: commit` for every commit; never call raw `git commit`. The skill owns: security scan, test-coverage preflight, pre-commit hooks (gitleaks/semgrep), AI-review handling, post-commit WARNINGs review, and the 3000-line diff cap.
 

@@ -2,8 +2,12 @@ Create a task draft from the description below.
 
 ## Instructions
 
-1. Read `.tasks.toml` in project root. Get `id_prefix`, `dir`, and `counter_file`. If `.tasks.toml` is missing, tell the user to run `/task-init` first and stop.
-2. Read the counter from `counter_file` (default: `tasks/.counter`), increment by 1, save back.
+1. Locate the SDD config and read `id_prefix`, `dir`, and `counter_file` from it:
+   - Look for `.tasks.toml` at the project root and one or two levels deep (`*/.tasks.toml`, `*/*/.tasks.toml`) — a repo may carry several SDD roots, e.g. one per client.
+   - One config → use it. Several → pick the one whose `id_prefix` matches the task ID in the request; with no ID given, pick the config whose directory contains the code being changed. A project rule naming the choice wins over both.
+   - Paths inside a config resolve relative to that config's own directory: `dir = "tasks"` in `clients/acme/.tasks.toml` means the board lives at `clients/acme/tasks/`.
+   - No `.tasks.toml` anywhere → tell the user to run `/task-init` first and stop.
+2. Read the counter from `counter_file` (default: `{dir}/.counter`), increment by 1, save back.
 3. Generate ID: `{id_prefix}-{counter:03d}` (e.g. `TMS-042`).
 4. Generate a slug from the description (kebab-case, max 5 words, ASCII only).
 5. Copy template from `~/.claude/templates/sdd/draft.md`. If `.claude/templates/draft.md` exists in the project, use that instead (project override).

@@ -2,7 +2,11 @@ Decompose a big idea into multiple draft tasks.
 
 ## Instructions
 
-1. Read `.tasks.toml` in project root. Get `id_prefix`, `dir`, and `counter_file`. If `.tasks.toml` is missing, tell the user to run `/task-init` first and stop.
+1. Locate the SDD config and read `id_prefix`, `dir`, and `counter_file` from it:
+   - Look for `.tasks.toml` at the project root and one or two levels deep (`*/.tasks.toml`, `*/*/.tasks.toml`) — a repo may carry several SDD roots, e.g. one per client.
+   - One config → use it. Several → pick the one whose `id_prefix` matches the task ID in the request; with no ID given, pick the config whose directory contains the code being changed. A project rule naming the choice wins over both.
+   - Paths inside a config resolve relative to that config's own directory: `dir = "tasks"` in `clients/acme/.tasks.toml` means the board lives at `clients/acme/tasks/`.
+   - No `.tasks.toml` anywhere → tell the user to run `/task-init` first and stop.
 2. Parse `$ARGUMENTS`:
    - If it looks like a file path (ends with `.md`, or starts with `/`, `./`, or `..`), read the file and use its content as the big idea description.
    - Otherwise, treat the entire `$ARGUMENTS` as a free-text description.
@@ -11,7 +15,7 @@ Decompose a big idea into multiple draft tasks.
 ## Phase 1: Context Loading
 
 1. Explore the project codebase: domain structure, modules, existing conventions.
-2. Scan all existing tasks in `tasks/` (all statuses except `archive`) — read their frontmatter (id, title, status, group) to understand what already exists. This avoids creating duplicate or overlapping tasks.
+2. Scan all existing tasks in `{dir}/` (all statuses except `archive`) — read their frontmatter (id, title, status, group) to understand what already exists. This avoids creating duplicate or overlapping tasks.
 3. If tasks with a `group` field exist, note the active groups.
 
 ## Phase 2: Clarification (Light Q&A)

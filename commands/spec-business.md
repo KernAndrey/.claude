@@ -6,10 +6,10 @@ Ask only business questions. Architecture, file paths, class names, module layou
 
 ## 0. Setup
 
-1. Read `.tasks.toml`. Missing → tell the user to run `/task-init` and stop.
-2. Locate the target by `$ARGUMENTS` (ID, slug, or full path) in `tasks/1-draft/`:
+1. Read `.tasks.toml` for `id_prefix` and `dir`. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory. None found → tell the user to run `/task-init` and stop.
+2. Locate the target by `$ARGUMENTS` (ID, slug, or full path) in `{dir}/1-draft/`:
    - Found → proceed.
-   - Found in `tasks/2-spec/` instead → tell the user `/spec-business` operates on drafts only; resuming a preliminary spec is out of scope — use `/spec {ID}` to resume or edit the spec manually. Stop.
+   - Found in `{dir}/2-spec/` instead → tell the user `/spec-business` operates on drafts only; resuming a preliminary spec is out of scope — use `/spec {ID}` to resume or edit the spec manually. Stop.
    - Not found → error and stop.
 3. Read the draft file content.
 4. Read the project `CLAUDE.md` for stack and conventions. You read it only to ground your domain exploration — you will not ask the user about anything you learn there.
@@ -102,7 +102,7 @@ Each blocker is a level-3 heading inside the spec's `## Blockers` section. Gener
 
 ## 2. Phase 2 — Write the preliminary spec
 
-Create the spec at `tasks/2-spec/{ID}-{slug}.md` from the template at `~/.claude/templates/sdd/spec.md`.
+Create the spec at `{dir}/2-spec/{ID}-{slug}.md` from the template at `~/.claude/templates/sdd/spec.md`.
 
 **Frontmatter fields you fill now:**
 - `id`, `title` — from the draft.
@@ -201,12 +201,12 @@ The sections you own are read by non-technical stakeholders. Use domain language
    - `## Architecture & Implementation Plan` is left as the template placeholder (with optional `Open architectural questions` entries).
    - Frontmatter `status: pm-preliminary`.
 2. Count open blockers (`### b-N` entries with `status: open` in `## Blockers`).
-3. Move the draft from `tasks/1-draft/` to `tasks/archive/drafts/`. The spec now contains all captured decisions.
+3. Move the draft from `{dir}/1-draft/` to `{dir}/archive/drafts/`. The spec now contains all captured decisions.
 4. Commit:
 
    ```
-   git add -A -- tasks/2-spec/{ID}-{slug}.md tasks/archive/drafts/{ID}-{slug}.md
-   git add -A -- tasks/1-draft/{ID}-{slug}.md 2>/dev/null || true
+   git add -A -- {dir}/2-spec/{ID}-{slug}.md {dir}/archive/drafts/{ID}-{slug}.md
+   git add -A -- {dir}/1-draft/{ID}-{slug}.md 2>/dev/null || true
    git commit -m "spec-business({ID}): preliminary spec"
    ```
 
@@ -221,7 +221,7 @@ The sections you own are read by non-technical stakeholders. Use domain language
    - Next step for the developer:
 
      ```
-     Preliminary spec saved at tasks/2-spec/{ID}-{slug}.md (status: pm-preliminary).
+     Preliminary spec saved at {dir}/2-spec/{ID}-{slug}.md (status: pm-preliminary).
 
      Next steps:
        1. Review the business sections.

@@ -128,7 +128,7 @@ All communication with Lead uses SendMessage. Put the signal on its own line, fi
 
 ```
 SPEC ARCHITECT DONE.
-Spec path: tasks/2-spec/{ID}-{slug}.md
+Spec path: {dir}/2-spec/{ID}-{slug}.md
 AC mapped: {count}/{total}
 Files to create: {count}
 Files to modify: {count}

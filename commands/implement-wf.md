@@ -14,12 +14,12 @@ This workflow runs to completion with NO human in the loop. It never pauses to a
 
 Only the lead may run git here — the workflow script itself has no shell. Do this setup before launching.
 
-1. Read `.tasks.toml`, `CLAUDE.md`, and the project structure.
-2. Find the spec for `$ARGUMENTS` in `tasks/3-ready/`. Read it in full.
+1. Read `.tasks.toml`, `CLAUDE.md`, and the project structure. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory.
+2. Find the spec for `$ARGUMENTS` in `{dir}/3-ready/`. Read it in full.
 3. Branch and worktree:
    - `auto_branch = true`: `git fetch origin dev`, then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path it returns. Note `{branch} = task/{ID}-{slug}`, `{base} = dev`.
    - `auto_branch = false`: stay on the current branch. `{worktree_path}` = project root, `{base}` = current branch, `{branch}` = current branch.
-4. Move the spec to `tasks/4-in-progress/` and set frontmatter `status: in-progress`. (The workflow moves it onward to `5-review` at the end.)
+4. Move the spec to `{dir}/4-in-progress/` and set frontmatter `status: in-progress`. (The workflow moves it onward to `5-review` at the end.)
 5. Note the review-rules path: `{review_prompt} = .claude/review_prompt.md` if it exists, else null.
 
 ## Phase 2: Build the Coder list (lead, ~30 seconds)
@@ -30,7 +30,7 @@ Sanity-check before launch:
 - Take the union of every coder's `files`. It must equal the **production** files in "Files to create" + "Files to modify" (test files excluded — the Tester owns those).
 - File paths must be real (or marked new).
 
-Reconcile small gaps or overlaps yourself and proceed. For anything you genuinely cannot reconcile, add a sentence to `seededConcerns` and continue — do not stop to ask. Reserve stopping for a breakdown that is outright broken (nonsense scopes, most files unaccounted for): in that case move the spec back to `tasks/2-spec/`, reset `status: awaiting-approval`, `wt remove task/{ID}-{slug}` if created, and report it as a Critic miss.
+Reconcile small gaps or overlaps yourself and proceed. For anything you genuinely cannot reconcile, add a sentence to `seededConcerns` and continue — do not stop to ask. Reserve stopping for a breakdown that is outright broken (nonsense scopes, most files unaccounted for): in that case move the spec back to `{dir}/2-spec/`, reset `status: awaiting-approval`, `wt remove task/{ID}-{slug}` if created, and report it as a Critic miss.
 
 ## Phase 3: Launch the workflow
 
@@ -40,7 +40,7 @@ Call the Workflow tool with the saved engine and the setup values:
 Workflow({
   name: "sdd-implement-engine",
   args: {
-    specPath:        "{worktree_path}/tasks/4-in-progress/{ID}-{slug}.md",
+    specPath:        "{worktree_path}/{dir}/4-in-progress/{ID}-{slug}.md",
     worktreePath:    "{worktree_path}",
     baseBranch:      "{base}",
     branchName:      "{branch}",          // task/{ID}-{slug}, or the current branch name
@@ -59,7 +59,7 @@ Capture two fields from the returned terminal result/object — you need them fo
 
 ## Phase 4: Report (lead)
 
-The workflow already finalized the spec (Implementation Summary, Known Concerns, Auto-Review Results, Steps for Manual Review), moved it to `tasks/5-review/`, landed the commits through the gate, and pushed the branch. From the returned object, show the user:
+The workflow already finalized the spec (Implementation Summary, Known Concerns, Auto-Review Results, Steps for Manual Review), moved it to `{dir}/5-review/`, landed the commits through the gate, and pushed the branch. From the returned object, show the user:
 
 1. **Status** — `DELIVERED`, `DELIVERED_WITH_CONCERNS`, or `DELIVERED_INCOMPLETE`. The last one means the final acceptance check could not confirm the spec is fully implemented even after the engine's in-run remediation — call this out prominently and point the user at the acceptance gaps recorded in Known Concerns.
 2. **Implementation Summary** (brief) and the **commit list** (subjects).
@@ -67,7 +67,7 @@ The workflow already finalized the spec (Implementation Summary, Known Concerns,
 4. **Steps for Manual Review**, the full list.
 5. The instruction: **"Walk through the manual review steps. If everything looks good — `/task-done {ID}`."** (For `DELIVERED_INCOMPLETE`, tell the user the task likely needs another pass before `/task-done`.)
 
-If `status` is missing or the workflow returned an error, read the spec in `tasks/4-in-progress/` (it may not have moved), report what landed, and tell the user which phase did not complete. When the run returned a death/error rather than a delivered object, go to **Phase 5** before reporting — Phase 5 decides whether to recover or to report-and-stop.
+If `status` is missing or the workflow returned an error, read the spec in `{dir}/4-in-progress/` (it may not have moved), report what landed, and tell the user which phase did not complete. When the run returned a death/error rather than a delivered object, go to **Phase 5** before reporting — Phase 5 decides whether to recover or to report-and-stop.
 
 ## Phase 5: Recovery on workflow death (lead)
 

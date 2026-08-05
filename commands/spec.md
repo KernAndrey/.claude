@@ -2,10 +2,10 @@ Generate a specification from a draft task using addressable background agents. 
 
 ## 0. Setup
 
-1. Read `.tasks.toml`. Missing → tell user to run `/task-init` and stop.
+1. Read `.tasks.toml` for `id_prefix` and `dir`. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory. None found → tell user to run `/task-init` and stop.
 2. Locate the target by `$ARGUMENTS` (ID, slug, or full path):
-   - Match in `tasks/1-draft/` → `RUN_MODE = new`.
-   - Match in `tasks/2-spec/` → `RUN_MODE = resume` (the spec already exists; you are re-entering it to resolve open blockers or apply late findings).
+   - Match in `{dir}/1-draft/` → `RUN_MODE = new`.
+   - Match in `{dir}/2-spec/` → `RUN_MODE = resume` (the spec already exists; you are re-entering it to resolve open blockers or apply late findings).
    - Not found → error and stop.
 3. Read the draft file content (new) or the existing spec file (resume).
 4. Read the project `CLAUDE.md` for stack and conventions.
@@ -175,7 +175,7 @@ Shared context to pass in every agent prompt:
 **New runs:** Spawn `Agent(subagent_type: "Spec-Analyst", name: "spec-analyst", run_in_background: true, prompt: "...")` and record its `agentId`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-analyst.md`
-> Spec output path: `tasks/2-spec/{ID}-{slug}.md`
+> Spec output path: `{dir}/2-spec/{ID}-{slug}.md`
 > Spec template: `~/.claude/templates/sdd/spec.md`
 > Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts). Every numbered decision MUST be reflected in the spec. Codebase observations inform your writing but don't need 1:1 mapping.**
 > User Phase 1 answers: {inline all answers — supplementary context}
@@ -203,7 +203,7 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 **New runs:** Spawn `Agent(subagent_type: "Spec-Architect", name: "spec-architect", run_in_background: true, prompt: "...")` and record its `agentId`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-architect.md`
-> Spec path: `tasks/2-spec/{ID}-{slug}.md` (business sections already populated)
+> Spec path: `{dir}/2-spec/{ID}-{slug}.md` (business sections already populated)
 > Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts — API signatures, model fields, file paths, patterns, gotchas). Every numbered decision MUST be reflected in the architecture. Codebase observations are your primary reference for integration points.**
 > User Phase 1 answers: {inline — supplementary context}
 > Project root: `{working directory}`
@@ -251,7 +251,7 @@ The three fixed critics read the spec as a document. What they cannot do is cove
 Spawn `Agent(subagent_type: "Spec-Critic-Arch", name: "spec-critic-arch", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-arch.md`
-> Spec path: `tasks/2-spec/{ID}-{slug}.md`
+> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and verify EVERY numbered decision is correctly reflected in the spec. Any mismatch = CRITICAL finding. Also read `## Codebase Observations` — verify spec's integration points and API claims match the recorded observations.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -264,7 +264,7 @@ Spawn `Agent(subagent_type: "Spec-Critic-Arch", name: "spec-critic-arch", run_in
 Spawn `Agent(subagent_type: "Spec-Critic-Business", name: "spec-critic-business", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-business.md`
-> Spec path: `tasks/2-spec/{ID}-{slug}.md`
+> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and verify EVERY numbered decision is correctly reflected in the spec's business sections. Any mismatch = CRITICAL finding.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -277,7 +277,7 @@ Spawn `Agent(subagent_type: "Spec-Critic-Business", name: "spec-critic-business"
 Spawn `Agent(subagent_type: "Spec-Critic-Premise", name: "spec-critic-premise", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-premise.md`
-> Spec path: `tasks/2-spec/{ID}-{slug}.md`
+> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and `## Codebase Observations`. Unlike the other agents, you do NOT treat Decisions as authoritative — they are exactly what you scrutinize. Treat every claim, including every recorded user decision, as a hypothesis to disprove.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -306,7 +306,7 @@ Agent(
 MIRROR_OF: {native critic file}
 PURPOSE: {critic-arch | critic-business | critic-premise}
 Working directory (WORKTREE): {project root}
-Spec path: tasks/2-spec/{ID}-{slug}.md
+Spec path: {dir}/2-spec/{ID}-{slug}.md
 Draft path: {draft path}
 Mirror the native critic's lens pass exactly and relay Kimi's report verbatim, with ` (Kimi)` appended to the report's identifier line (e.g. `SPEC ARCH CRITIC REPORT (Kimi)`)."
 )
@@ -326,7 +326,7 @@ LENS_ID: {lens-id}
 LENS_ANGLE: {angle}
 LENS_JUSTIFICATION: {why this spec needs it}
 LENS_HUNT: {failure classes to surface}
-Spec path: tasks/2-spec/{ID}-{slug}.md
+Spec path: {dir}/2-spec/{ID}-{slug}.md
 Draft path: {draft path} — read `## Decisions` and `## Codebase Observations` for the verified ground.
 Working directory: {project root}
 Phase 1 context: {inline user answers and Lead observations}
@@ -408,15 +408,15 @@ A `/spec` run produces exactly **two** commits: the finished draft, then the fin
 **Commit 1 — end of Phase 1.** The draft holds every decision in `## Decisions` and every finding in `## Codebase Observations`; the question queue is empty.
 
 ```
-git add tasks/1-draft/{ID}-{slug}.md
+git add {dir}/1-draft/{ID}-{slug}.md
 git commit -m "spec({ID}): draft with decisions and codebase observations"
 ```
 
 **Commit 2 — finalization.** The spec is verified and the draft has moved to the archive (§4, step 9).
 
 ```
-git add -A -- tasks/2-spec/{ID}-{slug}.md tasks/archive/drafts/{ID}-{slug}.md
-git add -A -- tasks/1-draft/{ID}-{slug}.md 2>/dev/null || true
+git add -A -- {dir}/2-spec/{ID}-{slug}.md {dir}/archive/drafts/{ID}-{slug}.md
+git add -A -- {dir}/1-draft/{ID}-{slug}.md 2>/dev/null || true
 git commit -m "spec({ID}): specification"
 ```
 
@@ -440,12 +440,12 @@ Run both commits with `run_in_background: true` — the pre-commit review hook c
 6. Verify `## Key Constraints` has 3-7 items, each tracing to Behavior or AC.
 7. Verify `## Assumptions` is populated (not just the template placeholder).
 8. Verify exactly one `[SENTINEL]` marker exists in the Behavior section.
-9. Move the draft to `tasks/archive/drafts/` — it is consumed either way, blockers or not.
+9. Move the draft to `{dir}/archive/drafts/` — it is consumed either way, blockers or not.
 10. Commit the spec and the archived draft together, as commit 2 of `## Commits`. This is the run's last action; the branches below only produce output.
 
 ### If open blockers > 0
 
-The spec stays in `tasks/2-spec/` with `status: awaiting-approval` unchanged. Output:
+The spec stays in `{dir}/2-spec/` with `status: awaiting-approval` unchanged. Output:
 
   ```
   Spec {ID} saved with {N} open blockers in ## Blockers section.

@@ -16,7 +16,9 @@ export const meta = {
 
 // ---------------------------------------------------------------------------
 // Args (from the /implement-wf lead):
-//   specPath        absolute path to the spec inside the worktree (tasks/4-in-progress/...)
+//   specPath        absolute path to the spec inside the worktree ({dir}/4-in-progress/...,
+//                   where {dir} is the board of the applicable .tasks.toml — the repo root's
+//                   or a client's, e.g. clients/<name>/tasks/)
 //   worktreePath    directory all agents work in
 //   baseBranch      branch to diff against for reviews (dev or current)
 //   branchName      task/{ID}-{slug} when auto_branch; null otherwise
@@ -33,6 +35,12 @@ const a = (typeof args === 'string' ? (args ? JSON.parse(args) : {}) : (args || 
 const CODERS = a.coders || []
 const WORKTREE = a.worktreePath
 const SPEC = a.specPath
+// Task-board root, derived from the spec path: a repo may carry several SDD
+// roots (e.g. clients/<name>/tasks/), so the stage directories are never
+// assumed to be a top-level `tasks/`.
+const TASKS_DIR = SPEC && SPEC.includes('/4-in-progress/')
+  ? SPEC.slice(0, SPEC.lastIndexOf('/4-in-progress/'))
+  : (SPEC || '').split('/').slice(0, -2).join('/')
 const BASE = a.baseBranch
 const TASK = a.taskId || 'TASK'
 const REVIEW_PROMPT = a.reviewPromptPath || null
@@ -1054,7 +1062,7 @@ const scribe = await agent(
     `- Auto-Review Results: tests = ${test.testCount} passing; reviewer verdicts:\n${reviewerSummary}`,
     `- Steps for Manual Review: 3-7 concrete "action → expected result" steps.`,
     `Then update frontmatter: status: review, completed/updated to today, branch: ${a.branchName || BASE}.`,
-    `Then MOVE the spec file from tasks/4-in-progress/ to tasks/5-review/ (git mv).`,
+    `Then MOVE the spec file from ${TASKS_DIR}/4-in-progress/ to ${TASKS_DIR}/5-review/ (git mv).`,
     `Do this with Bash inside ${WORKTREE}. Return done=true, the implementationSummary text, and the manualReviewSteps you wrote.`,
   ].join('\n'),
   { agentType: 'general-purpose', label: 'land:scribe', phase: 'Land', schema: SCRIBE_SCHEMA },
@@ -1445,7 +1453,7 @@ async function landDelta(tag) {
 }
 
 let accepted = false
-const specGlob = `${WORKTREE}/tasks/5-review/ (the Scribe moved it there; if not found, check tasks/4-in-progress/)`
+const specGlob = `${TASKS_DIR}/5-review/ (the Scribe moved it there; if not found, check ${TASKS_DIR}/4-in-progress/)`
 const acceptPersist = new Map() // gap fpKey -> consecutive rounds still open
 const acceptGivenUp = new Set() // gap fpKeys retired to Known Concerns
 let acceptRound = 0

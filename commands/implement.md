@@ -40,14 +40,14 @@ Thoroughness over speed. This task may run for hours — that is expected and ac
 
 ## Setup
 
-1. Read `.tasks.toml`, `CLAUDE.md`, and project structure.
-2. Find the spec by `$ARGUMENTS` (ID or slug) in `tasks/3-ready/`. `$ARGUMENTS` is just the task identifier.
+1. Read `.tasks.toml`, `CLAUDE.md`, and project structure. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory.
+2. Find the spec by `$ARGUMENTS` (ID or slug) in `{dir}/3-ready/`. `$ARGUMENTS` is just the task identifier.
 3. Read the full specification.
 4. Branch and worktree setup:
    - If `auto_branch = true`: fetch latest `dev` branch (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All agents work inside the worktree directory.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
 5. **Review prompt setup:** if the project has `.claude/review_prompt.md`, reviewers will apply it as project-specific rules (severity overrides, design decisions to treat as intentional). Note its path to pass to reviewers.
-6. Move spec to `tasks/4-in-progress/`. Update `status: in-progress`.
+6. Move spec to `{dir}/4-in-progress/`. Update `status: in-progress`.
 7. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers will need it.
 8. Initialize an empty agent registry (`name | agentId | role | files_owned`). You append a row per spawn.
 
@@ -71,7 +71,7 @@ Before spawning, verify the breakdown isn't broken:
 - Are file paths real (or explicitly noted as new)?
 - Does each coder's scope make sense given the file list?
 
-If the breakdown is broken (gaps, overlaps, nonsense scopes): **do not silently fix it**. Stop, report the issue to the user, and ask whether to (a) patch the breakdown manually before continuing, or (b) send the spec back to `tasks/2-spec/` for the Architect to redo. If (b): move the spec file back from `tasks/4-in-progress/` to `tasks/2-spec/`, reset frontmatter `status` from `in-progress` to `awaiting-approval`, remove the worktree if one was created (`wt remove task/{ID}-{slug}`), and stop any agents already spawned. The Critic should have caught this — flag it as a Critic miss too.
+If the breakdown is broken (gaps, overlaps, nonsense scopes): **do not silently fix it**. Stop, report the issue to the user, and ask whether to (a) patch the breakdown manually before continuing, or (b) send the spec back to `{dir}/2-spec/` for the Architect to redo. If (b): move the spec file back from `{dir}/4-in-progress/` to `{dir}/2-spec/`, reset frontmatter `status` from `in-progress` to `awaiting-approval`, remove the worktree if one was created (`wt remove task/{ID}-{slug}`), and stop any agents already spawned. The Critic should have caught this — flag it as a Critic miss too.
 
 #### Spawn Coders from the breakdown
 
@@ -345,7 +345,7 @@ After 7 iterations with findings still unresolved:
 - Lead takes over: read the code, diagnose, and fix the remaining issues directly.
 - If lead cannot fix — **ask user**: "These findings remain after 7 fix rounds and my own attempt. Options:
   (A) Continue to manual review — remaining issues documented in Known Concerns.
-  (B) Abort — return spec to `tasks/3-ready/` with findings attached as implementation notes."
+  (B) Abort — return spec to `{dir}/3-ready/` with findings attached as implementation notes."
 - If user picks B: revert worktree changes, move spec back.
 
 ---
@@ -384,7 +384,7 @@ Run inside the worktree directory when `auto_branch = true`:
    - `status: review`, `completed: {TODAY}`, `updated: {TODAY}`
    - `branch: task/{ID}-{slug}` (if `auto_branch = true`; otherwise current branch)
 
-3. Move file from `tasks/4-in-progress/` to `tasks/5-review/`.
+3. Move file from `{dir}/4-in-progress/` to `{dir}/5-review/`.
 
 4. Git commit — split changes into logical commits. Group by cohesive unit: each feature chunk together with its tests, config changes separately, etc. Each commit gets a conventional commit message prefixed with the task ID:
    - `feat({ID}): add order model with validation and tests`

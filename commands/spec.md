@@ -2,7 +2,7 @@ Generate a specification from a draft task using addressable background agents. 
 
 ## 0. Setup
 
-1. Read `.tasks.toml` for `id_prefix` and `dir`. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory. None found → tell user to run `/task-init` and stop.
+1. Read `.tasks.toml` for `id_prefix` and `dir`. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory. None found → tell user to run `/task-init` and stop.
 2. Locate the target by `$ARGUMENTS` (ID, slug, or full path):
    - Match in `{dir}/1-draft/` → `RUN_MODE = new`.
    - Match in `{dir}/2-spec/` → `RUN_MODE = resume` (the spec already exists; you are re-entering it to resolve open blockers or apply late findings).
@@ -408,15 +408,15 @@ A `/spec` run produces exactly **two** commits: the finished draft, then the fin
 **Commit 1 — end of Phase 1.** The draft holds every decision in `## Decisions` and every finding in `## Codebase Observations`; the question queue is empty.
 
 ```
-git add {dir}/1-draft/{ID}-{slug}.md
+git add "{dir}/1-draft/{ID}-{slug}.md"
 git commit -m "spec({ID}): draft with decisions and codebase observations"
 ```
 
 **Commit 2 — finalization.** The spec is verified and the draft has moved to the archive (§4, step 9).
 
 ```
-git add -A -- {dir}/2-spec/{ID}-{slug}.md {dir}/archive/drafts/{ID}-{slug}.md
-git add -A -- {dir}/1-draft/{ID}-{slug}.md 2>/dev/null || true
+git add -A -- "{dir}/2-spec/{ID}-{slug}.md" "{dir}/archive/drafts/{ID}-{slug}.md"
+git add -A -- "{dir}/1-draft/{ID}-{slug}.md" 2>/dev/null || true
 git commit -m "spec({ID}): specification"
 ```
 

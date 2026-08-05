@@ -14,7 +14,7 @@ This workflow runs to completion with NO human in the loop. It never pauses to a
 
 Only the lead may run git here — the workflow script itself has no shell. Do this setup before launching.
 
-1. Read `.tasks.toml`, `CLAUDE.md`, and the project structure. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory.
+1. Read `.tasks.toml`, `CLAUDE.md`, and the project structure. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory.
 2. Find the spec for `$ARGUMENTS` in `{dir}/3-ready/`. Read it in full.
 3. Branch and worktree:
    - `auto_branch = true`: `git fetch origin dev`, then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path it returns. Note `{branch} = task/{ID}-{slug}`, `{base} = dev`.

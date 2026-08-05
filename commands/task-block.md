@@ -2,7 +2,7 @@ Block a task with a reason.
 
 ## Instructions
 
-`{dir}` = the `dir` of the applicable `.tasks.toml`. A repo may carry several SDD roots (root plus `*/.tasks.toml`, `*/*/.tasks.toml`); pick the config whose `id_prefix` matches the task ID, and resolve its `dir` relative to that config's own directory.
+`{dir}` = the `dir` of the applicable `.tasks.toml`. A repo may carry several SDD roots (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories); pick the config whose `id_prefix` matches the task ID, or — when `$ARGUMENTS` is a bare slug — the root whose board actually holds a matching file, asking the user when several do. Resolve `dir` relative to that config's own directory.
 
 1. Parse `$ARGUMENTS`: first token is the task identifier (ID or slug), the rest is the reason.
 2. Find the file in any active directory under `{dir}` (1-draft, 2-spec, 3-ready, 4-in-progress, 5-review).

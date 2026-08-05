@@ -6,7 +6,7 @@ Ask only business questions. Architecture, file paths, class names, module layou
 
 ## 0. Setup
 
-1. Read `.tasks.toml` for `id_prefix` and `dir`. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory. None found → tell the user to run `/task-init` and stop.
+1. Read `.tasks.toml` for `id_prefix` and `dir`. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory. None found → tell the user to run `/task-init` and stop.
 2. Locate the target by `$ARGUMENTS` (ID, slug, or full path) in `{dir}/1-draft/`:
    - Found → proceed.
    - Found in `{dir}/2-spec/` instead → tell the user `/spec-business` operates on drafts only; resuming a preliminary spec is out of scope — use `/spec {ID}` to resume or edit the spec manually. Stop.
@@ -205,8 +205,8 @@ The sections you own are read by non-technical stakeholders. Use domain language
 4. Commit:
 
    ```
-   git add -A -- {dir}/2-spec/{ID}-{slug}.md {dir}/archive/drafts/{ID}-{slug}.md
-   git add -A -- {dir}/1-draft/{ID}-{slug}.md 2>/dev/null || true
+   git add -A -- "{dir}/2-spec/{ID}-{slug}.md" "{dir}/archive/drafts/{ID}-{slug}.md"
+   git add -A -- "{dir}/1-draft/{ID}-{slug}.md" 2>/dev/null || true
    git commit -m "spec-business({ID}): preliminary spec"
    ```
 

@@ -3,8 +3,8 @@ Decompose a big idea into multiple draft tasks.
 ## Instructions
 
 1. Locate the SDD config and read `id_prefix`, `dir`, and `counter_file` from it:
-   - Look for `.tasks.toml` at the project root and one or two levels deep (`*/.tasks.toml`, `*/*/.tasks.toml`) — a repo may carry several SDD roots, e.g. one per client.
-   - One config → use it. Several → pick the one whose `id_prefix` matches the task ID in the request; with no ID given, pick the config whose directory contains the code being changed. A project rule naming the choice wins over both.
+   - Look for `.tasks.toml` at the project root and one or two levels deep (`*/.tasks.toml`, `*/*/.tasks.toml`), skipping `node_modules/`, `.git/`, `vendor/`, and plugin/cache directories — a repo may carry several SDD roots, e.g. one per client.
+   - One config → use it. Several → a project rule naming the choice wins; otherwise match the big idea to a root by the directory it names (a client, an addon, a module). `/decompose` mints new IDs, so there is no `id_prefix` to match on — when two roots stay plausible after reading the idea, ask the user which board before allocating IDs.
    - Paths inside a config resolve relative to that config's own directory: `dir = "tasks"` in `clients/acme/.tasks.toml` means the board lives at `clients/acme/tasks/`.
    - No `.tasks.toml` anywhere → tell the user to run `/task-init` first and stop.
 2. Parse `$ARGUMENTS`:

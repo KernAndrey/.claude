@@ -328,9 +328,9 @@ hint needs no Change Control entry.
 - [ ] All Acceptance Criteria pass
 - [ ] Tests run green on a clean database
 - [ ] Migration verified on a production database copy (if the spec touches schema)
-- [ ] Code-Reviewer (Claude + Kimi mirror) report no MUST FIX findings
-- [ ] Test-Reviewer (Claude + Kimi mirror) report no MUST FIX findings
-- [ ] Spec-Auditor (Claude + Kimi mirror) report COMPLIANT
+- [ ] Code-Reviewer reports no MUST FIX findings
+- [ ] Test-Reviewer reports no MUST FIX findings
+- [ ] Spec-Auditor reports COMPLIANT
 - [ ] No regressions in modules listed under Affected Areas
 - [ ] Feature branch rebased on fresh dev
 

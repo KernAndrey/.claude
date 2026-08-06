@@ -2,10 +2,10 @@ Generate a specification from a draft task using addressable background agents. 
 
 ## 0. Setup
 
-1. Read `.tasks.toml`. Missing → tell user to run `/task-init` and stop.
+1. Read `.tasks.toml` for `id_prefix` and `dir`. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory. None found → tell user to run `/task-init` and stop.
 2. Locate the target by `$ARGUMENTS` (ID, slug, or full path):
-   - Match in `tasks/1-draft/` → `RUN_MODE = new`.
-   - Match in `tasks/2-spec/` → `RUN_MODE = resume` (the spec already exists; you are re-entering it to resolve open blockers or apply late findings).
+   - Match in `{dir}/1-draft/` → `RUN_MODE = new`.
+   - Match in `{dir}/2-spec/` → `RUN_MODE = resume` (the spec already exists; you are re-entering it to resolve open blockers or apply late findings).
    - Not found → error and stop.
 3. Read the draft file content (new) or the existing spec file (resume).
 4. Read the project `CLAUDE.md` for stack and conventions.
@@ -175,7 +175,7 @@ Shared context to pass in every agent prompt:
 **New runs:** Spawn `Agent(subagent_type: "Spec-Analyst", name: "spec-analyst", run_in_background: true, prompt: "...")` and record its `agentId`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-analyst.md`
-> Spec output path: `tasks/2-spec/{ID}-{slug}.md`
+> Spec output path: `{dir}/2-spec/{ID}-{slug}.md`
 > Spec template: `~/.claude/templates/sdd/spec.md`
 > Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts). Every numbered decision MUST be reflected in the spec. Codebase observations inform your writing but don't need 1:1 mapping.**
 > User Phase 1 answers: {inline all answers — supplementary context}
@@ -203,7 +203,7 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 **New runs:** Spawn `Agent(subagent_type: "Spec-Architect", name: "spec-architect", run_in_background: true, prompt: "...")` and record its `agentId`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-architect.md`
-> Spec path: `tasks/2-spec/{ID}-{slug}.md` (business sections already populated)
+> Spec path: `{dir}/2-spec/{ID}-{slug}.md` (business sections already populated)
 > Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts — API signatures, model fields, file paths, patterns, gotchas). Every numbered decision MUST be reflected in the architecture. Codebase observations are your primary reference for integration points.**
 > User Phase 1 answers: {inline — supplementary context}
 > Project root: `{working directory}`
@@ -215,15 +215,15 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 
 **Message loop:** same shape as 2a, but with `spec-architect` and the Architect signal names.
 
-### 2c. Critics (3 fixed + 3 Kimi mirrors + 3–5 adaptive lenses, in parallel)
+### 2c. Critics (3 fixed + 3–5 adaptive lenses, in parallel)
 
-Each fixed critic runs on **two engines**: the native Claude critic AND a `Kimi-Mirror` running the same lens pass on the Kimi CLI — two independent passes per critic, "ревью много не бывает". On top of those six, you design **3–5 adaptive lenses** for this specific spec (2c-0) and spawn one critic per lens.
+Three fixed critics read every spec. On top of them, you design **3–5 adaptive lenses** for this specific spec (2c-0) and spawn one critic per lens.
 
-Spawn everything — fixed critics, mirrors, and adaptive lenses — as background agents in **one batch** (all `Agent` calls in a single response). They run in parallel; there are no dependencies. Record every `agentId`.
+Spawn everything — fixed critics and adaptive lenses — as background agents in **one batch** (all `Agent` calls in a single response). They run in parallel; there are no dependencies. Record every `agentId`.
 
-Arm two watchdogs: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")` for the six fixed agents, and `Bash(run_in_background: true, command: "sleep 1500; echo WATCHDOG_ADAPTIVE")` for the adaptive ones. The batch now exceeds the concurrency cap, so the later spawns queue for slots — a single 900s timer over the whole batch fires on healthy-but-queued agents, and the respawns it triggers make the contention worse.
+Arm two watchdogs: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")` for the three fixed critics, and `Bash(run_in_background: true, command: "sleep 1500; echo WATCHDOG_ADAPTIVE")` for the adaptive ones. The adaptive rows can push the batch past the concurrency cap, so later spawns queue for slots — a single 900s timer over the whole batch fires on healthy-but-queued agents, and the respawns it triggers make the contention worse.
 
-The three native critic spawns are 2c-i / 2c-ii / 2c-iii below; each gets a mirror via the template in **2c-iv**; the adaptive lenses spawn via **2c-v**.
+The three fixed critic spawns are 2c-i / 2c-ii / 2c-iii below; the adaptive lenses spawn via **2c-iv**.
 
 #### 2c-0. Lens design (think before you spawn)
 
@@ -251,7 +251,7 @@ The three fixed critics read the spec as a document. What they cannot do is cove
 Spawn `Agent(subagent_type: "Spec-Critic-Arch", name: "spec-critic-arch", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-arch.md`
-> Spec path: `tasks/2-spec/{ID}-{slug}.md`
+> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and verify EVERY numbered decision is correctly reflected in the spec. Any mismatch = CRITICAL finding. Also read `## Codebase Observations` — verify spec's integration points and API claims match the recorded observations.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -264,7 +264,7 @@ Spawn `Agent(subagent_type: "Spec-Critic-Arch", name: "spec-critic-arch", run_in
 Spawn `Agent(subagent_type: "Spec-Critic-Business", name: "spec-critic-business", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-business.md`
-> Spec path: `tasks/2-spec/{ID}-{slug}.md`
+> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and verify EVERY numbered decision is correctly reflected in the spec's business sections. Any mismatch = CRITICAL finding.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -277,7 +277,7 @@ Spawn `Agent(subagent_type: "Spec-Critic-Business", name: "spec-critic-business"
 Spawn `Agent(subagent_type: "Spec-Critic-Premise", name: "spec-critic-premise", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-premise.md`
-> Spec path: `tasks/2-spec/{ID}-{slug}.md`
+> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and `## Codebase Observations`. Unlike the other agents, you do NOT treat Decisions as authoritative — they are exactly what you scrutinize. Treat every claim, including every recorded user decision, as a hypothesis to disprove.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -285,36 +285,9 @@ Spawn `Agent(subagent_type: "Spec-Critic-Premise", name: "spec-critic-premise", 
 > {On resume:} `RESUMED_RUN: true`
 > Run your full premise pass (Lenses L1–L6). A sound foundation yields zero challenges — never manufacture one. Signal `SPEC PREMISE CRITIC REPORT` when done.
 
-#### 2c-iv. Kimi mirrors (one per critic)
+#### 2c-iv. Adaptive lens critics (one per lens from 2c-0)
 
-In the same batch, spawn a `Kimi-Mirror` for each of the three critics. Each mirror reads its native critic file and re-runs the same lens pass on Kimi, relaying a report labelled `(Kimi)`:
-
-| Mirrors critic | Kimi-Mirror name | `MIRROR_OF` | `PURPOSE` |
-|---|---|---|---|
-| Architecture Critic | `kimi-critic-arch` | `~/.claude/agents/spec-critic-arch.md` | `critic-arch` |
-| Business Critic | `kimi-critic-business` | `~/.claude/agents/spec-critic-business.md` | `critic-business` |
-| Premise Critic | `kimi-critic-premise` | `~/.claude/agents/spec-critic-premise.md` | `critic-premise` |
-
-Each mirror spawn:
-
-```
-Agent(
-  subagent_type: "Kimi-Mirror",
-  name: "{kimi-critic-name}",
-  run_in_background: true,
-  prompt: "Read your instructions: ~/.claude/agents/kimi-mirror.md
-MIRROR_OF: {native critic file}
-PURPOSE: {critic-arch | critic-business | critic-premise}
-Working directory (WORKTREE): {project root}
-Spec path: tasks/2-spec/{ID}-{slug}.md
-Draft path: {draft path}
-Mirror the native critic's lens pass exactly and relay Kimi's report verbatim, with ` (Kimi)` appended to the report's identifier line (e.g. `SPEC ARCH CRITIC REPORT (Kimi)`)."
-)
-```
-
-#### 2c-v. Adaptive lens critics (one per lens from 2c-0)
-
-In the same batch, spawn one `Spec-Critic-Adaptive` per lens designed in 2c-0. These run on Claude only — no Kimi mirrors. The payoff comes from a *new angle*, not a second engine on an angle already covered, and the batch is already at the concurrency cap.
+In the same batch, spawn one `Spec-Critic-Adaptive` per lens designed in 2c-0.
 
 ```
 Agent(
@@ -326,7 +299,7 @@ LENS_ID: {lens-id}
 LENS_ANGLE: {angle}
 LENS_JUSTIFICATION: {why this spec needs it}
 LENS_HUNT: {failure classes to surface}
-Spec path: tasks/2-spec/{ID}-{slug}.md
+Spec path: {dir}/2-spec/{ID}-{slug}.md
 Draft path: {draft path} — read `## Decisions` and `## Codebase Observations` for the verified ground.
 Working directory: {project root}
 Phase 1 context: {inline user answers and Lead observations}
@@ -336,13 +309,13 @@ Run your lens pass. Signal `SPEC ADAPTIVE CRITIC REPORT [{lens-id}]` when done."
 )
 ```
 
-**Message loops:** run the fixed critics, their mirrors, and the adaptive lenses in parallel. Critics rarely escalate; if any (native, mirror, or adaptive) does, handle it like any other `QUESTION FOR USER`. A mirror returning `KIMI_SUSPICIOUS` / `KIMI_FAILED` instead of a report is re-run per `kimi-mirror.md`. An adaptive report missing its DEPTH or VERIFIED OK block is rejected and re-requested, same as any critic report.
+**Message loops:** run the fixed critics and the adaptive lenses in parallel. Critics rarely escalate; if any (fixed or adaptive) does, handle it like any other `QUESTION FOR USER`. An adaptive report missing its DEPTH or VERIFIED OK block is rejected and re-requested, same as any critic report.
 
-Wait for **every** agent in the batch — three critics, three mirrors, and all adaptive lenses — to complete before proceeding.
+Wait for **every** agent in the batch — three fixed critics and all adaptive lenses — to complete before proceeding.
 
 ### 2d. Apply findings
 
-You now hold three native critic reports, their three Kimi mirrors, and one report per adaptive lens. Merge them: first fold each mirror into its native pair (arch native + `kimi-critic-arch`, business + `kimi-critic-business`, premise + `kimi-critic-premise`), then merge across all reports including the adaptive ones. **Dedup** — findings that flag the same issue (within a pair, across critics, or between a fixed critic and an adaptive lens) collapse to one, keeping the more specific description. **Union of severity** — a finding raised by *any* source counts; a mirror-only or lens-only catch is still a catch. This includes `EMERGENT QUESTIONS FOR USER` from every source — they all feed into Phase 3. The premise mirror's questions dedup against the native premise critic's before Phase 3.
+You now hold three fixed critic reports and one report per adaptive lens. Merge them across all reports. **Dedup** — findings that flag the same issue (across critics, or between a fixed critic and an adaptive lens) collapse to one, keeping the more specific description. **Union of severity** — a finding raised by *any* source counts; a lens-only catch is still a catch. This includes `EMERGENT QUESTIONS FOR USER` from every source — they all feed into Phase 3.
 
 Adaptive findings carry the same `route:` tags and flow through the fix rounds below exactly like critic findings. Where an adaptive lens and a fixed critic disagree, keep both and let the fix round resolve it — divergence is signal.
 
@@ -372,7 +345,7 @@ Many open questions only become visible after Analyst describes behavior, Archit
 Gather from:
 - `Edge Cases & Risks` — table rows with `Status: OPEN` that still need clarification
 - `Architecture & Implementation Plan → Open architectural questions`
-- Every critic's `EMERGENT QUESTIONS FOR USER` — the three fixed ones (arch, business, premise), their mirrors, and each adaptive lens; each carries an expertise tag. The premise critic's questions challenge decisions the user already made — present them as genuine reconsiderations, not as gaps. An adaptive lens's questions carry its `lens-id`, so the user can see which angle raised them.
+- Every critic's `EMERGENT QUESTIONS FOR USER` — the three fixed ones (arch, business, premise) and each adaptive lens; each carries an expertise tag. The premise critic's questions challenge decisions the user already made — present them as genuine reconsiderations, not as gaps. An adaptive lens's questions carry its `lens-id`, so the user can see which angle raised them.
 
 ### Classify
 
@@ -408,15 +381,15 @@ A `/spec` run produces exactly **two** commits: the finished draft, then the fin
 **Commit 1 — end of Phase 1.** The draft holds every decision in `## Decisions` and every finding in `## Codebase Observations`; the question queue is empty.
 
 ```
-git add tasks/1-draft/{ID}-{slug}.md
+git add "{dir}/1-draft/{ID}-{slug}.md"
 git commit -m "spec({ID}): draft with decisions and codebase observations"
 ```
 
 **Commit 2 — finalization.** The spec is verified and the draft has moved to the archive (§4, step 9).
 
 ```
-git add -A -- tasks/2-spec/{ID}-{slug}.md tasks/archive/drafts/{ID}-{slug}.md
-git add -A -- tasks/1-draft/{ID}-{slug}.md 2>/dev/null || true
+git add -A -- "{dir}/2-spec/{ID}-{slug}.md" "{dir}/archive/drafts/{ID}-{slug}.md"
+git add -A -- "{dir}/1-draft/{ID}-{slug}.md" 2>/dev/null || true
 git commit -m "spec({ID}): specification"
 ```
 
@@ -440,12 +413,12 @@ Run both commits with `run_in_background: true` — the pre-commit review hook c
 6. Verify `## Key Constraints` has 3-7 items, each tracing to Behavior or AC.
 7. Verify `## Assumptions` is populated (not just the template placeholder).
 8. Verify exactly one `[SENTINEL]` marker exists in the Behavior section.
-9. Move the draft to `tasks/archive/drafts/` — it is consumed either way, blockers or not.
+9. Move the draft to `{dir}/archive/drafts/` — it is consumed either way, blockers or not.
 10. Commit the spec and the archived draft together, as commit 2 of `## Commits`. This is the run's last action; the branches below only produce output.
 
 ### If open blockers > 0
 
-The spec stays in `tasks/2-spec/` with `status: awaiting-approval` unchanged. Output:
+The spec stays in `{dir}/2-spec/` with `status: awaiting-approval` unchanged. Output:
 
   ```
   Spec {ID} saved with {N} open blockers in ## Blockers section.

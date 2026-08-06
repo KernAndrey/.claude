@@ -6,7 +6,7 @@ You are helping a QA engineer file a bug report. Your goal is to produce a clear
 
 ### Phase 1 — Initial Context
 
-1. Read `.tasks.toml` in project root. Get `dir` (default: `tasks`). If `.tasks.toml` is missing, tell the user to run `/task-init` first and stop.
+1. Locate the SDD config and read `dir` (default: `tasks`) from it. Look for `.tasks.toml` at the project root and one or two levels deep (`*/.tasks.toml`, `*/*/.tasks.toml`), skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories — a repo may carry several SDD roots, e.g. one per client. With several configs, pick the one whose directory contains the code the bug lives in, or the one a project rule names. `dir` resolves relative to that config's own directory. No `.tasks.toml` anywhere → tell the user to run `/task-init` first and stop.
 2. Read the bug counter from `{dir}/bugs/.counter`. If the file does not exist, create `{dir}/bugs/` directory and `{dir}/bugs/.counter` with `0`.
 3. The user's initial description is below in `$ARGUMENTS`. If empty, ask the user to describe what happened.
 

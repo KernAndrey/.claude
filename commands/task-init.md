@@ -2,8 +2,10 @@ Initialize Spec-Driven Development for the current project.
 
 ## Instructions
 
-1. Read the project root. Determine the project type (Odoo, Django, Node.js, etc.) and a suitable short prefix (e.g. TMS, ALT, WEB — uppercase, 2-4 chars based on project name or domain).
-2. Create the task directory structure:
+`{root}` = where this SDD root lives. Default: the project root. When `$ARGUMENTS` names a subdirectory (e.g. `clients/acme`), initialize there instead — a repo may carry several SDD roots, one per client or sub-product, each with its own board, prefix and counter. Every path below is relative to `{root}`, and a second root needs a prefix distinct from the existing ones (`TMS` vs `TMSBD`). Counters stay independent by design — never sync one root's counter to another's. When you create a second root, note it in the repo's `CLAUDE.md` (or a rule file) with the rule for choosing between them: by task-ID prefix first, else by the code being changed.
+
+1. Read `{root}`. Determine the project type (Odoo, Django, Node.js, etc.) and a suitable short prefix (e.g. TMS, ALT, WEB — uppercase, 2-4 chars based on project name or domain).
+2. Create the task directory structure under `{root}`:
    ```
    tasks/
      1-draft/
@@ -19,7 +21,7 @@ Initialize Spec-Driven Development for the current project.
    ```
    Add `.gitkeep` to each empty directory.
 3. Create `tasks/.counter` with content `0`. Create `tasks/bugs/.counter` with content `0`.
-4. Create `.tasks.toml` in project root:
+4. Create `.tasks.toml` in `{root}` (its `dir` and `counter_file` resolve relative to that same directory, so the values below are identical for a root-level and a per-client config):
    ```toml
    [tasks]
    dir = "tasks"

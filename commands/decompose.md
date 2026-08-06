@@ -2,7 +2,11 @@ Decompose a big idea into multiple draft tasks.
 
 ## Instructions
 
-1. Read `.tasks.toml` in project root. Get `id_prefix`, `dir`, and `counter_file`. If `.tasks.toml` is missing, tell the user to run `/task-init` first and stop.
+1. Locate the SDD config and read `id_prefix`, `dir`, and `counter_file` from it:
+   - Look for `.tasks.toml` at the project root and one or two levels deep (`*/.tasks.toml`, `*/*/.tasks.toml`), skipping `node_modules/`, `.git/`, `vendor/`, and plugin/cache directories — a repo may carry several SDD roots, e.g. one per client.
+   - One config → use it. Several → a project rule naming the choice wins; otherwise match the big idea to a root by the directory it names (a client, an addon, a module). `/decompose` mints new IDs, so there is no `id_prefix` to match on — when two roots stay plausible after reading the idea, ask the user which board before allocating IDs.
+   - Paths inside a config resolve relative to that config's own directory: `dir = "tasks"` in `clients/acme/.tasks.toml` means the board lives at `clients/acme/tasks/`.
+   - No `.tasks.toml` anywhere → tell the user to run `/task-init` first and stop.
 2. Parse `$ARGUMENTS`:
    - If it looks like a file path (ends with `.md`, or starts with `/`, `./`, or `..`), read the file and use its content as the big idea description.
    - Otherwise, treat the entire `$ARGUMENTS` as a free-text description.
@@ -11,7 +15,7 @@ Decompose a big idea into multiple draft tasks.
 ## Phase 1: Context Loading
 
 1. Explore the project codebase: domain structure, modules, existing conventions.
-2. Scan all existing tasks in `tasks/` (all statuses except `archive`) — read their frontmatter (id, title, status, group) to understand what already exists. This avoids creating duplicate or overlapping tasks.
+2. Scan all existing tasks in `{dir}/` (all statuses except `archive`) — read their frontmatter (id, title, status, group) to understand what already exists. This avoids creating duplicate or overlapping tasks.
 3. If tasks with a `group` field exist, note the active groups.
 
 ## Phase 2: Clarification (Light Q&A)

@@ -16,7 +16,9 @@ export const meta = {
 
 // ---------------------------------------------------------------------------
 // Args (from the /implement-wf lead):
-//   specPath        absolute path to the spec inside the worktree (tasks/4-in-progress/...)
+//   specPath        absolute path to the spec inside the worktree ({dir}/4-in-progress/...,
+//                   where {dir} is the board of the applicable .tasks.toml — the repo root's
+//                   or a client's, e.g. clients/<name>/tasks/)
 //   worktreePath    directory all agents work in
 //   baseBranch      branch to diff against for reviews (dev or current)
 //   branchName      task/{ID}-{slug} when auto_branch; null otherwise
@@ -33,6 +35,18 @@ const a = (typeof args === 'string' ? (args ? JSON.parse(args) : {}) : (args || 
 const CODERS = a.coders || []
 const WORKTREE = a.worktreePath
 const SPEC = a.specPath
+// Task-board root, derived from the spec path: a repo may carry several SDD
+// roots (e.g. clients/<name>/tasks/), so the stage directories are never
+// assumed to be a top-level `tasks/`. The lead always hands over a spec that
+// already sits in `{dir}/4-in-progress/` (commands/implement-wf.md, Phase 1),
+// so a path without that marker is a caller bug — it returns null and the
+// fail-fast guard below turns it into a loud error rather than a garbage
+// directory embedded in agent instructions.
+const deriveTasksDir = (specPath) => {
+  const at = typeof specPath === 'string' ? specPath.lastIndexOf('/4-in-progress/') : -1
+  return at === -1 ? null : specPath.slice(0, at)
+}
+const TASKS_DIR = deriveTasksDir(SPEC)
 const BASE = a.baseBranch
 const TASK = a.taskId || 'TASK'
 const REVIEW_PROMPT = a.reviewPromptPath || null
@@ -40,11 +54,12 @@ const knownConcerns = [].concat(a.seededConcerns || [])
 
 // Fail fast on misconfigured args rather than silently running coderless and
 // crashing minutes later on `CODERS[0].name` during fix-routing.
-if (!WORKTREE || !SPEC || !CODERS.length) {
+if (!WORKTREE || !SPEC || !CODERS.length || !TASKS_DIR) {
   throw new Error(
     `sdd-implement-engine: bad args — WORKTREE=${WORKTREE}, SPEC=${SPEC}, ` +
-    `CODERS=${CODERS.length}, typeof args=${typeof args}. ` +
-    `Expected a JSON object/string with worktreePath, specPath, and a non-empty coders[].`,
+    `TASKS_DIR=${TASKS_DIR}, CODERS=${CODERS.length}, typeof args=${typeof args}. ` +
+    `Expected a JSON object/string with worktreePath, a non-empty coders[], and a ` +
+    `specPath under {dir}/4-in-progress/ (the board of the applicable .tasks.toml).`,
   )
 }
 
@@ -753,6 +768,7 @@ if (typeof __IMPL_TEST__ !== 'undefined' && __IMPL_TEST__) {
   return {
     isTestPath,
     prodFilesOnly,
+    deriveTasksDir,
     awaitDetachedJob,
     spawnWithBudget,
     runPreReviewWait,
@@ -1042,7 +1058,7 @@ log(`Review resolved after ${fixRound} fix round(s).`)
 phase('Land')
 
 // 4.1 — Scribe writes the SDD finalization sections into the spec, sets
-// frontmatter (status: review), and moves the spec to tasks/5-review/.
+// frontmatter (status: review), and moves the spec to {dir}/5-review/.
 const reviewerSummary = reports.map(({ r, rep }) => `${r.type}: ${rep.verdict} — ${rep.summary}`).join('\n')
 const scribe = await agent(
   [
@@ -1054,7 +1070,7 @@ const scribe = await agent(
     `- Auto-Review Results: tests = ${test.testCount} passing; reviewer verdicts:\n${reviewerSummary}`,
     `- Steps for Manual Review: 3-7 concrete "action → expected result" steps.`,
     `Then update frontmatter: status: review, completed/updated to today, branch: ${a.branchName || BASE}.`,
-    `Then MOVE the spec file from tasks/4-in-progress/ to tasks/5-review/ (git mv).`,
+    `Then MOVE the spec file from ${TASKS_DIR}/4-in-progress/ to ${TASKS_DIR}/5-review/ (git mv).`,
     `Do this with Bash inside ${WORKTREE}. Return done=true, the implementationSummary text, and the manualReviewSteps you wrote.`,
   ].join('\n'),
   { agentType: 'general-purpose', label: 'land:scribe', phase: 'Land', schema: SCRIBE_SCHEMA },
@@ -1445,7 +1461,7 @@ async function landDelta(tag) {
 }
 
 let accepted = false
-const specGlob = `${WORKTREE}/tasks/5-review/ (the Scribe moved it there; if not found, check tasks/4-in-progress/)`
+const specGlob = `${TASKS_DIR}/5-review/ (the Scribe moved it there; if not found, check ${TASKS_DIR}/4-in-progress/)`
 const acceptPersist = new Map() // gap fpKey -> consecutive rounds still open
 const acceptGivenUp = new Set() // gap fpKeys retired to Known Concerns
 let acceptRound = 0

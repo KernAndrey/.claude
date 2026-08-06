@@ -36,11 +36,13 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 // gives each test an isolated module state (its own spawnAgent + poll counter).
 async function loadEngine() {
   const src = fs.readFileSync(ENGINE_PATH, 'utf8').replace(/^export /m, '')
-  // Minimal valid `args` so the early `if (!WORKTREE || !SPEC || !CODERS.length)`
-  // guard passes; the real engine body is never reached (we bail before it).
+  // Minimal valid `args` so the early
+  // `if (!WORKTREE || !SPEC || !CODERS.length || !TASKS_DIR)` guard passes; the
+  // real engine body is never reached (we bail before it). specPath mirrors what
+  // the lead really passes — a spec already moved into `{dir}/4-in-progress/`.
   const argsJson = JSON.stringify({
     worktreePath: '/tmp/sdd003-test',
-    specPath: '/tmp/sdd003-test/spec.md',
+    specPath: '/tmp/sdd003-test/tasks/4-in-progress/SDD-003-control-flow.md',
     baseBranch: 'dev',
     taskId: 'SDD-003',
     coders: [{ name: 'coder-1', scope: 'all', files: ['x'] }],
@@ -799,4 +801,39 @@ test('test_prodFilesOnly_drops_test_paths_keeps_production', async () => {
   // Missing / empty file list is tolerated (the `c.files || []` guard).
   assert.deepStrictEqual(mod.prodFilesOnly(undefined), [], 'undefined files → empty list')
   assert.deepStrictEqual(mod.prodFilesOnly([]), [], 'empty files → empty list')
+})
+
+// deriveTasksDir — the board root the engine embeds verbatim into the Scribe's
+// `git mv` instruction and the Accept-phase spec glob. A repo may carry several
+// SDD roots (repo root plus per-client ones), so this must follow the spec path
+// rather than assume a top-level `tasks/`; an unusable path must return null so
+// the arg guard fails loudly instead of handing agents a garbage directory.
+test('test_deriveTasksDir_follows_the_spec_path_across_sdd_roots', async () => {
+  const mod = await loadEngine()
+
+  assert.strictEqual(
+    mod.deriveTasksDir('/wt/tasks/4-in-progress/TMS-042-x.md'),
+    '/wt/tasks',
+    'repo-root board',
+  )
+  assert.strictEqual(
+    mod.deriveTasksDir('/wt/clients/internal-crm/tasks/4-in-progress/TMSBD-286-x.md'),
+    '/wt/clients/internal-crm/tasks',
+    'per-client board, not the top-level tasks/',
+  )
+  // A board directory that itself contains the marker name resolves to the last
+  // occurrence — the stage directory the lead actually moved the spec into.
+  assert.strictEqual(
+    mod.deriveTasksDir('/wt/4-in-progress/tasks/4-in-progress/X.md'),
+    '/wt/4-in-progress/tasks',
+    'last marker wins',
+  )
+
+  for (const bad of ['/wt/tasks/3-ready/X.md', '/wt/spec.md', '', undefined, null]) {
+    assert.strictEqual(
+      mod.deriveTasksDir(bad),
+      null,
+      `${bad === '' ? '<empty>' : bad} has no 4-in-progress stage → null`,
+    )
+  }
 })

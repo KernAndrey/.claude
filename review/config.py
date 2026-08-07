@@ -44,12 +44,17 @@ class RunnerConfig:
     backend: str
     model: str
     # 2400s (40 min) per single backend invocation. Chunked-path jobs run
-    # fully in parallel (chunked.py: max_workers=len(jobs)), so each kimi job
-    # is independently bounded by this; the slowest observed single job is
-    # ~1200-1300s and climbs under API concurrency. A timed-out chunk job
-    # emits a synthetic [CRITICAL] (no fallback on the chunked path) → false
-    # BLOCK, so the headroom matters. Not higher: a genuinely hung job should
-    # not hold a commit hostage for an hour.
+    # fully in parallel (chunked.py: max_workers=len(jobs)), so each job is
+    # independently bounded by this; the slowest observed single job is
+    # ~1200-1300s and climbs under API concurrency.
+    #
+    # This comment used to claim "no fallback on the chunked path". That was
+    # wrong: chunked._run_one_reviewer delegates to hook.run_with_fallback, so a
+    # chunk/lens job whose primary times out, errors, empties or is unreachable
+    # transparently falls back to FALLBACK exactly like the small-commit path.
+    # The synthetic [CRITICAL] → false BLOCK only fires when BOTH the primary
+    # and the fallback fail, which is why the headroom still matters. Not
+    # higher: a genuinely hung job should not hold a commit hostage for an hour.
     timeout: int = 2400
 
 
@@ -141,10 +146,17 @@ ALLOWED_LENSES: frozenset[str] = frozenset({"bugs", "architecture", "tests"})
 # entry, plus the whole-diff lens layer fans out across these same backends.
 # Total parallel jobs ≤ MAX_CHUNKS * len(CHUNKED_BACKENDS) +
 #                       len(ALLOWED_LENSES) * len(CHUNKED_BACKENDS).
+# Both layers currently share this one list, so the model here applies to
+# per-chunk reviewers AND whole-diff lens reviewers alike. Splitting them (e.g.
+# a cheaper model for the many chunk jobs, a stronger one for the 3 lenses)
+# needs a second list plus a fix to chunked.py's positional chunk/wholediff
+# boundary — see the `kind` computation in run_chunked_review.
 CHUNKED_BACKENDS: list[RunnerConfig] = [
-    RunnerConfig("kimi", _KIMI_MODEL),
+    RunnerConfig(
+        "codex", _CODEX_MODEL
+    ),  # matches PRIMARIES; kimi is no longer used anywhere in the live config. Failures here fall back to FALLBACK just like the small-commit path (chunked._run_one_reviewer → hook.run_with_fallback), so this is not the unprotected path an older comment claimed.
     # RunnerConfig("claude", "sonnet"),
-    # RunnerConfig("codex", _CODEX_MODEL),  # deliberately still kimi while codex proves itself on the small-commit path: the chunked path has NO fallback (see RunnerConfig.timeout), so a codex error/timeout here emits a synthetic [CRITICAL] → false BLOCK, whereas in PRIMARIES the same failure degrades quietly to FALLBACK. Swap once codex has a few clean chunked-size commits behind it.
+    # RunnerConfig("kimi", _KIMI_MODEL),  # KimiBackend stays registered and tested; uncomment to bring it back
 ]
 
 # NOTE: LENS_NAMES is intentionally not in this file. The lens registry

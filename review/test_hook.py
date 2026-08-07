@@ -1290,8 +1290,8 @@ def test_default_primaries_pin_codex_only() -> None:
     Current default: codex only (the owner switched from Kimi K2.7 Code to
     the Codex CLI on 2026-08-07 after buying a subscription; requires
     `codex login`). The arbiter and total-failure fallback remain
-    claude/sonnet, and CHUNKED_BACKENDS deliberately stays on kimi — see
-    test_config_defaults_pinned."""
+    claude/sonnet. CHUNKED_BACKENDS is codex too — see
+    test_config_defaults_pinned; kimi is no longer used in the live config."""
     assert len(PRIMARIES) == 1
     assert PRIMARIES[0].backend == "codex"
     # Pin the literal, not `_CODEX_MODEL` — asserting the constant against
@@ -1309,12 +1309,15 @@ def test_config_defaults_pinned() -> None:
     assert CHUNKED_BACKENDS
     for cfg in CHUNKED_BACKENDS:
         assert cfg.backend in BACKENDS
-    # CHUNKED_BACKENDS deliberately diverges from PRIMARIES: the chunked path
-    # has no fallback, so an error/timeout there becomes a synthetic [CRITICAL]
-    # → false BLOCK. Codex is proven only on the small-commit path so far, so
-    # big commits stay on kimi. Pinned so the divergence is a decision, not a
-    # drift someone notices when a commit is wrongly blocked.
-    assert [c.backend for c in CHUNKED_BACKENDS] == ["kimi"]
+    # CHUNKED_BACKENDS drives BOTH layers of the chunked path — one reviewer per
+    # chunk and one per whole-diff lens — so this list decides who reviews every
+    # commit at or above MAX_PROD_LINES. Pinned to codex to match PRIMARIES: kimi
+    # is no longer used in the live config. Failures here fall back to FALLBACK
+    # exactly like the small-commit path (chunked._run_one_reviewer delegates to
+    # hook.run_with_fallback); the synthetic [CRITICAL] fires only when primary
+    # AND fallback both fail.
+    assert [c.backend for c in CHUNKED_BACKENDS] == ["codex"]
+    assert [c.model for c in CHUNKED_BACKENDS] == ["gpt-5.6-terra"]
 
 
 # ---------------------------------------------------------------------------

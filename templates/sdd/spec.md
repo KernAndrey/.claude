@@ -191,25 +191,68 @@ Section ownership:
 
 ## Testing Strategy
 
-<!-- How each AC will be tested. Written by Analyst in business/behavior terms,
-     expanded by Architect with file-level detail when needed.
+<!-- The test plan, AC by AC. Owned by Analyst and written in business/behavior
+     terms; the Architect adds the file-level test target in the AC →
+     Implementation map rather than editing here. A case missing here is an
+     untested path in production — Spec-Critic-Testing audits this section
+     against every AC, Behavior rule, Example, and Edge Case, and the Tester in
+     /implement writes exactly the cases it lists.
 
-     Must answer:
-       - Level per AC: unit | integration | e2e
-       - Fixture strategy: where test data comes from (synthetic, real samples,
+     One `### AC-N (short title) — level` entry per AC, where level is
+     unit | integration | e2e. Each entry lists:
+       - Success: the happy path — literal input, literal observable that
+         proves the AC holds
+       - Failure: every way this AC can legitimately be violated — rejected
+         input, missing permission, absent record, external service error,
+         conflicting state. One line each. When an AC genuinely has none,
+         write `no failure mode — <why>` so the reader sees it was considered.
+       - Boundary: empty, zero, one, many, maximum, duplicate, and concurrent
+         cases, plus every branch of an enumeration or state transition the AC
+         touches. One line each.
+       - Fixtures: where the test data comes from (synthetic, real samples,
          common base class)
-       - Idempotency requirements: which operations must give the same result
-         on repeated runs (migrations, sanitizers, cron jobs)
-       - Mock boundaries: for integration tests, where mocks end and real code
-         begins (e.g. "mock requests.Session, not the model layer")
+       - Idempotency: which operations give the same result on a repeated run
+         (migrations, sanitizers, cron jobs), or `n/a`
+       - Mocks: for integration tests, where mocks end and real code begins
+         (e.g. "mock requests.Session, not the model layer")
+
+     Close with two coverage lines that map the rest of the spec into the plan:
+       - Edge Cases covered: every row of ## Edge Cases & Risks → the entry
+         that tests it
+       - Examples covered: every ## Examples entry → the case that asserts its
+         literal before/after values
 
      Example:
-       - AC-1 (archive via wizard): integration — TransactionCase, real ORM,
-         fixture: `hr.employee` with active=True. Idempotent: re-running
-         wizard on already-archived employee must be a no-op. Mocks: none.
-       - AC-2 (signature sanitizer): unit — pure function, pytest-compatible,
-         fixtures in tests/fixtures/signatures/*.html (3 real samples).
-         Idempotent: sanitize(sanitize(x)) == sanitize(x).
+
+     ### AC-1 (archive via wizard) — integration
+     - Success: employee `active=True`, reason "Retired" → `active=False`,
+       `archive_reason='Retired'`, one audit row with `archived_by=uid`.
+     - Failure: employee already archived → UserError "Employee is already
+       archived", no second audit row.
+     - Failure: user outside `hr.group_hr_manager` → AccessError, record
+       unchanged.
+     - Boundary: reason "Other" with empty free text → ValidationError.
+     - Boundary: 50 employees archived in one batch → 50 audit rows.
+     - Fixtures: TransactionCase, real ORM, `hr.employee` with active=True.
+     - Idempotency: re-running the wizard on an archived employee is a no-op.
+     - Mocks: none.
+
+     ### AC-2 (signature sanitizer) — unit
+     - Success: input containing a `<script>` block → output identical minus
+       that block.
+     - Failure: no failure mode — pure function, total over string input.
+     - Boundary: empty string → empty string; 1 MB input → completes without
+       truncation.
+     - Fixtures: tests/fixtures/signatures/*.html (3 real samples).
+     - Idempotency: sanitize(sanitize(x)) == sanitize(x).
+     - Mocks: none.
+
+     Edge Cases covered: risk 1 → AC-1 failure 2; risk 2 → AC-2 boundary 2.
+     Examples covered: "Archive a lead-stage contact" → AC-1 success.
+
+     A gap that survives /spec's fix rounds is recorded as a closing line
+     `Uncovered: AC-N — <the missing case>`, one per gap, so /implement sees it
+     instead of inheriting a silent hole.
 -->
 
 ## Architecture & Implementation Plan
@@ -354,7 +397,7 @@ hint needs no Change Control entry.
 
      ### b-N — <short title>
      - **status**: open | resolved-by-user
-     - **raised-by**: spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise | spec-critic-adaptive:{lens-id} | lead (Phase 1 / Phase 3)
+     - **raised-by**: spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise | spec-critic-testing | spec-critic-adaptive:{lens-id} | lead (Phase 1 / Phase 3)
      - **raised-on**: YYYY-MM-DD
      - **expertise-needed**: business | architecture | testing | security | ux | unknown
      - **context**: <what was found, what's ambiguous>
@@ -373,7 +416,7 @@ hint needs no Change Control entry.
      Spec-Auditor to skip these entries during /implement.
 
      Filled by Lead in /spec §2c-0 before the critic batch spawns: the angles it
-     designed for this specific spec, on top of the three fixed critics. Recorded
+     designed for this specific spec, on top of the four fixed critics. Recorded
      here so a resume run can re-run or extend them instead of losing them.
 
      Entry format:

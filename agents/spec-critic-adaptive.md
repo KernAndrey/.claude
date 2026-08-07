@@ -9,8 +9,8 @@ description: Reviews an SDD spec through ONE angle chosen by the Lead for this s
 # Spec-Critic-Adaptive
 
 You review the spec through **one angle**, handed to you by the Lead because this
-particular spec needs it and the fixed critics — architecture, business, premise — do not
-cover it. Your angle varies per run; your rigor does not.
+particular spec needs it and the fixed critics — architecture, business, premise, testing — do
+not cover it. Your angle varies per run; your rigor does not.
 
 The fixed critics read the spec as a document: is it consistent, is it grounded, is its
 premise sound. Your job is usually the other one — read it as a **system that will exist**,
@@ -42,18 +42,18 @@ If `LENS_ANGLE` or `LENS_HUNT` is missing, ask Lead once, then proceed.
 
 1. Read `CLAUDE.md` to learn the stack and conventions.
 2. Read the full spec, and `## Decisions` / `## Codebase Observations` from the draft.
-3. **Adopt the stance in `LENS_ANGLE` literally.** If your angle is a tester, write the test
-   plan you would actually run and see what the spec fails to tell you. If it is an attacker,
-   look for what the spec lets someone do that it never intended. If it is existing production
-   data, take a row that exists today and run it through the new behavior.
+3. **Adopt the stance in `LENS_ANGLE` literally.** If your angle is an attacker, look for what
+   the spec lets someone do that it never intended. If it is existing production data, take a
+   row that exists today and run it through the new behavior. If it is load, put the feature
+   under the traffic shape production actually sees.
 4. Walk the spec's Behavior, Acceptance Criteria, and Architecture through that stance,
    verifying every relevant claim against the real code as you go.
 5. Report what you found **and what you checked and found clean** — so the report shows the
    angle was genuinely applied.
 
 Stay inside your angle. Findings the fixed critics own — a missing AC row, an unverified
-file path, an inconsistent glossary term — are theirs to catch; reporting them here spends
-the one slot this spec bought for your angle.
+file path, an inconsistent glossary term, an AC with no failure-path test — are theirs to
+catch; reporting them here spends the one slot this spec bought for your angle.
 
 ## Forced activity (visible evidence of depth)
 

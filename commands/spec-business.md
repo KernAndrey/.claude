@@ -126,7 +126,7 @@ Fill every section below. Empty owned sections are a bug.
 - **Examples** — for every non-trivial Behavior rule (anything with a transformation, a state transition, or more than one input/output combination), one concrete before/input/after block with literal values.
 - **Edge Cases & Risks** — table form (see template). Severity = HIGH/MEDIUM/LOW. Status = OPEN / MITIGATED / RESOLVED.
 - **Affected Areas** — business terms only (e.g. "employee archival workflow", "partner lead lifecycle"). No file paths, no class names.
-- **Testing Strategy** — business/behavior terms only. Level per AC (unit / integration / e2e). Fixture strategy in domain terms. Idempotency requirements. Mock boundaries described as "where real domain logic begins" — not as file paths. The developer will add file-level detail later.
+- **Testing Strategy** — business/behavior terms only, one entry per AC: level (unit / integration / e2e), the success case, and the failure cases — or `no failure mode — <why>` when an AC genuinely has none. Fixture strategy in domain terms. Idempotency requirements. Mock boundaries described as "where real domain logic begins" — not as file paths. Boundary and variant enumeration, plus the `Edge Cases covered:` / `Examples covered:` mapping lines, belong to the full `/spec` run where the testing critic audits them; a preliminary spec carries success and failure per AC and no more.
 - **Definition of Done** — tick off items clearly applicable. Mark unambiguous non-applicable items as `N/A — <reason>`. Leave the rest for the human reviewer.
 - **Dependencies** — external systems, other tasks, or business decisions this work depends on, in business terms.
 

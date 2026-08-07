@@ -119,7 +119,7 @@ Each blocker is a level-3 heading inside the spec's `## Blockers` section. Gener
 ```markdown
 ### b-N — <short title summarizing the question>
 - **status**: open
-- **raised-by**: lead (Phase 1 / Phase 3) | spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise | spec-critic-adaptive:{lens-id}
+- **raised-by**: lead (Phase 1 / Phase 3) | spec-analyst | spec-architect | spec-critic-arch | spec-critic-business | spec-critic-premise | spec-critic-testing | spec-critic-adaptive:{lens-id}
 - **raised-on**: {TODAY}
 - **expertise-needed**: business | architecture | testing | security | ux | unknown
 - **context**: <what was found in the code or spec, what's ambiguous, what each option would imply>
@@ -215,34 +215,34 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 
 **Message loop:** same shape as 2a, but with `spec-architect` and the Architect signal names.
 
-### 2c. Critics (3 fixed + 3–5 adaptive lenses, in parallel)
+### 2c. Critics (4 fixed + 3–5 adaptive lenses, in parallel)
 
-Three fixed critics read every spec. On top of them, you design **3–5 adaptive lenses** for this specific spec (2c-0) and spawn one critic per lens.
+Four fixed critics read every spec. On top of them, you design **3–5 adaptive lenses** for this specific spec (2c-0) and spawn one critic per lens.
 
 Spawn everything — fixed critics and adaptive lenses — as background agents in **one batch** (all `Agent` calls in a single response). They run in parallel; there are no dependencies. Record every `agentId`.
 
-Arm two watchdogs: `Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_CRITICS")` for the three fixed critics, and `Bash(run_in_background: true, command: "sleep 1500; echo WATCHDOG_ADAPTIVE")` for the adaptive ones. The adaptive rows can push the batch past the concurrency cap, so later spawns queue for slots — a single 900s timer over the whole batch fires on healthy-but-queued agents, and the respawns it triggers make the contention worse.
+Arm two watchdogs: `Bash(run_in_background: true, command: "sleep 1200; echo WATCHDOG_CRITICS")` for the four fixed critics — the testing critic walks every AC, edge case, and example into a matrix, so it runs longer than the other three — and `Bash(run_in_background: true, command: "sleep 1500; echo WATCHDOG_ADAPTIVE")` for the adaptive ones. The adaptive rows can push the batch past the concurrency cap, so later spawns queue for slots — a single 900s timer over the whole batch fires on healthy-but-queued agents, and the respawns it triggers make the contention worse.
 
-The three fixed critic spawns are 2c-i / 2c-ii / 2c-iii below; the adaptive lenses spawn via **2c-iv**.
+The four fixed critic spawns are 2c-i / 2c-ii / 2c-iii / 2c-iv below; the adaptive lenses spawn via **2c-v**.
 
 #### 2c-0. Lens design (think before you spawn)
 
-The three fixed critics read the spec as a document. What they cannot do is cover the angle *this* spec needs — that depends on its domain, size, and complexity, and it is yours to work out. On the spec that motivated this phase, four self-designed angles found more than all the fixed passes combined, because they looked at the system rather than the text: through a tester's eyes, through an attacker's eyes, against existing production data, and against concurrent actions.
+The four fixed critics read the spec as a document. What they cannot do is cover the angle *this* spec needs — that depends on its domain, size, and complexity, and it is yours to work out. On the spec that motivated this phase, four self-designed angles found more than all the fixed passes combined, because they looked at the system rather than the text: through a tester's eyes, through an attacker's eyes, against existing production data, and against concurrent actions. The tester's-eyes angle earned its own fixed critic (2c-iv) and is covered now; the other three are the kind of angle still yours to design.
 
-1. **Read the fixed lens inventories** in `~/.claude/agents/spec-critic-{arch,business,premise}.md`. You are designing angles they do not cover, so you need to know what they do: arch Lens C already simulates state transitions and Lens D already covers data consistency after migration. Restating one of those spends a slot on covered ground.
+1. **Read the fixed lens inventories** in `~/.claude/agents/spec-critic-{arch,business,premise,testing}.md`. You are designing angles they do not cover, so you need to know what they do: arch Lens C already simulates state transitions, arch Lens D already covers data consistency after migration, and testing Lenses T1–T7 already own AC → test coverage down to failure paths and boundary variants. Restating one of those spends a slot on covered ground.
 2. **Choose how many** — 3 for ≤5 ACs in a single module; 4 for 6–15 ACs; 5 for >15 ACs, or multi-module, or anything touching data migration, concurrent access, or external integrations.
 3. **Write each lens** as four fields:
    - `lens-id` — short slug, e.g. `concurrent-actions`
    - `angle` — the stance, in one line
    - `justification` — why this spec needs it, **citing something concrete in the spec**: an AC number, a file path, a named state transition, a model name
    - `hunt` — the failure classes this angle should surface
-4. **Prefer system-level angles over text-level ones.** Non-exhaustive seeds: tester's eyes, attacker's eyes, existing production data, concurrent actions, operations and observability, performance at real scale, permissions and multi-tenancy, failure and rollback, cost. Treat this as a starting point, not a menu — **at least one lens must be specific to this spec's domain and appear on no list.** The justification citation is what separates a designed angle from a picked one.
+4. **Prefer system-level angles over text-level ones.** Non-exhaustive seeds: attacker's eyes, existing production data, concurrent actions, operations and observability, performance at real scale, permissions and multi-tenancy, failure and rollback, cost. Treat this as a starting point, not a menu — **at least one lens must be specific to this spec's domain and appear on no list.** The justification citation is what separates a designed angle from a picked one. Test coverage of the ACs is the fixed testing critic's ground, so a "tester's eyes" lens here duplicates it — the exception is a testing angle it cannot reach, such as how the feature behaves under a load profile or a data shape only production has.
 5. **Announce** the chosen lenses to the user with one line of rationale each, then proceed. This is your call to make — do not wait for approval.
 6. **Record them** in the spec's `## Review Lenses` section via `Edit`, before spawning — appending your entries below the section's italic *"Review metadata — not requirements"* line and leaving that line in place, since it is what keeps `Spec-Auditor` from tracing lenses to code during `/implement`. The briefs otherwise live only in a spawn prompt, and a resume run would lose them.
 
 <bad_pattern>
-❌ BAD THOUGHT: "Architecture, business, premise — that's every angle there is. Spawn the batch."
-✅ REALITY: Those three are the angles every spec gets. The ones that pay for themselves are the ones only this spec needs, and nobody but you is positioned to name them.
+❌ BAD THOUGHT: "Architecture, business, premise, testing — that's every angle there is. Spawn the batch."
+✅ REALITY: Those four are the angles every spec gets. The ones that pay for themselves are the ones only this spec needs, and nobody but you is positioned to name them.
 ⚠️ DETECTION: About to spawn the critic batch with no `## Review Lenses` block in the spec? → design the lenses first.
 </bad_pattern>
 
@@ -285,7 +285,20 @@ Spawn `Agent(subagent_type: "Spec-Critic-Premise", name: "spec-critic-premise", 
 > {On resume:} `RESUMED_RUN: true`
 > Run your full premise pass (Lenses L1–L6). A sound foundation yields zero challenges — never manufacture one. Signal `SPEC PREMISE CRITIC REPORT` when done.
 
-#### 2c-iv. Adaptive lens critics (one per lens from 2c-0)
+#### 2c-iv. Testing Critic
+
+Spawn `Agent(subagent_type: "Spec-Critic-Testing", name: "spec-critic-testing", run_in_background: true, prompt: "...")`. The prompt:
+
+> Read your instructions: `~/.claude/agents/spec-critic-testing.md`
+> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
+> Draft path: `{draft path}` — **read `## Decisions` and `## Codebase Observations`. A decision that changes behavior changes what must be tested: verify `## Testing Strategy` covers the behavior every numbered decision introduces.**
+> Working directory: `{project root}`
+> Phase 1 context: {inline user answers and Lead observations}
+> Project CLAUDE.md: `{path}`
+> {On resume:} `RESUMED_RUN: true`
+> Build the AC coverage matrix, then run your full lens pass (T1–T7). Report the matrix in full — one row per AC. Signal `SPEC TESTING CRITIC REPORT` when done.
+
+#### 2c-v. Adaptive lens critics (one per lens from 2c-0)
 
 In the same batch, spawn one `Spec-Critic-Adaptive` per lens designed in 2c-0.
 
@@ -311,11 +324,11 @@ Run your lens pass. Signal `SPEC ADAPTIVE CRITIC REPORT [{lens-id}]` when done."
 
 **Message loops:** run the fixed critics and the adaptive lenses in parallel. Critics rarely escalate; if any (fixed or adaptive) does, handle it like any other `QUESTION FOR USER`. An adaptive report missing its DEPTH or VERIFIED OK block is rejected and re-requested, same as any critic report.
 
-Wait for **every** agent in the batch — three fixed critics and all adaptive lenses — to complete before proceeding.
+Wait for **every** agent in the batch — four fixed critics and all adaptive lenses — to complete before proceeding.
 
 ### 2d. Apply findings
 
-You now hold three fixed critic reports and one report per adaptive lens. Merge them across all reports. **Dedup** — findings that flag the same issue (across critics, or between a fixed critic and an adaptive lens) collapse to one, keeping the more specific description. **Union of severity** — a finding raised by *any* source counts; a lens-only catch is still a catch. This includes `EMERGENT QUESTIONS FOR USER` from every source — they all feed into Phase 3.
+You now hold four fixed critic reports and one report per adaptive lens. Merge them across all reports. **Dedup** — findings that flag the same issue (across critics, or between a fixed critic and an adaptive lens) collapse to one, keeping the more specific description. **Union of severity** — a finding raised by *any* source counts; a lens-only catch is still a catch. This includes `EMERGENT QUESTIONS FOR USER` from every source — they all feed into Phase 3.
 
 Adaptive findings carry the same `route:` tags and flow through the fix rounds below exactly like critic findings. Where an adaptive lens and a fixed critic disagree, keep both and let the fix round resolve it — divergence is signal.
 
@@ -323,16 +336,20 @@ The premise critic is different in kind: it challenges decisions, not implementa
 
 The adaptive lenses also get **no re-check** pass. Their findings route to Analyst and Architect normally and land inside the existing 2-fix-round cap; re-checking each lens as well would multiply the rounds without adding coverage.
 
-The Analyst, Architect, and both consistency Critics (arch, business) have completed by now — resume each **by its `agentId`** (not by name). Their preserved context means they remember their prior work.
+The Analyst, Architect, and the three consistency Critics (arch, business, testing) have completed by now — resume each **by its `agentId`** (not by name). Their preserved context means they remember their prior work.
+
+A testing critic report without its full COVERAGE MATRIX is rejected and re-requested, same as a missing DEPTH block — the matrix is what shows every AC was walked rather than sampled.
 
 After reports are collected:
 
 - **Business findings** (`route: analyst`) → resume the Analyst by `agentId` with the specific findings, request fixes. Run the Analyst message loop again until `SPEC ANALYST FIX ROUND DONE.`.
 - **Architecture findings** (`route: architect`) → resume the Architect by `agentId`. Run the Architect message loop until `SPEC ARCHITECT FIX ROUND DONE.`.
+- **Testing findings** route by what the fix touches: a missing case, failure path, or uncovered edge case goes to the Analyst (it is written in behavior terms); test file placement, fixture infrastructure, and unsupported test levels go to the Architect. Carry the suggested case verbatim — it is already written in literal values.
 - **After fixes**: optionally re-check with the appropriate critic, resumed by `agentId`:
   - Business findings: `SendMessage(to: "{business-critic agentId}", "RE-CHECK OF: [f-1, f-3]")` → wait for `SPEC BUSINESS CRITIC RE-CHECK DONE.`
   - Architecture findings: `SendMessage(to: "{arch-critic agentId}", "RE-CHECK OF: [f-2, f-4]")` → wait for `SPEC ARCH CRITIC RE-CHECK DONE.`
-- **Maximum 2 fix rounds per agent.** After two rounds, unresolved business concerns stay in `Edge Cases & Risks`, unresolved architectural concerns stay in `Open architectural questions`. Phase 3 picks them up if they need user input.
+  - Testing findings: `SendMessage(to: "{testing-critic agentId}", "RE-CHECK OF: [f-5, f-6]")` → wait for `SPEC TESTING CRITIC RE-CHECK DONE.` Re-check this one whenever any AC changed during the fix round — a new or reworded AC arrives with no test plan behind it.
+- **Maximum 2 fix rounds per agent.** After two rounds, unresolved business concerns stay in `Edge Cases & Risks`, unresolved architectural concerns stay in `Open architectural questions`, and unresolved testing findings become an `Uncovered:` line at the end of `## Testing Strategy`, one per gap, naming the AC and the missing case. That line is what carries the gap into `/implement` — the Tester writes what it can and Test-Reviewer reports the rest, instead of the gap vanishing at the cap. Phase 3 picks up anything that needs user input.
 - **Tiny edits** (typo, missing bullet): Lead may Edit the spec file directly instead of round-tripping through an agent.
 - **`EMERGENT QUESTIONS FOR USER`**: deferred to Phase 3, do not resolve here.
 
@@ -345,7 +362,7 @@ Many open questions only become visible after Analyst describes behavior, Archit
 Gather from:
 - `Edge Cases & Risks` — table rows with `Status: OPEN` that still need clarification
 - `Architecture & Implementation Plan → Open architectural questions`
-- Every critic's `EMERGENT QUESTIONS FOR USER` — the three fixed ones (arch, business, premise) and each adaptive lens; each carries an expertise tag. The premise critic's questions challenge decisions the user already made — present them as genuine reconsiderations, not as gaps. An adaptive lens's questions carry its `lens-id`, so the user can see which angle raised them.
+- Every critic's `EMERGENT QUESTIONS FOR USER` — the four fixed ones (arch, business, premise, testing) and each adaptive lens; each carries an expertise tag. The testing critic's questions are `expertise: testing` and name a behavior nobody specified — usually "what should happen when this fails?", which the user answers once and the plan then covers. The premise critic's questions challenge decisions the user already made — present them as genuine reconsiderations, not as gaps. An adaptive lens's questions carry its `lens-id`, so the user can see which angle raised them.
 
 ### Classify
 
@@ -385,7 +402,7 @@ git add "{dir}/1-draft/{ID}-{slug}.md"
 git commit -m "spec({ID}): draft with decisions and codebase observations"
 ```
 
-**Commit 2 — finalization.** The spec is verified and the draft has moved to the archive (§4, step 9).
+**Commit 2 — finalization.** The spec is verified and the draft has moved to the archive (§4, step 10).
 
 ```
 git add -A -- "{dir}/2-spec/{ID}-{slug}.md" "{dir}/archive/drafts/{ID}-{slug}.md"
@@ -408,13 +425,14 @@ Run both commits with `run_in_background: true` — the pre-commit review hook c
 1. Read the spec file.
 2. Parse `## Blockers`. Count level-3 entries with `status: open`.
 3. Verify the AC → Implementation map covers every AC in Acceptance Criteria.
-4. Verify `## Examples` has entries for non-trivial Behavior rules.
-5. Verify `## Definition of Done` has been populated (items either checked, left unchecked for the human, or marked `N/A — <reason>`).
-6. Verify `## Key Constraints` has 3-7 items, each tracing to Behavior or AC.
-7. Verify `## Assumptions` is populated (not just the template placeholder).
-8. Verify exactly one `[SENTINEL]` marker exists in the Behavior section.
-9. Move the draft to `{dir}/archive/drafts/` — it is consumed either way, blockers or not.
-10. Commit the spec and the archived draft together, as commit 2 of `## Commits`. This is the run's last action; the branches below only produce output.
+4. Verify `## Testing Strategy` has one entry per AC, each carrying a success case and either a failure case or an explicit `no failure mode — <reason>` note, and that it closes with the `Edge Cases covered:` and `Examples covered:` lines. An AC accounted for by an `Uncovered:` line passes this gate — the fix rounds ran and recorded what they could not close. An AC with neither an entry nor an `Uncovered:` line means the section was never audited: send it to the Analyst rather than shipping the spec with a silent hole.
+5. Verify `## Examples` has entries for non-trivial Behavior rules.
+6. Verify `## Definition of Done` has been populated (items either checked, left unchecked for the human, or marked `N/A — <reason>`).
+7. Verify `## Key Constraints` has 3-7 items, each tracing to Behavior or AC.
+8. Verify `## Assumptions` is populated (not just the template placeholder).
+9. Verify exactly one `[SENTINEL]` marker exists in the Behavior section.
+10. Move the draft to `{dir}/archive/drafts/` — it is consumed either way, blockers or not.
+11. Commit the spec and the archived draft together, as commit 2 of `## Commits`. This is the run's last action; the branches below only produce output.
 
 ### If open blockers > 0
 

@@ -846,6 +846,7 @@ function testerPrompt(extra) {
     `Read your role instructions: ~/.claude/agents/tester.md`,
     `Coding is complete. Changed files: ${changedFiles.join(', ')}`,
     `Write tests for the implementation and run them.`,
+    `Work AC by AC from the spec's ## Testing Strategy: implement every case it lists, and give each AC a success test plus a failure test asserting the specific exception or rejected outcome — unless its entry says "no failure mode". Cover the variants and branches each AC names (empty/zero/one/many/duplicate/concurrent, every enum value, every state transition), every Edge Cases & Risks row, and the literal values of every ## Examples entry.`,
     `If you find a PRODUCTION bug, set productionBug (do not work around it). Otherwise productionBug = null.`,
     extra || '',
   ].join('\n')
@@ -884,7 +885,7 @@ phase('Review')
 const uiNeeded = changedFiles.some(f => FRONTEND_RE.test(f))
 const REVIEWERS = [
   { key: 'code', type: 'Code-Reviewer', scope: 'production code quality' },
-  { key: 'test', type: 'Test-Reviewer', scope: 'test quality and coverage' },
+  { key: 'test', type: 'Test-Reviewer', scope: 'the AC coverage matrix and test quality' },
   { key: 'spec', type: 'Spec-Auditor', scope: 'spec compliance' },
   { key: 'security', type: 'Security-Reviewer', scope: 'security and architecture' },
 ]
@@ -900,6 +901,12 @@ function reviewerPrompt(r) {
     `Audit ${r.scope}. Return verdict, a non-empty depth list (what you audited + counts), findings, and a summary.`,
     `Give each finding a stable id (f-1, f-2, ...).`,
   ]
+  if (r.key === 'test') {
+    // depth is label+count pairs, so the matrix lands as per-AC counts: this is
+    // what makes an all-happy-path suite visible instead of "N tests, all green".
+    lines.push(`Build the AC coverage matrix first — one row per AC in the spec, naming the success test, the failure test(s), and the boundary/variant tests. Report it in your summary and put its totals in depth: "ACs in spec", "ACs with success test", "ACs with failure test", "ACs with boundary tests", "Edge Cases tested", "Examples asserted".`)
+    lines.push(`An AC with no failure test is MUST_FIX unless its ## Testing Strategy entry says "no failure mode". Name the untested branch or enum value in each finding.`)
+  }
   if (r.key === 'ui') {
     lines.push(`Changed files: ${changedFiles.join(', ')}`)
     lines.push(`Identify the affected pages/URLs from the spec and changed files.`)

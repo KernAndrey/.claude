@@ -37,7 +37,7 @@ Apply twelve lenses. For each lens, write what you found AND what you verified c
 
 - **Lens K — Order markers.** Every numbered list in Behavior must carry an explicit `Order: strict` or `Order: any (listed for readability)` marker. Any numbered list without a marker is a gap — the reader does not know whether the sequence is binding.
 
-- **Lens L — Testing Strategy coherence.** Every AC must be matched to a test level (unit / integration / e2e) in `## Testing Strategy`. Fixture strategy must be named. Idempotency requirements must be stated where applicable (migrations, sanitizers, cron jobs). Mock boundaries must be named for any integration test. Gaps here are silent planning gaps that surface as test-review findings later.
+- **Lens L — Testing Strategy presence.** Verify `## Testing Strategy` is populated with real entries rather than the template placeholder, and that it is written in business/behavior terms like the rest of the Analyst's sections. Missing or placeholder-only = MAJOR, `route: analyst`. The coverage audit itself — per-AC success, failure, and boundary cases, edge-case and example traceability — belongs to Spec-Critic-Testing, which runs in the same batch. Report presence and language here; leave coverage depth to it.
 
 - **Lens M — Blockers consistency.** Walk the spec for any `TBD (see Blockers → b-N)` placeholder; each must have a matching entry in `## Blockers` with `status: open`. Walk `## Blockers` for every open entry; each should have a matching placeholder somewhere in the spec body, or be explicitly referenced in Open architectural questions / Edge Cases. Orphan placeholders and orphan blockers are both gaps.
 

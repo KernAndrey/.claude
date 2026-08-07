@@ -41,15 +41,15 @@ If `.claude/review_prompt.md` exists, read it — it carries project-specific re
 1. Read the spec's Behavior so you know what the change is meant to do.
 2. Get the diff and read the code around every changed hunk — the bug your angle finds is
    usually in the interaction between new code and old code, not inside the new lines.
-3. **Adopt the stance in `LENS_ANGLE` literally.** A tester writes the test plan and finds
-   what nothing covers. An attacker looks for what the code now permits that nobody intended.
-   Existing production data means taking a row that exists today and running it through the
-   new path. Concurrent actions means two callers arriving at the same moment.
+3. **Adopt the stance in `LENS_ANGLE` literally.** An attacker looks for what the code now
+   permits that nobody intended. Existing production data means taking a row that exists today
+   and running it through the new path. Concurrent actions means two callers arriving at the
+   same moment. Load means the traffic shape production actually sees.
 4. Trace the failure to a concrete `file:line` and a concrete triggering condition.
 
-Stay inside your angle. Findings the fixed reviewers own — long methods, missing tests,
-spec drift, a plain injection bug — are theirs; reporting them here spends the one slot this
-change bought for your angle.
+Stay inside your angle. Findings the fixed reviewers own — long methods, missing tests, an AC
+with no failure-path test, spec drift, a plain injection bug — are theirs; reporting them here
+spends the one slot this change bought for your angle.
 
 ## Forced activity
 

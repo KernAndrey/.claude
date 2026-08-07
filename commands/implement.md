@@ -163,7 +163,7 @@ The five dimensions below are what every change gets. What they cannot cover is 
 1. **Read the diff and the spec's Behavior first.** You cannot name the right angle for a change you have not looked at.
 2. **Choose 2–4 lenses**, scaled by the diff: 2 for a single-file change, 4 when it spans modules or touches data migration, concurrent access, permissions, or external integrations.
 3. **Write each lens** as four fields — `lens-id`, `angle` (the stance in one line), `justification` (why *this* diff needs it, citing a concrete `file:line` or spec behavior), `hunt` (the failure classes it should surface).
-4. **Prefer system-level angles.** Non-exhaustive seeds: tester's eyes, attacker's eyes, existing production data, concurrent actions, operations and observability, performance at real scale, permissions and multi-tenancy, failure and rollback. Do not restate a fixed dimension — a long method belongs to Code-Reviewer, a missing test to Test-Reviewer, spec drift to Spec-Auditor, a plain injection bug to Security-Reviewer.
+4. **Prefer system-level angles.** Non-exhaustive seeds: attacker's eyes, existing production data, concurrent actions, operations and observability, performance at real scale, permissions and multi-tenancy, failure and rollback. Do not restate a fixed dimension — a long method belongs to Code-Reviewer, a missing test or an untested failure path to Test-Reviewer, spec drift to Spec-Auditor, a plain injection bug to Security-Reviewer.
 5. **Announce** the chosen lenses with one line of rationale each, then spawn. This is your call — do not wait for approval.
 
 #### Reviewer list
@@ -171,7 +171,7 @@ The five dimensions below are what every change gets. What they cannot cover is 
 | Dimension | subagent_type | name |
 |---|---|---|
 | production code quality | `Code-Reviewer` | `code-reviewer` |
-| test quality and coverage | `Test-Reviewer` | `test-reviewer` |
+| AC coverage matrix and test quality | `Test-Reviewer` | `test-reviewer` |
 | spec compliance | `Spec-Auditor` | `spec-auditor` |
 | security and architecture | `Security-Reviewer` | `security-reviewer` |
 | visual verification *(only if frontend files changed)* | `UI-Reviewer` | `ui-reviewer` |
@@ -243,6 +243,8 @@ SUMMARY: X findings (Y MUST FIX, Z NIT/CONCERN)
 
 **Reject reports without a DEPTH block** — this applies to fixed reviewers and adaptive lenses alike. The DEPTH counts are how you detect shallow reviews. If a reviewer reports `VERDICT` and `FINDINGS` but omits `DEPTH`, re-run that reviewer. Same rule if counts look implausibly low for the diff (e.g. "Methods audited: 2" on a 20-method diff). To re-run, resume the reviewer by `agentId` and ask for the missing DEPTH block, or spawn a fresh instance.
 
+Test-Reviewer carries one extra requirement: its report includes the **AC coverage matrix**, one row per AC in the spec, with the success, failure, and boundary tests named. A report with no matrix, or a matrix covering fewer ACs than the spec has, is rejected the same way a missing DEPTH block is.
+
 #### Merge the reports
 
 You now hold one report per fixed dimension plus one per adaptive lens. Merge them all before acting:
@@ -272,7 +274,7 @@ Precondition: All spawned Phase 2 reviewers must have reported.
 
 Work from the **merged, deduped** findings (Phase 2 "Merge the reports"). Build two fix lists:
 - **Coder fixes**: `MUST FIX` / `CRITICAL` findings from Code-Reviewer, Spec-Auditor, Security-Reviewer, UI-Reviewer
-- **Tester fixes**: `MUST FIX` findings from Test-Reviewer, missing coverage from Spec-Auditor
+- **Tester fixes**: `MUST FIX` findings from Test-Reviewer, missing coverage from Spec-Auditor. One exception: a finding the reviewer marked as a spec-flagged `Uncovered:` gap goes to Known Concerns and the user escalation path instead — the spec already recorded that the behavior is undefined, so fix rounds cannot close it and would spend all 7 iterations trying.
 - **Adaptive lens findings** join whichever list matches the fix: a production-code failure goes to the Coder, an untested path to the Tester. Route by what the fix touches, not by which lens raised it.
 
 If zero `MUST FIX` / `CRITICAL` across all reviewers — skip to Finalization.
@@ -332,7 +334,7 @@ Say: **"Fix rounds complete. Running gate check, final test suite, then committi
 - Phase 1a — **every** Coder from Work breakdown sent `CODER DONE`? If NO → resume the missing one(s) by `agentId` NOW.
 - Phase 1b — Tester sent `TESTER DONE` with test count? If NO → resume Tester NOW.
 - Phase 2 — Code-Reviewer reported with DEPTH? If NO → spawn NOW.
-- Phase 2 — Test-Reviewer reported? If NO → spawn NOW.
+- Phase 2 — Test-Reviewer reported, with a matrix row per AC? If NO → spawn NOW.
 - Phase 2 — Spec-Auditor reported? If NO → spawn NOW.
 - Phase 2 — Security-Reviewer reported? If NO → spawn NOW.
 - Phase 2 — UI-Reviewer reported? (only if spawned) If NO → spawn NOW.

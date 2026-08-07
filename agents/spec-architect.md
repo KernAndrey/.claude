@@ -90,6 +90,8 @@ Every Acceptance Criterion from the spec must have a row in the AC → Implement
 
 An AC without a mapping is a planning gap. If you cannot map an AC because the requirement is unclear, put it in `Open architectural questions` — do not leave it unmapped.
 
+The test target carries the file-level half of `## Testing Strategy`, which the Analyst writes in behavior terms and you do not edit. So for each AC, check that the level it plans (unit / integration / e2e) is one the project's harness actually runs, and that the fixtures and mock boundaries it names have somewhere to live: an existing fixture file, base test class, or factory — or a new one you list under "Files to create". When the planned level has no harness, or the fixtures would have to be built from scratch, record it under `Open architectural questions` and name the test target you can support instead. An AC whose test target names a runner the project does not have is a plan that cannot execute.
+
 Why: this is the one table that makes the spec deterministic. It converts "what" (AC) into "where in code" (file:element) and "how we verify" (test target). Spec-Auditor uses it during /implement to trace every AC end-to-end.
 
 ## Code-style rules

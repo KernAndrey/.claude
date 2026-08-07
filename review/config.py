@@ -21,6 +21,17 @@ from dataclasses import dataclass
 # skill (~/.claude/skills/kimi) still pins K3 — different subsystem.
 _KIMI_MODEL = "kimi-code/kimi-for-coding"
 
+# --- which codex model the reviewer would use (not currently wired) --------
+# The CodexBackend is registered and tested but no RunnerConfig uses it yet —
+# flipping to codex is a one-line uncomment below (PRIMARIES and/or
+# CHUNKED_BACKENDS). Requires `codex login`.
+#
+# Model ids come from `~/.codex/models_cache.json` and are gated by the auth
+# tier. As of 2026-08-07 on `auth_mode = "chatgpt"` the cache lists:
+# gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4-mini. A subscription change can
+# change that list — re-check the cache before trusting this constant.
+_CODEX_MODEL = "gpt-5.6-terra"
+
 
 @dataclass(frozen=True)
 class RunnerConfig:
@@ -43,8 +54,8 @@ class RunnerConfig:
 
 
 # Reviewer roles. Available backend names live in review/backends.py
-# (the BACKENDS dict). To add a new backend (e.g. "codex", "kimi"),
-# see the docstring at the top of that file.
+# (the BACKENDS dict). To add a new backend, see the docstring at the
+# top of that file.
 #
 # PRIMARIES is the list of reviewers that run in parallel on every
 # commit. Their findings are consolidated by the arbiter (which also
@@ -64,8 +75,9 @@ class RunnerConfig:
 #     ]
 PRIMARIES: list[RunnerConfig] = [
     RunnerConfig(
-        "kimi", _KIMI_MODEL
-    ),  # Kimi is the sole primary reviewer; requires `kimi login`. Model alias must match a ~/.kimi-code/config.toml [models.*] key. Read-only containment is enforced by ~/.kimi/hooks/review_readonly.py (KimiBackend arms it via KIMI_REVIEW_READONLY=1). review-note: no startup capability probe by design — this hook only runs on the owner's machine (~/.claude is single-user config), the reviewer fail-opens on backend errors (fallback to claude/sonnet on total primary failure, now surfaced by hook.fallback_banner), and a probe per commit would burn ~1-2s for no real safety on a misconfigured machine the user would notice immediately anyway.
+        "codex", _CODEX_MODEL
+    ),  # Codex CLI is the sole primary reviewer; requires `codex login`. Model slug must match a `slug` in ~/.codex/models_cache.json. Read-only containment is native — CodexBackend pins `--sandbox read-only`, no external hook or agent file needed (unlike opencode/kimi). review-note: user explicitly switched here from kimi on 2026-08-07 after buying a Codex subscription; kimi stays registered and one uncomment away. Same no-startup-probe rationale as before: this hook runs only on the owner's machine and fails open to FALLBACK.
+    # RunnerConfig("kimi", _KIMI_MODEL),  # uncomment to restore Kimi (requires `kimi login`; alias must match a ~/.kimi-code/config.toml [models.*] key)
     # RunnerConfig("claude", "sonnet"),  # uncomment to add a parallel second reviewer
 ]
 
@@ -132,6 +144,7 @@ ALLOWED_LENSES: frozenset[str] = frozenset({"bugs", "architecture", "tests"})
 CHUNKED_BACKENDS: list[RunnerConfig] = [
     RunnerConfig("kimi", _KIMI_MODEL),
     # RunnerConfig("claude", "sonnet"),
+    # RunnerConfig("codex", _CODEX_MODEL),  # deliberately still kimi while codex proves itself on the small-commit path: the chunked path has NO fallback (see RunnerConfig.timeout), so a codex error/timeout here emits a synthetic [CRITICAL] → false BLOCK, whereas in PRIMARIES the same failure degrades quietly to FALLBACK. Swap once codex has a few clean chunked-size commits behind it.
 ]
 
 # NOTE: LENS_NAMES is intentionally not in this file. The lens registry

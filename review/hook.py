@@ -457,6 +457,35 @@ def _verify_runner_configs() -> None:
             raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {valid}")
 
 
+def _warn_on_unhealthy_backends() -> None:
+    """Warn early when a configured backend cannot produce a trustworthy review.
+
+    ``_verify_runner_configs`` validates config *shape* — that every backend
+    name resolves. This checks the *environment* each configured backend needs,
+    via ``Backend.selfcheck``. Only codex implements one today: its sandbox can
+    fail in a way that leaves the reviewer blind while still returning rc=0 and
+    a plausible review, which no return-value check can catch.
+
+    Warn, never raise. ``CodexBackend.run`` independently fails such a run so
+    ``run_with_fallback`` fires and the commit still gets a real review from
+    FALLBACK; raising here would instead skip the review entirely. This is the
+    early, named heads-up so the cause is visible before any LLM work starts.
+    Each backend caches its own verdict, so probing the same backend from
+    several config slots costs one probe.
+    """
+    seen: set[str] = set()
+    for cfg in (*PRIMARIES, FALLBACK, ARBITER, *CHUNKED_BACKENDS):
+        if cfg is None or cfg.backend in seen:
+            continue
+        seen.add(cfg.backend)
+        backend = BACKENDS.get(cfg.backend)
+        if backend is None:
+            continue  # already reported by _verify_runner_configs
+        reason = backend.selfcheck()
+        if reason:
+            warn(f"{cfg.backend} backend unhealthy: {reason}")
+
+
 def run_reviewer(
     cfg: RunnerConfig,
     system_prompt: str,
@@ -1849,6 +1878,7 @@ def _run_preflight_gate_or_exit() -> None:
 def main() -> None:
     try:
         _verify_runner_configs()
+        _warn_on_unhealthy_backends()
         _check_staged_review_guard()
         _run_preflight_gate_or_exit()
 

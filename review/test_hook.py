@@ -2,13 +2,22 @@ from __future__ import annotations
 
 import os
 import subprocess
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from backends import BACKENDS, Backend, ClaudeBackend, KimiBackend, OpencodeBackend, _build_registry
+from backends import (
+    BACKENDS,
+    Backend,
+    ClaudeBackend,
+    CodexBackend,
+    KimiBackend,
+    OpencodeBackend,
+    _build_registry,
+)
 from config import CHUNKED_BACKENDS, FALLBACK, FANOUT_THRESHOLD, MAX_PROD_LINES, PRIMARIES, RunnerConfig
 from hook import (
     ARBITER,
@@ -596,6 +605,454 @@ def test_kimi_backend_forwards_timeout() -> None:
     assert captured["kwargs"]["timeout"] == 333
 
 
+def _capture_codex_invocation(
+    last_message: str | None = "review body",
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int = 0,
+) -> tuple[dict, AbstractContextManager[MagicMock]]:
+    """Patch backends.subprocess.run and capture the real codex invocation.
+
+    Mirror image of :func:`_capture_kimi_invocation`. Kimi stages its prompt in a
+    temp file and the helper *reads* it inside ``side_effect``; codex is the other
+    direction — the backend passes an empty ``--output-last-message`` path and reads
+    it back *after* ``subprocess.run`` returns, unlinking it in ``finally``. So this
+    ``side_effect`` must **write** that file, standing in for the codex CLI. Writing
+    it anywhere else (or not at all) makes every parse assertion see an empty file
+    and pass for the wrong reason.
+
+    ``last_message=None`` simulates codex never writing the file at all (crash,
+    auth failure) as distinct from writing an empty one.
+
+    Also pins the sandbox verdict to healthy: ``run`` calls ``selfcheck`` first
+    and would otherwise fail fast without ever building the argv these tests
+    assert on. Tests that want the broken path use ``_codex_sandbox(False)``.
+    """
+    captured: dict = {}
+
+    def side_effect(cmd: list[str], **kwargs: object) -> MagicMock:
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        out_path = cmd[cmd.index("--output-last-message") + 1]
+        captured["out_path"] = out_path
+        if last_message is not None:
+            Path(out_path).write_text(last_message, encoding="utf-8")
+        else:
+            Path(out_path).unlink(missing_ok=True)
+        result = MagicMock()
+        result.stdout = stdout
+        result.stderr = stderr
+        result.returncode = returncode
+        return result
+
+    @contextmanager
+    def ctx() -> Iterator[MagicMock]:
+        with (
+            _codex_sandbox(healthy=True),
+            patch("backends.subprocess.run", side_effect=side_effect) as mock_run,
+        ):
+            yield mock_run
+
+    return captured, ctx()
+
+
+def test_codex_backend_builds_exec_command() -> None:
+    captured, ctx = _capture_codex_invocation(last_message="body")
+    with ctx:
+        stdout, stderr, rc = CodexBackend().run("sys", "user", "gpt-5.6-terra", 600)
+
+    cmd = captured["cmd"]
+    assert cmd[0] == "codex"
+    assert cmd[1] == "exec"
+    assert cmd[cmd.index("--model") + 1] == "gpt-5.6-terra"
+    assert "--output-last-message" in cmd
+    # No positional prompt: `codex exec` reads instructions from stdin when none is
+    # given. A literal "-" would risk being taken as the prompt itself, with the
+    # diff demoted to an appended <stdin> block — a silently garbage review.
+    assert "-" not in cmd
+    # Prompt travels via stdin, never argv (chunked prompts blow past ARG_MAX).
+    assert captured["kwargs"]["input"] == "sys\n\nuser"
+    assert captured["kwargs"]["timeout"] == 600
+    assert (stdout, stderr, rc) == ("body", "", 0)
+
+
+def test_codex_backend_pins_read_only_sandbox() -> None:
+    """The codex invocation must pin --sandbox read-only so the reviewer cannot
+    write to the tree or reach the network while investigating the diff. This is
+    codex's native equivalent of opencode's --agent pin and kimi's
+    KIMI_REVIEW_READONLY deny-hook, and it pairs with the index snapshot/restore
+    in ~/.claude/git-hooks/pre-commit — losing it widens the blast radius the
+    snapshot has to roll back."""
+    captured, ctx = _capture_codex_invocation()
+    with ctx:
+        CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--sandbox") + 1] == "read-only"
+    # Never silently escalate out of the sandbox.
+    for dangerous in ("--dangerously-bypass-approvals-and-sandbox", "--approve-for-me"):
+        assert dangerous not in cmd
+
+
+def test_codex_run_sends_exactly_the_probed_feature_flags() -> None:
+    """`run` must send the same `--enable` flags `selfcheck` probes, and no others.
+
+    Drift here is the subtle killer: the probe would certify a sandbox
+    configuration the review never uses, so a green probe would stop meaning
+    anything. Bites even while `_SANDBOX_FEATURE_ARGV` is empty — it then asserts
+    `run` passes no feature flags at all, which is the current contract (the
+    AppArmor profile makes the default bwrap sandbox work, and re-adding the
+    deprecated landlock flag would hard-error on a future codex release).
+    """
+    captured, ctx = _capture_codex_invocation()
+    with ctx:
+        CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    def enabled_features(argv: list[str] | tuple[str, ...]) -> list[str]:
+        return [argv[i + 1] for i, arg in enumerate(argv) if arg == "--enable"]
+
+    assert enabled_features(captured["cmd"]) == enabled_features(CodexBackend._SANDBOX_FEATURE_ARGV)
+
+
+@contextmanager
+def _codex_sandbox(healthy: bool = True) -> Iterator[None]:
+    """Force CodexBackend's cached sandbox verdict, and always restore it.
+
+    The verdict is process-global by design (one probe per commit), so a test
+    that leaves it set would silently change every later test.
+    """
+    import backends as backends_mod
+
+    saved = backends_mod._CODEX_SANDBOX_CHECK
+    backends_mod._CODEX_SANDBOX_CHECK = (None,) if healthy else ("sandbox is dead",)
+    try:
+        yield
+    finally:
+        backends_mod._CODEX_SANDBOX_CHECK = saved
+
+
+def test_codex_selfcheck_probes_the_same_flags_run_uses() -> None:
+    """The probe must exercise the flag combination `run` actually sends.
+
+    If the two drifted, a green probe would certify a sandbox the review never
+    uses — the failure this whole guard exists to prevent.
+    """
+    import backends as backends_mod
+
+    mock_result = MagicMock()
+    mock_result.stdout = CodexBackend._SELFCHECK_MARKER
+    mock_result.stderr = ""
+    mock_result.returncode = 0
+
+    saved = backends_mod._CODEX_SANDBOX_CHECK
+    backends_mod._CODEX_SANDBOX_CHECK = None
+    try:
+        with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
+            assert CodexBackend().selfcheck() is None
+    finally:
+        backends_mod._CODEX_SANDBOX_CHECK = saved
+
+    cmd = mock_run.call_args[0][0]
+    assert cmd[:2] == ["codex", "sandbox"]
+    for flag in CodexBackend._SANDBOX_FEATURE_ARGV:
+        assert flag in cmd
+
+
+def test_codex_selfcheck_rejects_rc0_without_marker() -> None:
+    """rc==0 alone is not proof: the marker must reach stdout, which is what
+    shows the sandboxed command really executed."""
+    import backends as backends_mod
+
+    mock_result = MagicMock()
+    mock_result.stdout = ""  # command never ran
+    mock_result.stderr = "bwrap: setting up uid map: Permission denied"
+    mock_result.returncode = 0
+
+    saved = backends_mod._CODEX_SANDBOX_CHECK
+    backends_mod._CODEX_SANDBOX_CHECK = None
+    try:
+        with patch("backends.subprocess.run", return_value=mock_result):
+            reason = CodexBackend().selfcheck()
+    finally:
+        backends_mod._CODEX_SANDBOX_CHECK = saved
+
+    assert reason is not None
+    assert "bwrap" in reason
+    # orchestrator._invoke_single_call logs only stderr[:200]; the actionable fix must
+    # survive that cut, so it sits at the front and the raw detail trails.
+    assert "/etc/apparmor.d/codex-bwrap" in reason[:200]
+
+
+def test_codex_selfcheck_caches_across_calls_and_instances() -> None:
+    """One probe per process — the chunked path calls run() from many threads."""
+    import backends as backends_mod
+
+    mock_result = MagicMock()
+    mock_result.stdout = CodexBackend._SELFCHECK_MARKER
+    mock_result.stderr = ""
+    mock_result.returncode = 0
+
+    saved = backends_mod._CODEX_SANDBOX_CHECK
+    backends_mod._CODEX_SANDBOX_CHECK = None
+    try:
+        with patch("backends.subprocess.run", return_value=mock_result) as mock_run:
+            CodexBackend().selfcheck()
+            CodexBackend().selfcheck()
+            CodexBackend().selfcheck()
+    finally:
+        backends_mod._CODEX_SANDBOX_CHECK = saved
+
+    assert mock_run.call_count == 1
+
+
+def test_codex_selfcheck_reports_probe_timeout() -> None:
+    """A hung probe must degrade to a reason string, not propagate.
+
+    `selfcheck` is called from `run`, which promises never to raise on
+    environment trouble — an escaping TimeoutExpired would surface as a review
+    crash instead of a clean fallback to FALLBACK.
+    """
+    import backends as backends_mod
+
+    saved = backends_mod._CODEX_SANDBOX_CHECK
+    backends_mod._CODEX_SANDBOX_CHECK = None
+    try:
+        with patch(
+            "backends.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["codex", "sandbox"], timeout=30),
+        ):
+            reason = CodexBackend().selfcheck()
+    finally:
+        backends_mod._CODEX_SANDBOX_CHECK = saved
+
+    assert reason is not None
+    assert "TimeoutExpired" in reason
+
+
+def test_codex_selfcheck_reports_os_error() -> None:
+    """Any OSError from the probe (permissions, ENOMEM, fork failure) becomes a
+    reason string rather than escaping into the review pipeline."""
+    import backends as backends_mod
+
+    saved = backends_mod._CODEX_SANDBOX_CHECK
+    backends_mod._CODEX_SANDBOX_CHECK = None
+    try:
+        with patch("backends.subprocess.run", side_effect=OSError("cannot fork")):
+            reason = CodexBackend().selfcheck()
+    finally:
+        backends_mod._CODEX_SANDBOX_CHECK = saved
+
+    assert reason is not None
+    assert "cannot fork" in reason
+
+
+def test_warn_on_unhealthy_backends_skips_unregistered_backend() -> None:
+    """A backend name that is not in BACKENDS must be skipped silently here.
+
+    `_verify_runner_configs` already raises a named error for that case; warning
+    about it twice would just add noise, and looking up `None.selfcheck()` would
+    crash the hook before the real review ever starts.
+    """
+    import hook
+
+    messages: list[str] = []
+    with (
+        patch("hook.PRIMARIES", [RunnerConfig("ghost", "m")]),
+        patch("hook.CHUNKED_BACKENDS", []),
+        patch("hook.FALLBACK", None),
+        patch("hook.ARBITER", None),
+        patch("hook.warn", side_effect=messages.append),
+    ):
+        hook._warn_on_unhealthy_backends()  # must not raise
+
+    assert messages == []
+
+
+def test_codex_selfcheck_reports_missing_cli() -> None:
+    import backends as backends_mod
+
+    saved = backends_mod._CODEX_SANDBOX_CHECK
+    backends_mod._CODEX_SANDBOX_CHECK = None
+    try:
+        with patch("backends.subprocess.run", side_effect=FileNotFoundError):
+            reason = CodexBackend().selfcheck()
+    finally:
+        backends_mod._CODEX_SANDBOX_CHECK = saved
+
+    assert reason is not None
+    assert "not found" in reason
+
+
+def test_codex_run_fails_fast_when_sandbox_broken() -> None:
+    """A dead sandbox must fail the run so FALLBACK produces a real review.
+
+    Returning empty review + rc!=0 is precisely what run_with_fallback keys on.
+    The alternative — letting codex answer blind — yields a confident "0
+    findings" that passes the gate.
+    """
+    with _codex_sandbox(healthy=False), patch("backends.subprocess.run") as mock_run:
+        review, stderr, rc = CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    assert (review, rc) == ("", 1)
+    assert "sandbox is dead" in stderr
+    mock_run.assert_not_called()  # never spend an API call on a blind review
+
+
+def test_warn_on_unhealthy_backends_names_the_backend() -> None:
+    """The early warn must name which backend is unhealthy and why."""
+    import hook
+
+    class SickBackend(Backend):
+        name = "sick"
+
+        def run(self, system_prompt: str, user_prompt: str, model: str, timeout: int) -> tuple[str, str, int]:
+            return "", "", 0
+
+        def selfcheck(self) -> str | None:
+            return "sandbox cannot start"
+
+    messages: list[str] = []
+    with (
+        patch.dict("hook.BACKENDS", {"sick": SickBackend()}),
+        patch("hook.PRIMARIES", [RunnerConfig("sick", "m")]),
+        patch("hook.CHUNKED_BACKENDS", []),
+        patch("hook.FALLBACK", None),
+        patch("hook.ARBITER", None),
+        patch("hook.warn", side_effect=messages.append),
+    ):
+        hook._warn_on_unhealthy_backends()
+
+    assert any("sick" in m and "sandbox cannot start" in m for m in messages)
+
+
+def test_warn_on_unhealthy_backends_silent_when_all_healthy() -> None:
+    """Default backends implement no selfcheck — no spurious warn, no probe."""
+    import hook
+
+    messages: list[str] = []
+    with (
+        patch("hook.PRIMARIES", [RunnerConfig("claude", "sonnet")]),
+        patch("hook.CHUNKED_BACKENDS", []),
+        patch("hook.FALLBACK", None),
+        patch("hook.ARBITER", None),
+        patch("hook.warn", side_effect=messages.append),
+    ):
+        hook._warn_on_unhealthy_backends()
+
+    assert messages == []
+
+
+def test_codex_backend_reads_review_from_last_message_file() -> None:
+    """Review text comes from --output-last-message only; the JSONL event stream
+    on stdout must never leak into the reviewer-text contract."""
+    noise = '{"type":"item.completed","item":{"type":"reasoning","text":"thinking out loud"}}'
+    _captured, ctx = _capture_codex_invocation(
+        last_message="- [CRITICAL] a.py:1 — boom\nSummary: 1 critical",
+        stdout=noise,
+    )
+    with ctx:
+        review, _stderr, rc = CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    assert review == "- [CRITICAL] a.py:1 — boom\nSummary: 1 critical"
+    assert "thinking out loud" not in review
+    assert rc == 0
+
+
+def test_codex_backend_empty_system_prompt_sends_user_only() -> None:
+    """With an empty system_prompt, only the user prompt is piped (no leading
+    separator artefact) — mirrors the Opencode/Kimi branch."""
+    captured, ctx = _capture_codex_invocation()
+    with ctx:
+        CodexBackend().run("", "user", "gpt-5.6-terra", 60)
+
+    assert captured["kwargs"]["input"] == "user"
+
+
+def test_codex_backend_forwards_timeout() -> None:
+    captured, ctx = _capture_codex_invocation()
+    with ctx:
+        CodexBackend().run("sys", "user", "gpt-5.6-terra", 333)
+
+    assert captured["kwargs"]["timeout"] == 333
+
+
+def test_codex_backend_empty_output_file_returns_empty_review_with_stdout_tail() -> None:
+    """No review text → empty string (so run_with_fallback fires), and the stdout
+    tail is carried into stderr so the logged reason is readable. Codex reports
+    quota/auth failures on stdout; without this the fallback reason would be blank."""
+    _captured, ctx = _capture_codex_invocation(
+        last_message="",
+        stdout='{"type":"error","message":"You have hit your usage limit"}',
+        stderr="",
+        returncode=1,
+    )
+    with ctx:
+        review, stderr, rc = CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    assert review == ""
+    assert "usage limit" in stderr
+    assert rc == 1
+
+
+def test_codex_backend_missing_output_file_returns_empty_review() -> None:
+    """Codex dying before writing the file must degrade to an empty review, not
+    an unhandled OSError that escapes the backend."""
+    _captured, ctx = _capture_codex_invocation(last_message=None, stdout="", returncode=1)
+    with ctx:
+        review, _stderr, rc = CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    assert review == ""
+    assert rc == 1
+
+
+def test_codex_backend_stdout_tail_is_trimmed() -> None:
+    """A huge stdout must not be pasted wholesale into the markdown log.
+
+    Only the stdout portion is bounded — real stderr is appended in full and
+    deliberately kept FIRST, because ``orchestrator._invoke_single_call`` logs
+    only ``stderr[:200]`` on the rc!=0 path. Keeping the precise signal at the
+    front means it survives that truncation; when codex leaves stderr empty (it
+    reports quota/auth failures as JSONL on stdout under ``--json``) the tail
+    becomes the front and survives instead.
+    """
+    _captured, ctx = _capture_codex_invocation(last_message="", stdout="x" * 10_000, stderr="real stderr line")
+    with ctx:
+        _review, stderr, _rc = CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    head, _, tail = stderr.partition("\n")
+    assert head == "real stderr line"  # precise signal stays at the front
+    assert tail == "x" * CodexBackend._STDOUT_TAIL_CHARS  # stdout portion bounded
+
+
+def test_codex_backend_short_stdout_tail_is_not_truncated() -> None:
+    """Below the cap the tail is carried whole — no off-by-one that clips the
+    first character of a short quota message."""
+    _captured, ctx = _capture_codex_invocation(last_message="", stdout="  quota exceeded  ")
+    with ctx:
+        _review, stderr, _rc = CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    assert stderr == "quota exceeded"
+
+
+def test_codex_backend_removes_output_file() -> None:
+    """The staged --output-last-message file must not survive the call; the hook
+    runs on every commit and would otherwise litter /tmp."""
+    captured, ctx = _capture_codex_invocation()
+    with ctx:
+        CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    assert not Path(captured["out_path"]).exists()
+
+
+def test_codex_backend_unlink_failure_is_swallowed() -> None:
+    """A failing cleanup must not take down an otherwise successful review."""
+    _captured, ctx = _capture_codex_invocation(last_message="ok")
+    with ctx, patch("backends.os.unlink", side_effect=OSError("boom")):
+        review, _stderr, rc = CodexBackend().run("sys", "user", "gpt-5.6-terra", 60)
+
+    assert (review, rc) == ("ok", 0)
+
+
 # ---------------------------------------------------------------------------
 # Fallback visibility — record_fallback / fallback_banner
 # ---------------------------------------------------------------------------
@@ -823,22 +1280,24 @@ def test_parse_stream_json_ignores_non_string_content() -> None:
     assert KimiBackend._parse_stream_json(stream) == "real review"
 
 
-def test_default_primaries_pin_kimi_only() -> None:
+def test_default_primaries_pin_codex_only() -> None:
     """The runtime composition of PRIMARIES is part of the user-facing
     contract — every commit on the owner's machine sees this list. A
     silent reorder, addition, or removal here would change real
     pre-commit behavior without any failing test. Pin the default so
     drift is caught at test time, not at commit time.
 
-    Current default: kimi only (the owner uses Kimi K2.7 Code as the sole
-    primary reviewer; requires `kimi login`). The arbiter and total-failure
-    fallback remain claude/sonnet."""
+    Current default: codex only (the owner switched from Kimi K2.7 Code to
+    the Codex CLI on 2026-08-07 after buying a subscription; requires
+    `codex login`). The arbiter and total-failure fallback remain
+    claude/sonnet, and CHUNKED_BACKENDS deliberately stays on kimi — see
+    test_config_defaults_pinned."""
     assert len(PRIMARIES) == 1
-    assert PRIMARIES[0].backend == "kimi"
-    # Pin the literal, not `_KIMI_MODEL` — asserting the constant against
-    # itself passes for any value and would not catch a repin. The alias must
-    # also stay in sync with a [models."…"] key in ~/.kimi-code/config.toml.
-    assert PRIMARIES[0].model == "kimi-code/kimi-for-coding"
+    assert PRIMARIES[0].backend == "codex"
+    # Pin the literal, not `_CODEX_MODEL` — asserting the constant against
+    # itself passes for any value and would not catch a repin. The slug must
+    # also stay in sync with a `slug` in ~/.codex/models_cache.json.
+    assert PRIMARIES[0].model == "gpt-5.6-terra"
 
 
 def test_config_defaults_pinned() -> None:
@@ -850,6 +1309,12 @@ def test_config_defaults_pinned() -> None:
     assert CHUNKED_BACKENDS
     for cfg in CHUNKED_BACKENDS:
         assert cfg.backend in BACKENDS
+    # CHUNKED_BACKENDS deliberately diverges from PRIMARIES: the chunked path
+    # has no fallback, so an error/timeout there becomes a synthetic [CRITICAL]
+    # → false BLOCK. Codex is proven only on the small-commit path so far, so
+    # big commits stay on kimi. Pinned so the divergence is a decision, not a
+    # drift someone notices when a commit is wrongly blocked.
+    assert [c.backend for c in CHUNKED_BACKENDS] == ["kimi"]
 
 
 # ---------------------------------------------------------------------------

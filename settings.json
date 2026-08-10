@@ -67,13 +67,20 @@
   "enabledPlugins": {
     "ralph-loop@claude-plugins-official": false,
     "claude-seo@agricidaniel-seo": false,
-    "superpowers@claude-plugins-official": true
+    "superpowers@claude-plugins-official": true,
+    "codex@openai-codex": true
   },
   "extraKnownMarketplaces": {
     "agricidaniel-seo": {
       "source": {
         "source": "github",
         "repo": "AgriciDaniel/claude-seo"
+      }
+    },
+    "openai-codex": {
+      "source": {
+        "source": "github",
+        "repo": "openai/codex-plugin-cc"
       }
     }
   },

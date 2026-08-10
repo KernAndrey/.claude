@@ -32,6 +32,7 @@ Use `AskUserQuestion` for the decisions that survive the gate: scope, edge cases
 The plan may be written in any style, but it must include and honour all of the following. If any requirement is not applicable to the specific task, state so explicitly in the plan rather than skipping silently.
 
 - **Worktree isolation.** Work happens in `wt create task/{ID}-{slug} --base origin/dev`; all subsequent steps run inside the returned worktree path.
+- **The board lives in the worktree here.** This flow does not use `~/.claude/templates/sdd/board-root.md`, and `{dir}` stays repo-relative: once the worktree exists, every board path is `{worktree_path}/{dir}/…`, because the task file's moves must be captured by the commit that carries the code.
 - **Task lifecycle — in progress.** Move task file to `{dir}/4-in-progress/`, update frontmatter `status: in-progress`, `updated: {TODAY}`, `branch: task/{ID}-{slug}` before implementation starts.
 - **Tests in the same pass as code.** Every new or modified code path (function, branch, template conditional, user-facing surface) gets a test that asserts on its behavior. Follow the Test discipline section in `~/.claude/CLAUDE.md`. Run tests and paste passing output into the session before committing.
 - **Task lifecycle — review (before the commit).** Once tests pass, move the task file to `{dir}/5-review/` and update frontmatter `status: review`, `updated: {TODAY}`. Do this **before** committing so the move is captured in the commit — otherwise it is lost when the worktree is removed and never reaches `dev`.

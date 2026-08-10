@@ -2,11 +2,7 @@ Decompose a big idea into multiple draft tasks.
 
 ## Instructions
 
-1. Locate the SDD config and read `id_prefix`, `dir`, and `counter_file` from it:
-   - Look for `.tasks.toml` at the project root and one or two levels deep (`*/.tasks.toml`, `*/*/.tasks.toml`), skipping `node_modules/`, `.git/`, `vendor/`, and plugin/cache directories — a repo may carry several SDD roots, e.g. one per client.
-   - One config → use it. Several → a project rule naming the choice wins; otherwise match the big idea to a root by the directory it names (a client, an addon, a module). `/decompose` mints new IDs, so there is no `id_prefix` to match on — when two roots stay plausible after reading the idea, ask the user which board before allocating IDs.
-   - Paths inside a config resolve relative to that config's own directory: `dir = "tasks"` in `clients/acme/.tasks.toml` means the board lives at `clients/acme/tasks/`.
-   - No `.tasks.toml` anywhere → tell the user to run `/task-init` first and stop.
+1. Read `~/.claude/templates/sdd/board-root.md` and follow it to resolve `{main_root}`, discover the SDD configs, and define `{board}` and `{counter_file}`. The board lives in the main worktree — this command allocates IDs from it and writes there even when you are standing in a linked worktree. Select the root: one config → use it; several → a project rule naming the choice wins, otherwise match the big idea to a root by the directory it names (a client, an addon, a module). `/decompose` mints new IDs, so there is no `id_prefix` to match on — when two roots stay plausible after reading the idea, ask the user which board before allocating IDs.
 2. Parse `$ARGUMENTS`:
    - If it looks like a file path (ends with `.md`, or starts with `/`, `./`, or `..`), read the file and use its content as the big idea description.
    - Otherwise, treat the entire `$ARGUMENTS` as a free-text description.
@@ -15,7 +11,7 @@ Decompose a big idea into multiple draft tasks.
 ## Phase 1: Context Loading
 
 1. Explore the project codebase: domain structure, modules, existing conventions.
-2. Scan all existing tasks in `{dir}/` (all statuses except `archive`) — read their frontmatter (id, title, status, group) to understand what already exists. This avoids creating duplicate or overlapping tasks.
+2. Scan all existing tasks in `{board}/` (all statuses except `archive`) — read their frontmatter (id, title, status, group) to understand what already exists. This avoids creating duplicate or overlapping tasks.
 3. If tasks with a `group` field exist, note the active groups.
 
 ## Phase 2: Clarification (Light Q&A)
@@ -104,10 +100,10 @@ After the user has answered all questions:
 
 After user confirms the proposal:
 
-1. Read the counter from `counter_file`. Calculate the range: `current + 1` through `current + N`.
+1. Read the counter from `{counter_file}`. Calculate the range: `current + 1` through `current + N`.
 2. Generate a **group slug** from the big idea (kebab-case, max 4 words, ASCII only). Example: `invoice-pipeline`, `test-isolation`.
 3. For each confirmed task (in dependency order):
-   a. Increment counter, generate ID: `{id_prefix}-{counter:03d}`.
+   a. Increment counter, generate ID: `{id_prefix}-{counter:03d}`, then run the free-ID check from `board-root.md` §5 before using it.
    b. Generate task slug from the title (kebab-case, max 5 words, ASCII only).
    c. Copy template from `~/.claude/templates/sdd/draft.md`. If `.claude/templates/draft.md` exists in the project, use that instead (project override).
    d. Fill placeholders: `{{ID}}`, `{{TITLE}}`, `{{DATE}}`.
@@ -121,13 +117,15 @@ After user confirms the proposal:
       Group: {group-slug}
       Sibling tasks: {ID-1} ({title-1}), {ID-2} ({title-2}), ...
       ```
-   h. Save to `{dir}/1-draft/{ID}-{slug}.md`.
+   h. Save to `{board}/1-draft/{ID}-{slug}.md`.
 
-4. Write the counter back (to `current + N`).
+4. Write the counter back to `{counter_file}` (to `current + N`).
+5. Commit the board change per `board-root.md` §6 — one commit for the whole batch,
+   message `chore(sdd): add {N} drafts for {group-slug}`.
 
 ## Output
 
-Display a summary table and next steps:
+Display a summary table and next steps, plus the `board-root.md` §7 report when `{main_root}` differs from the current directory:
 
 ```
 ## Создано {N} задач (группа: {group-slug})

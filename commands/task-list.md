@@ -2,8 +2,8 @@ Show the current task board.
 
 ## Instructions
 
-1. Find every `.tasks.toml` — project root plus one or two levels deep (`*/.tasks.toml`, `*/*/.tasks.toml`), skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories — and read `id_prefix` and `dir` from each. `dir` resolves relative to its own config's directory, so `dir = "tasks"` in `clients/acme/.tasks.toml` means the board lives at `clients/acme/tasks/`. None found → tell user to run `/task-init` and stop.
-2. Scan all subdirectories of every `{dir}` (except `archive`). Directories are numbered for display order: `1-draft`, `2-spec`, etc. With several configs, print one board per config and title each with its `id_prefix`.
+1. Read `~/.claude/templates/sdd/board-root.md` (§1–§4) and follow it to resolve `{main_root}`, discover every `.tasks.toml`, and define `{board}` for each. The board lives in the main worktree, so this command shows the authoritative board even when you are standing in a linked worktree. This command only reads — nothing to commit.
+2. Scan all subdirectories of every `{board}` (except `archive`). Directories are numbered for display order: `1-draft`, `2-spec`, etc. With several configs, print one board per config and title each with its `id_prefix`.
 3. For each `.md` file, read frontmatter: id, title, status, priority, updated, group, depends_on.
 4. Display a grouped table. If any tasks have a `group` field, cluster them first, then show ungrouped tasks.
 

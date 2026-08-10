@@ -2,9 +2,9 @@ Approve a specification and move it to ready status.
 
 ## Instructions
 
-`{dir}` = the `dir` of the applicable `.tasks.toml`. A repo may carry several SDD roots (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories); pick the config whose `id_prefix` matches the task ID, or — when `$ARGUMENTS` is a bare slug — the root whose board actually holds a matching file, asking the user when several do. Resolve `dir` relative to that config's own directory.
+Read `~/.claude/templates/sdd/board-root.md` and follow it to resolve `{main_root}`, discover the SDD configs, and define `{board}`. The board lives in the main worktree — this command reads and moves a file there even when you are standing in a linked worktree. Select the root: the config whose `id_prefix` matches the task ID, or — when `$ARGUMENTS` is a bare slug — the root whose board actually holds a matching file, asking the user when several do.
 
-1. Find the file by `$ARGUMENTS` (ID or slug) in `{dir}/2-spec/`.
+1. Find the file by `$ARGUMENTS` (ID or slug) in `{board}/2-spec/`.
 2. Read the spec file.
 3. **Template version guard.** Check that the spec contains a `## Definition of Done` heading. This header is present in every spec authored against the current template and absent in legacy specs. If missing, refuse with:
 
@@ -41,6 +41,7 @@ Approve a specification and move it to ready status.
 
 5. Verify `status: awaiting-approval` in frontmatter. If not, report error and stop.
 6. Update frontmatter: `status: ready`, `approved_date: {TODAY}`, `updated: {TODAY}`.
-7. Move file from `{dir}/2-spec/` to `{dir}/3-ready/`.
-8. Do NOT create a git branch here — `/implement` handles branch and worktree creation from `dev`.
-9. Output: `Spec {ID} approved. Run /implement {ID} to start implementation.`
+7. Move file from `{board}/2-spec/` to `{board}/3-ready/`.
+8. Commit the board change per `board-root.md` §6, message `chore(sdd): approve {ID}`.
+9. Do NOT create a git branch here — `/implement` handles branch and worktree creation from `dev`.
+10. Output: `Spec {ID} approved. Run /implement {ID} to start implementation.` Add the `board-root.md` §7 report when `{main_root}` differs from the current directory.

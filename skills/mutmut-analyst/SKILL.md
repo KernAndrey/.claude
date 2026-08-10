@@ -101,9 +101,21 @@ mutmut run                              # full run, uses cached baseline timing
 mutmut run "*function_name*"            # scoped run — glob matches the MANGLED key
 ```
 
+⚠️ **Invoke the console script, never `python -m mutmut`.** Under `-m`, Python loads `mutmut/__main__.py` as the module `__main__`. Every trampoline in a mutated file then does `from mutmut.__main__ import record_trampoline_hit`, which imports the SAME file a second time under its real name and re-executes its top level — including `set_start_method('fork')`, which raises on the second call:
+
+```
+RuntimeError: context has already been set
+```
+
+It surfaces as `failed to collect stats. runner returned 3`, with the traceback buried inside a test failure, so it reads like a defect in the code under test. Use `mutmut run` (or `<venv>/bin/mutmut run`, or `path/to/target/bin/mutmut` for a `pip --target` install).
+
 ⚠️ The glob is `fnmatch`ed against mutmut's mangled key (`pkg.mod.x_function__mutmut_3`), not the name you wrote. `"pkg.mod.function*"` matches nothing and aborts the run — see the glob table under "Mutmut takes hours to run" below.
 
 Mutmut writes mutants to `mutants/` directory. The directory persists between runs — incremental retesting is the default.
+
+⚠️ **`mutants/` must not land anywhere a coverage or review gate will look.** The mutated copy of a source file is 50-100x its size, and a pre-commit gate running `diff-cover --include-untracked` (or any "every added line must be covered" check) will see ~170 KLOC of brand-new uncovered Python and block the commit. Either run mutmut from a scratch directory outside the repo — symlink the package in, since `paths_to_mutate` resolves through symlinks and `also_copy`'s `copytree` follows them — or add `mutants/` to `.git/info/exclude`. mutmut hardcodes `mutants/` relative to CWD, so the working directory IS the knob.
+
+**Installing next to a project venv you must not disturb.** mutmut 3.5 needs `pytest<9`, and the project venv may be on 9.x for other reasons. `pip install --target <dir> mutmut 'pytest<9'` then `PYTHONPATH=<dir> <dir>/bin/mutmut run` shadows the venv's pytest for this process only, leaves the shared venv untouched, and still imports everything else (Odoo, Django, the app) from it. The generated `<dir>/bin/mutmut` already carries the right shebang.
 
 If user wants to start fresh: `rm -rf mutants/`. If user just wants to retest survived after fixing tests, `mutmut run` is enough — it remembers what was killed.
 

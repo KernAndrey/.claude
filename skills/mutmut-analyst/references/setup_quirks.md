@@ -31,36 +31,54 @@ So the only way to mutation test an Odoo addon is **to make Odoo's tests run und
 
 Therefore: **boot the Odoo registry once, in the parent.** Every forked child inherits it copy-on-write. The ~20s registry load stops being a per-mutant cost, and per-mutant time collapses to just the covering tests. This is the "persistent DB" optimization, and the fork gives it to you for free.
 
-**Working shim (verified against Odoo 19 + mutmut 3.5):**
+**Working shim (verified against Odoo 19 and Odoo 17, mutmut 3.5):**
 
 ```python
 # conftest.py at the directory you run mutmut from
-import os, sys, unittest
+import io, os, sys, unittest
 from pathlib import Path
 
 REPO = Path("/abs/path/to/repo")          # absolute! see gotcha 1
 sys.path.insert(0, str(REPO / "vendor" / "odoo"))   # odoo is not pip-installed
 
-import odoo.sql_db
+import odoo, odoo.netsvc, odoo.sql_db
 from odoo.modules.module import initialize_sys_path
-from odoo.modules.registry import Registry          # Odoo 19 API
+from odoo.modules.registry import Registry          # Odoo 19 API; 17 has it too
 from odoo.tools import config as odoo_config
 
 DB = os.environ.get("MUTMUT_ODOO_DB", "your_test_db")
+MUTANTS = Path(os.environ["MUTMUT_WORKDIR"]) / "mutants" / "odoo" / "addons"   # gotcha 9
+
+def _is_addons_dir(path):                            # gotcha 11
+    return path.is_dir() and any(
+        (c / "__manifest__.py").exists() for c in path.iterdir() if c.is_dir()
+    )
 
 def pytest_configure(config):                        # MUST be named `config`
-    odoo_config.parse_config([
-        "-c", str(REPO / "docker" / "odoo.conf"),
+    if getattr(odoo, "_mutmut_booted", False):       # gotcha 12
+        return
+    odoo._mutmut_booted = True
+
+    # the mutated copy must SHADOW the pristine addon: mutants first
+    addons = [p for p in (MUTANTS,) if _is_addons_dir(p)] + [
+        REPO / "custom-addons",
+        REPO / "third-party-addons",
+        REPO / "vendor" / "odoo" / "addons",
+    ]
+    args = [
         "-d", DB,
-        # the mutated copy must SHADOW the pristine addon: mutants first
-        "--addons-path", ",".join([
-            str(REPO / "mutants" / "custom-addons"),
-            str(REPO / "custom-addons"),
-            str(REPO / "third-party-addons"),
-            str(REPO / "vendor" / "odoo" / "addons"),
-        ]),
+        "--addons-path=" + ",".join(str(p) for p in addons),
         "--max-cron-threads=0",
-    ], setup_logging=False)
+    ]
+    # gotcha 10 — Odoo 19 has setup_logging=False; Odoo 17 does not.
+    try:
+        odoo_config.parse_config(args, setup_logging=False)
+    except TypeError:
+        odoo_config._parse_config(args)              # same work, minus init_logger
+        try:
+            odoo.netsvc.init_logger()
+        except io.UnsupportedOperation:
+            pass                                     # no fileno() under mutmut
     odoo_config["dev_mode"] = []                     # conf may set reload,xml,qweb
     initialize_sys_path()
 
@@ -74,14 +92,27 @@ def pytest_configure(config):                        # MUST be named `config`
     Registry(DB)                                     # boot once, forks inherit
 ```
 
+Verify the shim before launching anything long, by running the selection under bare pytest from the same directory (this is also gotcha 6's front-loading):
+
+```bash
+MUTMUT_WORKDIR=$PWD PYTHONPATH=<target> <target>/bin/python -m pytest test_mutation_targets.py -q
+```
+
+Two things to check in that output, not just the exit code: `Modules loaded` must appear **exactly once** (that is the fork-inherit optimisation working), and the test count must match what odoo-bin reports for the same classes.
+
 Point mutmut at the addon and pull the whole thing into `mutants/`:
+
+Lay the working directory out as `odoo/addons/<addon>` — a symlink to the real addon
+is enough — because the path is what mutmut derives the mutant key from (gotcha 9):
 
 ```toml
 [tool.mutmut]
-paths_to_mutate = ["custom-addons/tms/models/tms_settlement.py"]
+paths_to_mutate = ["odoo/addons/tms/models/tms_settlement.py"]
 # Odoo cannot load an addon without its manifest/views/siblings, and
 # paths_to_mutate only copies the mutated files. also_copy brings the rest.
-also_copy = ["custom-addons/tms", "conftest.py", "test_mutation_targets.py"]
+# copytree follows symlinks, so nothing is duplicated on disk.
+also_copy = ["odoo/addons/tms", "conftest.py", "test_mutation_targets.py"]
+do_not_mutate = ["*/migrations/*", "*/__manifest__.py", "*/tests/*"]
 pytest_add_cli_args_test_selection = ["test_mutation_targets.py"]
 ```
 
@@ -118,6 +149,53 @@ Three things reliably fail this gate on Odoo, none of which are real defects:
 **Gotcha 7 — build the test DB fresh; never reuse an old one.** A DB that has been carried forward with `-u` drifts: `-u` does not backfill data and cannot add a NOT NULL constraint over rows that violate it. On one inherited DB, 13 tests failed — a required-field test whose `assertRaises(IntegrityError)` never fired (column still nullable), a perf test over rows with NULLs in a newer required column, sequence tests whose `ir.sequence` rows had a stale `company_id`, and demo-data consistency tests. All 13 passed on a DB built with `-i <all addons> --without-demo=False`. Beyond the gate, a drifting schema also fakes mutant verdicts — so this is correctness, not convenience.
 
 **Gotcha 8 — `--max-children > 1` does not parallelise Odoo; it serialises with extra waiting.** Every fork shares the parent's DB, and a shared `setUpClass` typically writes rows that are identical across suites (a fixture user with a unique login, a group link, an `ir.config_parameter`). `TransactionCase` rolls back only at *class* teardown, so each fork holds those row locks for its entire life and siblings block on `Lock|transactionid` — visible in `pg_stat_activity` as `wait_event_type=Lock`. Real parallelism needs **one database and one working directory per worker** (mutmut hardcodes `mutants/` relative to CWD), each running `--max-children=1`. Symlink the addons dirs into each worker dir so `paths_to_mutate` resolves without copying the tree, and point the conftest at its DB via an env var.
+
+**Gotcha 9 (READ THIS ONE FIRST) — the addon must sit at `odoo/addons/<name>/` in the mutmut working directory, or EVERY mutant reports "no tests".** This is the broken stats mapping the main skill warns about, and here is the mechanism.
+
+mutmut names a mutant from the **file path** under `mutants/`, with separators turned into dots. The trampoline records a stats hit under the module's **runtime `__name__`**. Odoo always imports an addon as `odoo.addons.<name>...`, whatever directory it was loaded from. So the natural layout produces two namespaces that never meet:
+
+```
+mutant key   custom-addons.payroll_management.models.payroll_slip.xǁPayrollSlipǁ_lock_rows_for_update
+stats key    odoo.addons.payroll_management.models.payroll_slip.xǁPayrollSlipǁ_lock_rows_for_update
+```
+
+Every lookup misses, every mutant gets exit code 33, and the run finishes fast and clean with `🎉 0  🫥 1244` — which reads like "the tests cover nothing" rather than "the tool could not find the tests". Nothing in the output says the word *mismatch*.
+
+Fix it with layout, not with a patch. In the directory you run mutmut from:
+
+```
+odoo/addons/<addon>  ->  symlink to the real addon
+```
+```toml
+paths_to_mutate = ["odoo/addons/<addon>/models/x.py", ...]
+also_copy       = ["odoo/addons/<addon>", "conftest.py", "test_mutation_targets.py"]
+```
+
+and point the conftest's shadowing addons-path entry at `mutants/odoo/addons`. `paths_to_mutate` resolves through symlinks and `also_copy`'s `copytree` follows them, so nothing is duplicated on disk.
+
+**Verify before committing hours to a run:** after the stats phase, compare the two key spaces directly — they must share a prefix.
+
+```python
+import json, glob
+stats = json.load(open("mutants/mutmut-stats.json"))["tests_by_mangled_function_name"]
+meta  = json.load(open(glob.glob("mutants/**/*.py.meta", recursive=True)[0]))["exit_code_by_key"]
+print(next(iter(stats)))   # runtime __name__
+print(next(iter(meta)))    # path-derived key
+```
+
+**Gotcha 10 — `parse_config(..., setup_logging=False)` is Odoo 19 only.** Odoo 17's signature is `parse_config(self, args=None)` and it calls `odoo.netsvc.init_logger()` unconditionally. `init_logger` probes for colour with `os.isatty(handler.stream.fileno())`, and mutmut runs `pytest.main()` **in-process** behind a capture object that has no `fileno`, so the whole thing dies before a single test runs:
+
+```
+io.UnsupportedOperation: fileno
+```
+
+Call the private `_parse_config(args)` instead — it is exactly `parse_config` minus `init_logger` and `_warn_deprecated_options` — and then call `init_logger()` yourself inside `try/except io.UnsupportedOperation`. That keeps Odoo's log output on the bare-pytest pre-flight run, where the streams are real, and degrades quietly under mutmut where logging is cosmetic anyway. Do NOT skip `initialize_sys_path()`: `parse_config` was calling it for you.
+
+**Gotcha 11 — an empty `mutants/` addons dir aborts the pre-flight run.** Odoo validates every `--addons-path` entry and rejects the WHOLE option, rather than skipping one entry, with `option --addons-path: the path '...' is not a valid addons directory`. On the first (pre-mutmut) verification run `mutants/custom-addons` does not exist yet. Filter the list with a "contains a subdirectory holding `__manifest__.py`" predicate, which is Odoo's own criterion, so the same conftest serves both the pre-flight and the real run.
+
+**Gotcha 12 — `pytest_configure` fires once per `pytest.main()` call, and mutmut makes several in one process** (stats, then the clean run, then the mutants). Odoo's `_parse_config` is not re-entrant — it consumes entries of `self.options` — so the second call dies with `KeyError: 'load_language'`, reported only as `Failed to run clean test`. Guard the whole bootstrap with a module-level "booted" flag. This is not merely defensive: booting once is the entire point of the fork model, since the registry built on the first call is what every child inherits.
+
+**Gotcha 13 — `python -m mutmut` breaks every trampoline.** See the warning in the main skill file: under `-m`, `__main__.py` is loaded as `__main__`, and the trampoline's `from mutmut.__main__ import record_trampoline_hit` re-executes it, hitting `set_start_method('fork')` twice → `RuntimeError: context has already been set`. It surfaces as `failed to collect stats. runner returned 3` with the traceback nested inside a test failure, which reads exactly like a defect in the code under test. Always invoke the console script.
 
 **Performance:** without the registry-inherit trick, budget 30-180s per mutant (the number most Odoo write-ups quote). With it, per-mutant cost is just the covering tests — often a few seconds. Verify the parent boots the registry exactly once by watching for a single "Modules loaded" line.
 

@@ -77,12 +77,12 @@ Validated at startup by `_verify_runner_configs()` — a typo in
 
 ### `backends.py` — add a new tool
 
-Adding **Codex CLI**, **Kimi**, or any other CLI reviewer is **one
-file, one class, one registry entry**:
+Adding any other CLI reviewer is **one file, one class, one registry
+entry**:
 
 ```python
-class CodexBackend(Backend):
-    name = "codex"
+class MyToolBackend(Backend):
+    name = "mytool"
 
     def run(self, system_prompt, user_prompt, model, timeout):
         # Build argv, invoke subprocess, parse stdout however this CLI
@@ -91,14 +91,35 @@ class CodexBackend(Backend):
 
 BACKENDS: dict[str, Backend] = _build_registry(
     OpencodeBackend(), ClaudeBackend(), KimiBackend(), CodexBackend(),
+    MyToolBackend(),
 )
 ```
 
 Then in `config.py`:
 
 ```python
-PRIMARY = RunnerConfig("codex", "<model-id>")
+PRIMARY = RunnerConfig("mytool", "<model-id>")
 ```
+
+`CodexBackend` is the most recent worked example — see `backends.py`. It
+covers the three decisions every new backend faces: how the system prompt
+is delivered when the CLI has no `--system-prompt` flag (concatenate), how
+to get a large prompt past `ARG_MAX` (stdin, not argv), and how to contain
+a reviewer that would otherwise have write access (`--sandbox read-only`).
+
+`Backend.selfcheck()` is an optional second hook. Override it only when a
+CLI can fail in a way `run`'s return tuple cannot express — codex's
+sandbox can die such that every file-reading tool fails while the run
+still returns rc=0 and a plausible review, so `CodexBackend.selfcheck`
+probes the sandbox once per process (no API call, ~0.1s) and `run` fails
+fast on a bad verdict, routing the commit to `FALLBACK`. `hook.main` also
+calls it via `_warn_on_unhealthy_backends` for an early named warn. Most
+backends need none of this and inherit the default no-op.
+
+**Registered but not wired:** `codex` is in `BACKENDS` and covered by
+tests, but no `RunnerConfig` uses it. Switching to it is a one-line
+uncomment in `config.py` (`_CODEX_MODEL` + the commented `PRIMARIES` /
+`CHUNKED_BACKENDS` entries) and a `codex login`.
 
 `hook.py` does not change. The dispatcher (`run_reviewer`) and
 validator (`_verify_runner_configs`) both read from `BACKENDS`, so a

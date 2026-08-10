@@ -7,6 +7,7 @@ or from ~/.claude/review/ directly.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -25,3 +26,28 @@ def _reset_fallback_events() -> None:
         hook._FALLBACK_EVENTS.clear()
     except Exception:  # noqa: BLE001 — best-effort test hygiene
         pass
+
+
+@pytest.fixture(autouse=True)
+def _pin_codex_sandbox_healthy() -> Iterator[None]:
+    """Pre-seed CodexBackend's sandbox verdict as healthy for every test.
+
+    Without this, any test that reaches ``hook.main()`` (which calls
+    ``_warn_on_unhealthy_backends``) or ``CodexBackend.run`` outside the
+    dedicated helpers would shell out to a real ``codex sandbox`` probe — making
+    the suite slow, environment-dependent, and different on a machine with no
+    codex installed. Restores the previous value afterwards so the probe's own
+    tests (which reset it to None deliberately) stay isolated.
+    """
+    try:
+        import backends
+    except Exception:  # noqa: BLE001 — best-effort test hygiene
+        yield
+        return
+
+    saved = backends._CODEX_SANDBOX_CHECK
+    backends._CODEX_SANDBOX_CHECK = (None,)
+    try:
+        yield
+    finally:
+        backends._CODEX_SANDBOX_CHECK = saved

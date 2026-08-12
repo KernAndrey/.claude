@@ -47,15 +47,18 @@ def main() -> None:
         )
         if result.stdout:
             print(result.stdout, file=sys.stderr)
-        # Check type annotations are present
-        ann_result = subprocess.run(
-            ["ruff", "check", "--select", "ANN", file_path],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-        )
-        if ann_result.stdout:
-            print(ann_result.stdout, file=sys.stderr)
+        # Check type annotations are present. Odoo custom addons are exempt:
+        # their project CLAUDE.md forbids type hints ("No type hints (Odoo
+        # convention)"), so ANN findings there are permanent false noise.
+        if "/custom-addons/" not in file_path:
+            ann_result = subprocess.run(
+                ["ruff", "check", "--select", "ANN", file_path],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+            )
+            if ann_result.stdout:
+                print(ann_result.stdout, file=sys.stderr)
     except FileNotFoundError:
         # ruff not installed — skip silently
         pass

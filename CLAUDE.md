@@ -11,6 +11,26 @@ change. A test's origin is irrelevant: "it was already broken" / "pre-existing"
 If unsure how to fix, report to the user. Loosening assertions masks real bugs.
 </critical>
 
+## Tests that pass review
+
+- The test ships in the same commit as the code — a reviewer sees only the diff.
+- Every trigger branch gets its own test. A guard that fires on two different
+  fields is two tests; reaching it through create and through update is two more.
+- Before calling a test done, ask: would it fail if the fix were reverted?
+  If not, it pins nothing.
+- Assert the exact message or the resulting record state, not a substring that
+  two different refusals share.
+- Exercise a permission branch as an ordinary user — running as admin or
+  superuser skips it entirely.
+
+## Write guards
+
+- A guard added to one write path belongs on the others too (create / update /
+  delete), and each path gets its own test.
+- A guard that depends on the new value reads state after the write, not before.
+- Search-then-create without a unique index does not prevent a duplicate: two
+  concurrent transactions both pass the check.
+
 ## Behavior
 - Verify the task is fully clear before implementing — ask about requirements, edge cases, expected behavior the code can't answer.
 - Critically evaluate proposed solutions; suggest a better approach when you see one.

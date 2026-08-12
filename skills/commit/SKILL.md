@@ -13,7 +13,7 @@ description: Smart commit — security scan, logical split, branch safety checks
 
 1. Per-repo lint hook (ruff/pylint/xmllint where present) → gitleaks → semgrep → `python3 ~/.claude/review/hook.py`.
 2. `review/hook.py` runs the deterministic preflight (`scripts/preflight_gate.py`): coverage gate (diff-cover, 100% of new prod lines) + assert gate (every new/changed test has ≥1 real assertion; no patching the unit under test). No LLM at this stage.
-3. If the diff adds >300 production-code lines (`MAX_PROD_LINES`), the hook routes to the chunked-review pipeline and needs `.review/manifest.yaml` (auto-scaffolded on first hit).
+3. If the diff adds 400 or more production-code lines (`MAX_PROD_LINES`), the hook routes to the chunked-review pipeline and needs `.review/manifest.yaml` (auto-scaffolded on first hit).
 4. AI reviewers from `review/config.py:PRIMARIES` run in parallel; arbiter (`claude/sonnet`) UPHOLDs CRITICAL clusters → commit BLOCKed. WARNINGs are non-blocking but addressed in the next commit.
 5. Crashes fail-open. The global hook snapshots the index via `git write-tree` and restores it on exit if any sub-tool mutates it.
 
@@ -121,7 +121,23 @@ Review all changes and group them into logical commits. A logical commit is a co
 - Wait for the user to confirm or adjust the split before proceeding.
 - Each commit contains one logical change — unrelated changes in one commit make bisect and revert impossible.
 - Keep production code and its tests in the same commit. Splitting into "all code" + "all tests" is forbidden: the first commit hits the `tests` lens with no coverage and gets blocked.
-- If `git diff --cached` adds >300 production-code lines (`MAX_PROD_LINES`), the hook routes to the chunked-review pipeline and needs `.review/manifest.yaml`. The hook auto-scaffolds it on first hit; fill in `chunks:` (group files by meaning, ≤300 prod lines per chunk, ≤12 chunks) and re-run `git commit`. Tests, docs, configs, lock-files, and removals do not count toward the limit.
+- If `git diff --cached` adds 400 or more production-code lines (`MAX_PROD_LINES`), the hook routes to the chunked-review pipeline and needs `.review/manifest.yaml`. The hook auto-scaffolds it on first hit; fill in `chunks:` (group files by meaning, ≤400 prod lines per chunk, ≤6 chunks — `MAX_CHUNKS`) and re-run `git commit`. Tests, docs, configs, lock-files, and removals do not count toward the limit.
+- Validate the manifest before committing — `validators/manifest.py` is a library, not a CLI, so run it as:
+
+  ```bash
+  cd "$(git rev-parse --show-toplevel)" && PYTHONPATH="$HOME/.claude/review" python3 -c "
+  import subprocess
+  from pathlib import Path
+  from validators.manifest import validate
+  diff = subprocess.run(['git', 'diff', '--cached'], capture_output=True, text=True).stdout
+  print(validate(Path('.review/manifest.yaml').read_text(), diff, Path.cwd()).to_text())
+  "
+  ```
+
+  Three failures recur:
+  - `uncovered_file` — every file in the staged diff must be claimed by exactly one chunk.
+  - `missing_related_file` — `default_related_files` must point at paths that exist; a task file moved between `tasks/N-*/` folders breaks it.
+  - `stale_hash` — re-staging changes the diff hash, so regenerate the manifest after any re-stage (`python3 ~/.claude/review/scripts/scaffold_manifest.py`).
 - Valid standalone `test:` commits: test refactoring, adding coverage for previously untested existing code, migrating to a new test framework or fixtures.
 
 ## Phase 5: Lint Check
@@ -209,7 +225,7 @@ If `git fsck` still reports missing blobs after `git reset`, stop and report to 
 - Create new commits rather than amending, unless the user explicitly asks.
 - Use standard push (no `--force`).
 - If a pre-commit hook fails or the AI review BLOCKs the commit, fix the reported issues, re-stage, and create a new commit.
-- Diffs over 300 added prod lines route to the chunked path and require `.review/manifest.yaml`.
+- Diffs of 400 or more added prod lines route to the chunked path and require `.review/manifest.yaml`.
 - Two stages run before BLOCK: deterministic preflight (line coverage + asserts, no LLM), then AI lens. Pass both by writing real tests, not by trimming scope.
 - When splitting a large feature, slice by **vertical** (each slice = code + its tests), never by layer (all code → all tests).
 - Before `git commit` the working tree must contain only staged changes. The skill stashes the unstaged tail in Phase 6 — do not skip that step: it keeps linters and re-stages from leaking unstaged or untracked content into the commit.

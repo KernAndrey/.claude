@@ -9,15 +9,21 @@ is touched.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
+import fcntl
 import io
 import json
+import math
 import os
 import shutil
 import sys
-from collections.abc import Callable
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
 HOME = Path.home()
 CLAUDE_DIR = HOME / ".claude"
@@ -28,14 +34,111 @@ ACTIVE_FILE = PROFILES_DIR / ".active"
 BACKUPS_DIR = PROFILES_DIR / ".backups"
 BACKUP_KEEP = 5
 
+AUTO_FILE = PROFILES_DIR / ".auto"
+GATE_FILE = PROFILES_DIR / ".gate"
+EXHAUSTED_FILE = PROFILES_DIR / ".exhausted"
+SETTLE_FILE = PROFILES_DIR / ".settle"
+LOG_FILE = PROFILES_DIR / ".auto.log"
+LOCK_FILE = PROFILES_DIR / ".lock"
+
 EXIT_OK = 0
 EXIT_USER = 1
 EXIT_SYS = 2
+
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# The Claude Code CLI's public OAuth client id. Public clients have no client
+# secret, so this identifier is not confidential — it ships inside the binary
+# and travels in every token request. gitleaks flags it purely on UUID entropy.
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # gitleaks:allow
+USER_AGENT = "cc-switch (local account switcher)"
+HTTP_TIMEOUT = 20
+
+
+# Leaving a 5h window early costs little — it refills in hours. Leaving a
+# weekly window early costs a week, so 7d is squeezed much harder.
+DEFAULT_EXIT_5H = 95.0
+DEFAULT_EXIT_7D = 99.0
+# ENTER_* sit below EXIT_* on purpose: the gap is the hysteresis that stops
+# two accounts from trading places at the threshold.
+DEFAULT_ENTER_5H = 90.0
+DEFAULT_ENTER_7D = 94.0
+DEFAULT_BALANCE_GAP_7D = 5.0
+DEFAULT_SETTLE_SECONDS = 60.0
+# Pause after an unreachable candidate: long enough not to hammer a throttled
+# endpoint, short enough that a blip costs minutes rather than days.
+DEFAULT_RETRY_SECONDS = 300.0
 
 
 def die(msg: str, code: int = EXIT_SYS) -> NoReturn:
     print(f"cc-switch: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a percentage override, rejecting values that break arithmetic later.
+
+    `float()` happily accepts "nan" and "inf". A NaN threshold would sail
+    through here and only blow up in `math.floor()` while writing the gate —
+    after `.auto` is already on, so every statusline render would spawn a
+    crashing tick.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        die(f"invalid {name}: {raw!r} (expected a number)", EXIT_USER)
+    if not math.isfinite(value):
+        die(f"invalid {name}: {raw!r} (must be a finite number)", EXIT_USER)
+    if not 0 <= value <= 100:
+        die(f"invalid {name}: {raw!r} (must be between 0 and 100)", EXIT_USER)
+    return value
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """Read a duration override. Non-finite or negative would break deadlines."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        die(f"invalid {name}: {raw!r} (expected a number)", EXIT_USER)
+    if not math.isfinite(value) or value < 0:
+        die(f"invalid {name}: {raw!r} (must be a non-negative finite number)", EXIT_USER)
+    return value
+
+
+EXIT_5H = _env_float("CC_SWITCH_EXIT_5H", DEFAULT_EXIT_5H)
+EXIT_7D = _env_float("CC_SWITCH_EXIT_7D", DEFAULT_EXIT_7D)
+ENTER_5H = _env_float("CC_SWITCH_ENTER_5H", DEFAULT_ENTER_5H)
+ENTER_7D = _env_float("CC_SWITCH_ENTER_7D", DEFAULT_ENTER_7D)
+BALANCE_GAP_7D = _env_float("CC_SWITCH_BALANCE_GAP_7D", DEFAULT_BALANCE_GAP_7D)
+SETTLE_SECONDS = _env_seconds("CC_SWITCH_SETTLE_SECONDS", DEFAULT_SETTLE_SECONDS)
+RETRY_SECONDS = _env_seconds("CC_SWITCH_RETRY_SECONDS", DEFAULT_RETRY_SECONDS)
+
+
+def check_threshold_consistency(
+    enter_5h: float, exit_5h: float, enter_7d: float, exit_7d: float, balance_gap: float
+) -> None:
+    """Reject threshold combinations that make switching unstable.
+
+    An entry bar above its exit threshold destroys the hysteresis: an account
+    could be left and re-entered at the same percentage. A zero balance gap is
+    worse — equal weekly usage becomes a reason to move, so two healthy
+    accounts trade places after every settle window, forever.
+    """
+    if enter_5h > exit_5h:
+        die("CC_SWITCH_ENTER_5H must not exceed CC_SWITCH_EXIT_5H", EXIT_USER)
+    if enter_7d > exit_7d:
+        die("CC_SWITCH_ENTER_7D must not exceed CC_SWITCH_EXIT_7D", EXIT_USER)
+    if balance_gap <= 0:
+        die("CC_SWITCH_BALANCE_GAP_7D must be greater than 0", EXIT_USER)
+
+
+check_threshold_consistency(ENTER_5H, EXIT_5H, ENTER_7D, EXIT_7D, BALANCE_GAP_7D)
 
 
 def ensure_dirs() -> None:
@@ -154,14 +257,21 @@ def read_active() -> str | None:
     return value or None
 
 
-def write_active(name: str) -> None:
-    tmp = ACTIVE_FILE.parent / (ACTIVE_FILE.name + ".tmp")
+def write_text_file(path: Path, text: str, fatal: bool = True) -> bool:
+    tmp = path.parent / (path.name + ".tmp")
     try:
         with _open_write_0600(tmp) as f:
-            f.write(name + "\n")
-        os.replace(tmp, ACTIVE_FILE)
+            f.write(text)
+        os.replace(tmp, path)
     except OSError as e:
-        die(f"failed to write {ACTIVE_FILE}: {e}")
+        if fatal:
+            die(f"failed to write {path}: {e}")
+        return False
+    return True
+
+
+def write_active(name: str) -> None:
+    write_text_file(ACTIVE_FILE, name + "\n")
 
 
 def rotate_backups() -> None:
@@ -227,6 +337,472 @@ def list_profiles() -> list[Path]:
     return sorted(items)
 
 
+def load_profile_data(name: str) -> dict[str, Any] | None:
+    """Read a profile without exiting — callers decide what a bad one means."""
+    try:
+        data, _, _ = _parse_json_object(profile_path(name))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    return data
+
+
+# ---- Auto-switch state ------------------------------------------------
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _iso_now() -> str:
+    return _dt.datetime.now(_dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso(ts: object) -> float | None:
+    """Parse an API timestamp to epoch seconds; None when absent or unparsable.
+
+    `resets_at` comes back null for a window with no usage at all, so the
+    missing case is ordinary rather than exceptional.
+    """
+    if not isinstance(ts, str) or not ts:
+        return None
+    try:
+        return _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def read_epoch_file(path: Path) -> float:
+    """Read a deadline written as plain text; 0.0 when missing or unreadable.
+
+    Plain text rather than JSON so the statusline can read it from bash
+    without a parser.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return 0.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.0
+
+
+def write_epoch_file(path: Path, epoch: float) -> None:
+    write_text_file(path, f"{int(epoch)}\n")
+
+
+def clear_state_file(path: Path) -> None:
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def auto_enabled() -> bool:
+    try:
+        return AUTO_FILE.read_text(encoding="utf-8").strip() == "on"
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def profile_lock() -> Iterator[bool]:
+    """Hold one lock across the whole read-decide-write sequence.
+
+    Yields False when another process holds it. Two sessions crossing the
+    threshold in the same second must not both auto-save and switch, or the
+    second one writes stale credentials over the profile the first just
+    moved to.
+    """
+    try:
+        fd = os.open(str(LOCK_FILE), os.O_WRONLY | os.O_CREAT, 0o600)
+    except OSError:
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+def log_decision(message: str) -> None:
+    stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        fd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(f"{stamp} {message}\n")
+    except OSError:
+        pass
+
+
+# ---- Usage snapshots --------------------------------------------------
+
+
+class Candidate(NamedTuple):
+    name: str
+    five_hour: float
+    seven_day: float
+
+
+def _window(utilization: float, resets_at: str | None) -> dict[str, Any]:
+    return {"utilization": utilization, "resets_at": resets_at}
+
+
+def make_snapshot(five: float, seven: float, resets_5h: str | None, resets_7d: str | None) -> dict[str, Any]:
+    return {
+        "five_hour": _window(five, resets_5h),
+        "seven_day": _window(seven, resets_7d),
+        "observedAt": _iso_now(),
+    }
+
+
+def usage_from_api(payload: dict[str, Any]) -> dict[str, Any]:
+    """Reduce an /api/oauth/usage response to the two windows we act on."""
+    values: dict[str, tuple[float, str | None]] = {}
+    for key in ("five_hour", "seven_day"):
+        block = payload.get(key)
+        util = block.get("utilization") if isinstance(block, dict) else None
+        resets = block.get("resets_at") if isinstance(block, dict) else None
+        values[key] = (
+            float(util) if isinstance(util, (int, float)) else 0.0,
+            resets if isinstance(resets, str) else None,
+        )
+    return make_snapshot(values["five_hour"][0], values["seven_day"][0], values["five_hour"][1], values["seven_day"][1])
+
+
+def _window_value(window: object, now: float) -> float:
+    if not isinstance(window, dict):
+        return 0.0
+    resets = parse_iso(window.get("resets_at"))
+    if resets is not None and now > resets:
+        return 0.0
+    value = window.get("utilization")
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def effective_usage(snapshot: object, now: float) -> tuple[float, float]:
+    """Snapshot usage with each window zeroed past its own reset.
+
+    An idle account's usage only falls, so a stored snapshot is an upper
+    bound. Both windows are zeroed independently: zeroing only the 5h
+    component would strand an account whose stored weekly figure is high but
+    whose weekly window rolled over long ago.
+    """
+    if not isinstance(snapshot, dict):
+        return 0.0, 0.0
+    return _window_value(snapshot.get("five_hour"), now), _window_value(snapshot.get("seven_day"), now)
+
+
+def record_usage_snapshot(name: str, snapshot: dict[str, Any]) -> None:
+    """Merge fresh usage into a saved profile and clear any auth failure.
+
+    Having read usage at all proves the credentials work, so a stale
+    `authError` must not survive it.
+    """
+    data = load_profile_data(name)
+    if data is None:
+        return
+    data["usage"] = snapshot
+    data.pop("authError", None)
+    atomic_write_json(profile_path(name), data, indent=2, trailing_nl=True)
+
+
+def mark_auth_error(name: str, reason: str) -> None:
+    data = load_profile_data(name)
+    if data is None:
+        return
+    data["authError"] = {"reason": reason, "at": _iso_now()}
+    atomic_write_json(profile_path(name), data, indent=2, trailing_nl=True)
+
+
+def profile_unusable_reason(data: object, now: float) -> str | None:
+    """Why this profile must not be switched to, or None when it is fine."""
+    if not isinstance(data, dict):
+        return "corrupted"
+    creds = data.get("credentials")
+    oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+    if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
+        return "no credentials"
+    if not isinstance(data.get("oauthAccount"), dict):
+        return "no account"
+    expires = oauth.get("refreshTokenExpiresAt")
+    # A refresh does not push this deadline out — the server returns the same
+    # absolute expiry — so past it the account is dead until someone logs in.
+    if isinstance(expires, (int, float)) and expires / 1000 <= now:
+        return "refresh token expired"
+    err = data.get("authError")
+    if isinstance(err, dict):
+        return f"auth error ({err.get('reason', 'unknown')})"
+    return None
+
+
+def rank_candidates(now: float, exclude: str | None) -> list[Candidate]:
+    """Usable profiles that clear the entry bar, lowest weekly usage first.
+
+    This is the whole loop-prevention argument: one evaluation over a total
+    order picks the best account, rather than reacting to the current one.
+    """
+    ranked: list[Candidate] = []
+    for path in list_profiles():
+        name = path.stem
+        if name == exclude:
+            continue
+        data = load_profile_data(name)
+        if profile_unusable_reason(data, now) is not None:
+            continue
+        five, seven = effective_usage((data or {}).get("usage"), now)
+        if five > ENTER_5H or seven > ENTER_7D:
+            continue
+        ranked.append(Candidate(name, five, seven))
+    ranked.sort(key=lambda c: (c.seven_day, c.five_hour, c.name))
+    return ranked
+
+
+def switch_reason(five: float, seven: float, candidate_7d: float) -> str | None:
+    """Why to leave the active account: exhaustion, imbalance, or neither."""
+    if five >= EXIT_5H or seven >= EXIT_7D:
+        return "limit"
+    if seven - candidate_7d >= BALANCE_GAP_7D:
+        return "balance"
+    return None
+
+
+def earliest_future_reset(names: list[str], now: float) -> float:
+    """Earliest window reset still ahead of us, 0.0 when none is known.
+
+    Past such a moment an idle snapshot zeroes itself, which can create a
+    reason to switch with no usage change at all.
+    """
+    upcoming: list[float] = []
+    for name in names:
+        data = load_profile_data(name)
+        snapshot = data.get("usage") if isinstance(data, dict) else None
+        if not isinstance(snapshot, dict):
+            continue
+        for key in ("five_hour", "seven_day"):
+            resets = parse_iso((snapshot.get(key) or {}).get("resets_at"))
+            if resets is not None and resets > now:
+                upcoming.append(resets)
+    return min(upcoming) if upcoming else 0.0
+
+
+def recompute_gate(active: str | None, now: float) -> None:
+    """Write the cheap trigger the statusline consults on every render.
+
+    Format `<not_before> <recheck_after> <trigger_5h> <trigger_7d>`, all
+    integers so bash compares them without a parser; 0 means "no trigger".
+    Balancing needs checks at ordinary percentages too, and this file is what
+    keeps that from costing a python process per render.
+    """
+    ranked = rank_candidates(now, active)
+    best_7d = ranked[0].seven_day if ranked else 100.0
+    trigger_7d = min(EXIT_7D, best_7d + BALANCE_GAP_7D)
+    not_before = max(read_epoch_file(SETTLE_FILE), read_epoch_file(EXHAUSTED_FILE))
+    others = [p.stem for p in list_profiles() if p.stem != active]
+    line = (
+        f"{int(not_before)} {int(earliest_future_reset(others, now))} {math.floor(EXIT_5H)} {math.floor(trigger_7d)}\n"
+    )
+    write_text_file(GATE_FILE, line, fatal=False)
+
+
+# ---- Live account checks ----------------------------------------------
+
+
+def _http_json(req: urllib.request.Request) -> tuple[int, Any]:
+    """Send a request to one of our two endpoints and parse the JSON reply.
+
+    The allow-list is enforced rather than assumed: urllib honours `file://`,
+    so a URL that ever became attacker-influenced could read local files. Both
+    URLs are module constants today, and this keeps that true.
+    """
+    if req.full_url not in (USAGE_URL, TOKEN_URL):
+        die(f"refusing to call an unexpected URL: {req.full_url}")
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:  # noqa: S310  # nosemgrep: dynamic-urllib-use-detected
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode("utf-8"))
+        except (OSError, ValueError):
+            return e.code, None
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        return 0, {"error": {"message": str(e)}}
+
+
+def fetch_usage(access_token: str) -> tuple[int, Any]:
+    req = urllib.request.Request(
+        USAGE_URL,
+        headers={"Authorization": f"Bearer {access_token}", "User-Agent": USER_AGENT},
+    )
+    return _http_json(req)
+
+
+def oauth_refresh(refresh_token: str) -> tuple[int, Any]:
+    """Exchange a refresh token. Never retried — the endpoint throttles failures with 429."""
+    body = json.dumps(
+        {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": OAUTH_CLIENT_ID}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+        method="POST",
+    )
+    return _http_json(req)
+
+
+def _emergency_token_dump(name: str, payload: dict[str, Any]) -> None:
+    """Last resort so a rotated token is never lost with nowhere to go."""
+    path = PROFILES_DIR / f".recovery-{name}.json"
+    try:
+        with _open_write_0600(path) as f:
+            json.dump(payload, f, indent=2)
+        print(f"cc-switch: rotated tokens for '{name}' saved to {path}", file=sys.stderr)
+    except OSError:
+        print(f"cc-switch: rotated tokens for '{name}': {json.dumps(payload)}", file=sys.stderr)
+
+
+def _store_refreshed_tokens(name: str, payload: dict[str, Any]) -> str:
+    """Write rotated tokens to the profile before they are used anywhere else.
+
+    The old refresh token dies the moment the server answers, so the gap
+    between that answer and this write is the only place an account can be
+    lost. Nothing else happens in between.
+    """
+    try:
+        return _store_refreshed_tokens_unguarded(name, payload)
+    except SystemExit:
+        _emergency_token_dump(name, payload)
+        raise
+    except Exception:
+        # Anything at all — a malformed `expires_in`, an unreadable profile,
+        # a surprise from the JSON layer — still leaves the server-side old
+        # token dead. The rotated pair must reach disk somewhere before this
+        # propagates, or the account needs a manual login to recover.
+        _emergency_token_dump(name, payload)
+        raise
+
+
+def _expiry_ms(value: object, now_ms: int) -> int | None:
+    """Absolute expiry from a lifetime in seconds; None when unusable."""
+    try:
+        seconds = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return now_ms + seconds * 1000 if seconds > 0 else None
+
+
+def _store_refreshed_tokens_unguarded(name: str, payload: dict[str, Any]) -> str:
+    data = load_profile_data(name)
+    if data is None:
+        die(f"profile {name} became unreadable while storing refreshed tokens")
+    oauth = data["credentials"]["claudeAiOauth"]
+    now_ms = int(time.time() * 1000)
+    oauth["accessToken"] = payload["access_token"]
+    if payload.get("refresh_token"):
+        oauth["refreshToken"] = payload["refresh_token"]
+    # A missing or malformed lifetime leaves the stored expiry alone: a stale
+    # timestamp only costs one extra refresh, whereas guessing could park a
+    # dead token far in the future and strand the account.
+    access_expiry = _expiry_ms(payload.get("expires_in"), now_ms)
+    if access_expiry is not None:
+        oauth["expiresAt"] = access_expiry
+    refresh_expiry = _expiry_ms(payload.get("refresh_token_expires_in"), now_ms)
+    if refresh_expiry is not None:
+        oauth["refreshTokenExpiresAt"] = refresh_expiry
+    data.pop("authError", None)
+    atomic_write_json(profile_path(name), data, indent=2, trailing_nl=True)
+    return str(payload["access_token"])
+
+
+def _refresh_error(name: str, status: int, payload: object) -> tuple[str, bool]:
+    """Classify a failed refresh: retire the profile only on a real rejection.
+
+    Returns (message, transient). A throttled or unreachable server says
+    nothing about the account, so it must not retire the profile and must not
+    count as evidence of exhaustion.
+    """
+    detail = json.dumps(payload) if payload is not None else ""
+    if status in (401, 403) or "invalid_grant" in detail:
+        mark_auth_error(name, f"refresh rejected ({status})")
+        return f"unauthorized ({status})", False
+    return f"refresh failed ({status})", True
+
+
+def _is_live_account(name: str) -> bool:
+    """Does this profile hold the account Claude Code is currently signed into?
+
+    Matched by email, not by profile name: the same account can be saved
+    twice under different names, and refreshing the copy would rotate the
+    refresh token the running session shares with it.
+    """
+    state = read_current_state(strict=False)
+    live_email = state[1].get("emailAddress") if state else None
+    return bool(live_email) and _profile_email(profile_path(name)) == live_email
+
+
+def access_token_for(name: str, active: str | None) -> tuple[str | None, str | None, bool]:
+    """Return (access token, error, transient). The live account is never refreshed.
+
+    Claude Code owns the live credentials and rotates them itself; refreshing
+    underneath it would invalidate the refresh token the running process
+    holds.
+    """
+    if name == active or _is_live_account(name):
+        state = read_current_state(strict=False)
+        if state is None:
+            return None, "no live credentials", False
+        return state[0].get("claudeAiOauth", {}).get("accessToken"), None, False
+    data = load_profile_data(name)
+    if data is None:
+        return None, "corrupted", False
+    oauth = data.get("credentials", {}).get("claudeAiOauth", {})
+    if float(oauth.get("expiresAt") or 0) / 1000 > time.time() + 60:
+        return oauth.get("accessToken"), None, False
+    status, payload = oauth_refresh(str(oauth.get("refreshToken") or ""))
+    if status != 200 or not isinstance(payload, dict) or "access_token" not in payload:
+        message, transient = _refresh_error(name, status, payload)
+        return None, message, transient
+    return _store_refreshed_tokens(name, payload), None, False
+
+
+class Confirmation(NamedTuple):
+    """Outcome of a live candidate check.
+
+    `transient` separates "this account is out of room / not authorized" from
+    "we could not reach the server". Only the former is evidence about the
+    account; treating the latter as exhaustion would silence auto-switching
+    for as long as the reset deadline says.
+    """
+
+    usage: dict[str, Any] | None
+    error: str | None
+    transient: bool = False
+
+
+def confirm_candidate(name: str, active: str | None) -> Confirmation:
+    """Prove the candidate is authorized and learn its real usage.
+
+    Offline checks cannot see a revoked session, so the winner — and only the
+    winner — is confirmed live before anything is swapped.
+    """
+    token, error, transient = access_token_for(name, active)
+    if not token:
+        return Confirmation(None, error or "no access token", transient)
+    status, payload = fetch_usage(token)
+    if status == 200 and isinstance(payload, dict):
+        snapshot = usage_from_api(payload)
+        record_usage_snapshot(name, snapshot)
+        return Confirmation(snapshot, None)
+    if status in (401, 403):
+        mark_auth_error(name, f"usage rejected ({status})")
+        return Confirmation(None, f"unauthorized ({status})")
+    return Confirmation(None, f"usage request failed ({status})", transient=True)
+
+
 # ---- Commands ---------------------------------------------------------
 
 
@@ -238,26 +814,47 @@ def cmd_add(args: argparse.Namespace) -> int:
         if not confirm(f"Profile '{name}' already exists. Overwrite?"):
             print("Cancelled.")
             return EXIT_OK
-    state = read_current_state(strict=True)
-    assert state is not None  # strict=True would have exited on failure
-    creds, oauth = state
-    save_profile(name, creds, oauth)
+    # The lock is taken after the prompt so a waiting confirmation never
+    # blocks a tick, but before any write — an auto switch saving the account
+    # we are about to overwrite would otherwise interleave with this.
+    with profile_lock() as acquired:
+        if not acquired:
+            die("another cc-switch operation is in progress — try again in a moment", EXIT_USER)
+        state = read_current_state(strict=True)
+        assert state is not None  # strict=True would have exited on failure
+        creds, oauth = state
+        save_profile(name, creds, oauth)
     email = oauth.get("emailAddress", "?")
     sub = creds.get("claudeAiOauth", {}).get("subscriptionType", "?")
     print(f"Saved profile '{name}' ({email}, {sub}) -> {path}")
     return EXIT_OK
 
 
-def _auto_backup_active(name: str) -> None:
-    active = read_active()
+def _auto_backup_active(name: str, quiet: bool = False) -> None:
+    """Save the live credentials into the profile we are leaving.
+
+    The destination is resolved from those same live credentials, never from
+    the `.active` marker. They disagree whenever Claude Code logged into a
+    different saved account on its own, and writing one account's credentials
+    into another account's profile destroys the second one irrecoverably.
+
+    The usage snapshot recorded during this session is preserved, so the
+    account we walk away from keeps honest numbers for the next ranking.
+    """
+    active = resolve_active()
     if not active or active == name or not profile_path(active).exists():
         return
     state = read_current_state(strict=False)
     if state is None:
         return
+    previous = load_profile_data(active) or {}
     cur_creds, cur_oauth = state
     save_profile(active, cur_creds, cur_oauth)
-    print(f"Auto-saved active profile '{active}'")
+    snapshot = previous.get("usage")
+    if isinstance(snapshot, dict):
+        record_usage_snapshot(active, snapshot)
+    if not quiet:
+        print(f"Auto-saved active profile '{active}'")
 
 
 def _load_profile_for_use(name: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -309,13 +906,14 @@ def _apply_switch_atomic(
         raise
 
 
-def cmd_use(args: argparse.Namespace) -> int:
-    ensure_dirs()
-    name: str = args.name
-    if not profile_path(name).exists():
-        die(f"profile not found: {name}", EXIT_USER)
+def _switch_to(name: str, quiet: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Swap credentials to a saved profile. Shared by manual and auto paths.
 
-    _auto_backup_active(name)
+    Every switch arms the settle window, manual ones included: the statusline
+    keeps reporting the old account's percentages for a moment afterwards, and
+    a tick reading those would immediately undo a deliberate `cc-switch use`.
+    """
+    _auto_backup_active(name, quiet=quiet)
 
     new_creds, new_oauth = _load_profile_for_use(name)
     main_data, indent_main, tnl_main = _preflight_main()
@@ -333,6 +931,30 @@ def cmd_use(args: argparse.Namespace) -> int:
         creds_tnl,
     )
     write_active(name)
+    write_epoch_file(SETTLE_FILE, _now() + SETTLE_SECONDS)
+    return new_creds, new_oauth
+
+
+def cmd_use(args: argparse.Namespace) -> int:
+    """Switch to a named profile.
+
+    Takes the same lock as the automatic path: a manual switch runs the
+    identical read-decide-write sequence, so racing a statusline tick would
+    let either side overwrite the other's `.active`, credentials, and saved
+    profile — and silently undo the choice the user just made.
+    """
+    ensure_dirs()
+    name: str = args.name
+    if not profile_path(name).exists():
+        die(f"profile not found: {name}", EXIT_USER)
+
+    with profile_lock() as acquired:
+        if not acquired:
+            die("another cc-switch operation is in progress — try again in a moment", EXIT_USER)
+        new_creds, new_oauth = _switch_to(name)
+        # The gate describes one specific active account; a manual move
+        # invalidates it just as much as an automatic one.
+        recompute_gate(name, _now())
 
     email = new_oauth.get("emailAddress", "?")
     sub = new_creds.get("claudeAiOauth", {}).get("subscriptionType", "?")
@@ -363,24 +985,41 @@ def _profile_summary(p: Path) -> tuple[str, str]:
 
 def cmd_list(_args: argparse.Namespace) -> int:
     ensure_dirs()
-    active = read_active()
+    # The marker can name an account Claude Code has already logged out of;
+    # showing the wrong one as active is how a user ends up acting on it.
+    active = resolve_active()
     profiles = list_profiles()
     if not profiles:
         print("No profiles yet. Save the current one: cc-switch add <name>")
         return EXIT_OK
 
-    rows: list[tuple[bool, str, str, str]] = []
+    now = _now()
+    rows: list[tuple[bool, str, str, str, str]] = []
     for p in profiles:
         name = p.stem
         email, sub = _profile_summary(p)
-        rows.append((name == active, name, email, sub))
+        rows.append((name == active, name, email, sub, _profile_note(name, now)))
 
     name_w = max(len(r[1]) for r in rows)
     email_w = max(len(r[2]) for r in rows)
-    for is_active, name, email, sub in rows:
+    for is_active, name, email, sub, note in rows:
         marker = "*" if is_active else " "
-        print(f"{marker} {name:<{name_w}}  {email:<{email_w}}  ({sub})")
+        print(f"{marker} {name:<{name_w}}  {email:<{email_w}}  ({sub}){note}")
     return EXIT_OK
+
+
+def _profile_note(name: str, now: float) -> str:
+    """Flag a profile that cannot be switched to, or is about to expire."""
+    data = load_profile_data(name)
+    reason = profile_unusable_reason(data, now)
+    if reason is not None:
+        return f"  ! {reason}"
+    expires = (data or {}).get("credentials", {}).get("claudeAiOauth", {}).get("refreshTokenExpiresAt")
+    if isinstance(expires, (int, float)):
+        days_left = (expires / 1000 - now) / 86400
+        if days_left < 2:
+            return f"  ! login expires in {days_left * 24:.0f}h"
+    return ""
 
 
 def _profile_email(p: Path) -> str | None:
@@ -395,25 +1034,44 @@ def _profile_email(p: Path) -> str | None:
     return email if isinstance(email, str) else None
 
 
+def resolve_active() -> str | None:
+    """The profile whose credentials are actually live.
+
+    The live credentials win over the `.active` marker, which is a hint that
+    goes stale the moment someone logs into a different account through Claude
+    Code itself. This is a safety decision, not cosmetics: everything
+    downstream refuses to refresh *the active profile*, so naming the wrong
+    one would rotate the token out from under the running session — exactly
+    what that rule exists to prevent.
+    """
+    state = read_current_state(strict=False)
+    live_email = state[1].get("emailAddress") if state else None
+    if live_email:
+        marker = read_active()
+        if marker and _profile_email(profile_path(marker)) == live_email:
+            return marker
+        for p in list_profiles():
+            if _profile_email(p) == live_email:
+                return p.stem
+        return None
+    # No live email to match against (never logged in, or a stripped account
+    # object). The marker is all we have; it is still better than nothing.
+    marker = read_active()
+    return marker if marker and profile_path(marker).exists() else None
+
+
 def cmd_current(_args: argparse.Namespace) -> int:
     ensure_dirs()
-    active = read_active()
-    if active and profile_path(active).exists():
-        print(active)
+    resolved = resolve_active()
+    if resolved is not None:
+        print(resolved)
         return EXIT_OK
 
     state = read_current_state(strict=False)
     if state is None:
         print("No active profile (no current credentials)")
         return EXIT_OK
-    _, oauth = state
-    cur_email = oauth.get("emailAddress")
-    if cur_email:
-        for p in list_profiles():
-            if _profile_email(p) == cur_email:
-                print(p.stem)
-                return EXIT_OK
-    print(f"No active profile (current email: {cur_email or '?'})")
+    print(f"No active profile (current email: {state[1].get('emailAddress') or '?'})")
     return EXIT_OK
 
 
@@ -426,16 +1084,297 @@ def cmd_remove(args: argparse.Namespace) -> int:
     if not confirm(f"Remove profile '{name}'?"):
         print("Cancelled.")
         return EXIT_OK
-    try:
-        path.unlink()
-    except OSError as e:
-        die(f"failed to remove {path}: {e}")
-    if read_active() == name:
+    with profile_lock() as acquired:
+        if not acquired:
+            die("another cc-switch operation is in progress — try again in a moment", EXIT_USER)
         try:
-            ACTIVE_FILE.unlink()
-        except OSError:
-            pass
+            path.unlink()
+        except OSError as e:
+            die(f"failed to remove {path}: {e}")
+        if read_active() == name:
+            # Only the marker is cleared here — matching it by name is right,
+            # since we are removing that exact saved profile.
+            try:
+                ACTIVE_FILE.unlink()
+            except OSError:
+                pass
+        # The gate ranks candidates; removing one makes it stale immediately.
+        recompute_gate(resolve_active(), _now())
     print(f"Removed profile '{name}'")
+    return EXIT_OK
+
+
+# ---- Auto-switch commands ---------------------------------------------
+
+
+def _fmt_epoch(epoch: float) -> str:
+    if epoch <= 0:
+        return "unknown"
+    return _dt.datetime.fromtimestamp(epoch).strftime("%d %b %H:%M")
+
+
+def cmd_auto(args: argparse.Namespace) -> int:
+    """Turn auto-switching on or off. The flag is permanent until changed.
+
+    On and off take the lock so the reported state is the real one: a tick
+    holding the lock re-reads the flag before deciding, so once `auto off`
+    returns, no already-running tick can still switch accounts.
+    """
+    ensure_dirs()
+    action: str = args.action
+    if action in ("on", "off"):
+        with profile_lock() as acquired:
+            if not acquired:
+                die("another cc-switch operation is in progress — try again in a moment", EXIT_USER)
+            if action == "on":
+                write_text_file(AUTO_FILE, "on\n")
+                clear_state_file(EXHAUSTED_FILE)
+                recompute_gate(resolve_active(), _now())
+                print("Auto-switching enabled")
+            else:
+                clear_state_file(AUTO_FILE)
+                clear_state_file(GATE_FILE)
+                print("Auto-switching disabled")
+        return EXIT_OK
+    print(f"Auto-switching {'enabled' if auto_enabled() else 'disabled'}")
+    exhausted = read_epoch_file(EXHAUSTED_FILE)
+    if exhausted > _now():
+        print(f"All accounts exhausted until {_fmt_epoch(exhausted)}")
+    print(
+        f"Thresholds: leave at 5h>={EXIT_5H:.0f}% or 7d>={EXIT_7D:.0f}%, "
+        f"enter below 5h {ENTER_5H:.0f}% / 7d {ENTER_7D:.0f}%, balance gap {BALANCE_GAP_7D:.0f}pp"
+    )
+    return EXIT_OK
+
+
+def _perform_auto_switch(active: str | None, name: str, reason: str, now: float) -> None:
+    _switch_to(name, quiet=True)  # arms the settle window
+    clear_state_file(EXHAUSTED_FILE)
+    recompute_gate(name, now)
+    log_decision(f"switch {active or '?'} -> {name} ({reason})")
+
+
+def _no_candidate_left(active: str | None, reason: str, now: float, transient: bool = False) -> int:
+    """Stay put. Only proven exhaustion earns a deadline.
+
+    Two cases must not write one. A balance evaluation that found nothing
+    would silence the limit path until the weekly window rolls over. And a
+    candidate that merely could not be reached is no evidence at all — a
+    network blip would suppress switching for hours or days while the account
+    actually had room. Both fall back to a short retry pause instead.
+    """
+    if reason != "limit":
+        recompute_gate(active, now)
+        return EXIT_OK
+    if transient:
+        write_epoch_file(SETTLE_FILE, now + RETRY_SECONDS)
+        log_decision(f"no candidate reachable; retrying after {int(RETRY_SECONDS)}s")
+        recompute_gate(active, now)
+        return EXIT_OK
+    deadline = earliest_future_reset([p.stem for p in list_profiles()], now)
+    if deadline > 0:
+        write_epoch_file(EXHAUSTED_FILE, deadline)
+    log_decision(f"all accounts exhausted; earliest reset {_fmt_epoch(deadline)}")
+    recompute_gate(active, now)
+    return EXIT_OK
+
+
+def _try_candidates(
+    active: str | None,
+    ranked: list[Candidate],
+    reason: str,
+    active_usage: tuple[float, float],
+    now: float,
+) -> int:
+    """Confirm candidates in order; the first authorized one with headroom wins.
+
+    Each candidate is confirmed at most once, so this terminates even when
+    every stored snapshot turns out to have been optimistic.
+    """
+    five, seven = active_usage
+    unreachable = False
+    for candidate in ranked:
+        result = confirm_candidate(candidate.name, active)
+        if result.usage is None:
+            unreachable = unreachable or result.transient
+            log_decision(f"skip {candidate.name}: {result.error}")
+            continue
+        live_5h, live_7d = effective_usage(result.usage, now)
+        if live_5h > ENTER_5H or live_7d > ENTER_7D:
+            log_decision(f"skip {candidate.name}: live 5h={live_5h:.0f}% 7d={live_7d:.0f}%")
+            continue
+        if switch_reason(five, seven, live_7d) is None:
+            log_decision(f"skip {candidate.name}: live 7d={live_7d:.0f}% leaves no reason to move")
+            continue
+        _perform_auto_switch(active, candidate.name, reason, now)
+        return EXIT_OK
+    return _no_candidate_left(active, reason, now, transient=unreachable)
+
+
+def _tick_locked(args: argparse.Namespace, now: float) -> int:
+    active = resolve_active()
+    if active is None:
+        return EXIT_OK
+    five, seven = float(args.five_hour), float(args.seven_day)
+    record_usage_snapshot(active, make_snapshot(five, seven, args.resets_5h or None, args.resets_7d or None))
+    ranked = rank_candidates(now, active)
+    reason = switch_reason(five, seven, ranked[0].seven_day if ranked else 100.0)
+    if reason is None:
+        recompute_gate(active, now)
+        return EXIT_OK
+    return _try_candidates(active, ranked, reason, (five, seven), now)
+
+
+def _tick_is_still_wanted(now: float) -> bool:
+    """Re-read the flag and the deadlines. Called again under the lock.
+
+    Everything checked before acquiring the lock can change while we wait for
+    it: the user can run `auto off`, or a manual `use` can switch accounts and
+    arm `.settle`. Acting on the pre-lock answer would switch credentials
+    after auto-switching was turned off, or overwrite a manual choice using
+    statusline percentages that now describe the wrong account.
+    """
+    if not auto_enabled():
+        return False
+    return not (read_epoch_file(SETTLE_FILE) > now or read_epoch_file(EXHAUSTED_FILE) > now)
+
+
+def cmd_tick(args: argparse.Namespace) -> int:
+    """One evaluation, driven by the statusline. Never loops, never blocks."""
+    ensure_dirs()
+    now = _now()
+    # Cheap pre-check: skip the lock entirely in the common no-op case.
+    if not _tick_is_still_wanted(now):
+        return EXIT_OK
+    with profile_lock() as acquired:
+        if not acquired:
+            return EXIT_OK
+        if not _tick_is_still_wanted(now):
+            return EXIT_OK
+        return _tick_locked(args, now)
+
+
+def cmd_pick(_args: argparse.Namespace) -> int:
+    """Move to the account with the lowest weekly usage."""
+    ensure_dirs()
+    now = _now()
+    with profile_lock() as acquired:
+        if not acquired:
+            die("another cc-switch decision is already running", EXIT_USER)
+        # Resolved inside the lock: a switch completing between an unlocked
+        # read and here would leave us calling the newly live account a
+        # candidate and refreshing the running session's token.
+        return _pick_locked(resolve_active(), now)
+
+
+def _pick_locked(active: str | None, now: float) -> int:
+    """Check every candidate live, then take the genuinely lowest one.
+
+    Stopping at the first candidate that is not better than the active
+    account would miss a lower one behind it — stored snapshots order the
+    checks, but only the live numbers decide.
+    """
+    active_7d = 100.0
+    if active and profile_path(active).exists():
+        current = confirm_candidate(active, active)
+        if current.usage is not None:
+            _, active_7d = effective_usage(current.usage, now)
+
+    best: tuple[str, float] | None = None
+    for candidate in rank_candidates(now, active):
+        result = confirm_candidate(candidate.name, active)
+        if result.usage is None:
+            print(f"Skipping '{candidate.name}': {result.error}")
+            continue
+        live_5h, live_7d = effective_usage(result.usage, now)
+        if live_5h > ENTER_5H or live_7d > ENTER_7D:
+            print(f"Skipping '{candidate.name}': 5h {live_5h:.0f}%, 7d {live_7d:.0f}%")
+            continue
+        if best is None or live_7d < best[1]:
+            best = (candidate.name, live_7d)
+
+    if best is None:
+        print("No usable account with headroom")
+        return EXIT_OK
+    if best[1] >= active_7d:
+        print(f"Staying on '{active}' (7d {active_7d:.0f}%) — nothing lower available")
+        return EXIT_OK
+    _perform_auto_switch(active, best[0], "pick", now)
+    print(f"Switched to '{best[0]}' (7d {best[1]:.0f}%, was {active_7d:.0f}%)")
+    return EXIT_OK
+
+
+def _usage_row(name: str, active: str | None, now: float) -> dict[str, Any]:
+    """Live usage for one profile, falling back to its stored snapshot."""
+    data = load_profile_data(name)
+    email, _ = _profile_summary(profile_path(name))
+    row: dict[str, Any] = {"profile": name, "email": email, "active": name == active}
+    reason = profile_unusable_reason(data, now)
+    if reason is not None:
+        stored = (data or {}).get("usage")
+        row.update(_usage_fields(stored), status=reason, stale=True)
+        return row
+    result = confirm_candidate(name, active)
+    if result.usage is None:
+        row.update(_usage_fields((data or {}).get("usage")), status=result.error or "unavailable", stale=True)
+        return row
+    row.update(_usage_fields(result.usage), status="active" if name == active else "ok", stale=False)
+    return row
+
+
+def _usage_fields(snapshot: object) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return {"five_hour": None, "seven_day": None, "resets_5h": None, "resets_7d": None}
+    return {
+        "five_hour": (snapshot.get("five_hour") or {}).get("utilization"),
+        "seven_day": (snapshot.get("seven_day") or {}).get("utilization"),
+        "resets_5h": (snapshot.get("five_hour") or {}).get("resets_at"),
+        "resets_7d": (snapshot.get("seven_day") or {}).get("resets_at"),
+    }
+
+
+def _pct(value: object) -> str:
+    return f"{float(value):.0f}%" if isinstance(value, (int, float)) else "?"
+
+
+def _reset_cell(row: dict[str, Any]) -> str:
+    five = parse_iso(row.get("resets_5h"))
+    seven = parse_iso(row.get("resets_7d"))
+    return f"{_fmt_epoch(five or 0)} / {_fmt_epoch(seven or 0)}"
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    """Refresh every profile's limits from the API and print them.
+
+    Refreshing rotates tokens, so this holds the lock too. Two processes
+    refreshing the same expired token would each invalidate the other's: the
+    loser gets `invalid_grant` and retires a profile that is perfectly fine.
+    """
+    ensure_dirs()
+    profiles = list_profiles()
+    if not profiles:
+        print("No profiles yet. Save the current one: cc-switch add <name>")
+        return EXIT_OK
+    now = _now()
+    with profile_lock() as acquired:
+        if not acquired:
+            die("another cc-switch operation is in progress — try again in a moment", EXIT_USER)
+        active = resolve_active()
+        rows = [_usage_row(p.stem, active, now) for p in profiles]
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return EXIT_OK
+    name_w = max(*(len(str(r["profile"])) for r in rows), len("PROFILE"))
+    email_w = max(*(len(str(r["email"])) for r in rows), len("EMAIL"))
+    print(f"  {'PROFILE':<{name_w}}  {'EMAIL':<{email_w}}  {'5h':>5}  {'7d':>5}  RESETS 5h / 7d")
+    for row in rows:
+        marker = "*" if row["active"] else " "
+        stale = " (stored)" if row["stale"] else ""
+        print(
+            f"{marker} {row['profile']:<{name_w}}  {row['email']:<{email_w}}  "
+            f"{_pct(row['five_hour']):>5}  {_pct(row['seven_day']):>5}  "
+            f"{_reset_cell(row)}  {row['status']}{stale}"
+        )
     return EXIT_OK
 
 
@@ -466,6 +1405,24 @@ def build_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("remove", help="delete a saved profile")
     r.add_argument("name", help="profile name")
     r.set_defaults(func=cmd_remove)
+
+    a2 = sub.add_parser("auto", help="turn automatic switching on or off")
+    a2.add_argument("action", choices=("on", "off", "status"), nargs="?", default="status")
+    a2.set_defaults(func=cmd_auto)
+
+    t = sub.add_parser("tick", help="internal: one auto-switch evaluation (called by the statusline)")
+    t.add_argument("--5h", dest="five_hour", type=float, required=True, help="active account 5h utilization")
+    t.add_argument("--7d", dest="seven_day", type=float, required=True, help="active account 7d utilization")
+    t.add_argument("--resets-5h", dest="resets_5h", default=None, help="ISO timestamp, may be empty")
+    t.add_argument("--resets-7d", dest="resets_7d", default=None, help="ISO timestamp, may be empty")
+    t.set_defaults(func=cmd_tick)
+
+    pk = sub.add_parser("pick", help="switch to the account with the lowest weekly usage")
+    pk.set_defaults(func=cmd_pick)
+
+    u2 = sub.add_parser("usage", help="refresh and show limits for every profile")
+    u2.add_argument("--json", action="store_true", help="machine-readable output")
+    u2.set_defaults(func=cmd_usage)
 
     return p
 

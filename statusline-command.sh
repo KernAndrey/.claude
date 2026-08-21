@@ -4,7 +4,7 @@
 input=$(cat)
 
 PROFILES_DIR="$HOME/.claude-profiles"
-CC_SWITCH="$HOME/.claude/cc_switch.py"
+CC_SWITCH="$HOME/.claude/cc-switch/cc_switch.py"
 CREDS_FILE="$HOME/.claude/.credentials.json"
 SPAWNED_DEAD=""
 

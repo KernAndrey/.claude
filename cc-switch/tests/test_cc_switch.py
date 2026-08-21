@@ -27,6 +27,10 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+#: The statusline lives in ~/.claude, one level above this package: it is Claude
+#: Code's status line, which settings.json points at, not a cc-switch component.
+STATUSLINE_SCRIPT = _ROOT.parent / "statusline-command.sh"
+
 import cc_switch as cc  # noqa: E402
 
 
@@ -3680,7 +3684,7 @@ class TestStatuslinePassesExactValues(unittest.TestCase):
     """The shell must not pre-round what the decision depends on."""
 
     def setUp(self) -> None:
-        self.script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        self.script = STATUSLINE_SCRIPT.read_text()
 
     def test_tick_receives_the_unrounded_percentages(self) -> None:
         self.assertIn('tick --5h "$FIVE_H" --7d "$WEEK"', self.script)
@@ -4024,7 +4028,7 @@ class TestStatuslineNamesTheLiveAccount(AutoBaseTest):
         self.assertEqual(self.live_file.stat().st_mtime_ns, before)
 
     def test_the_statusline_prefers_the_live_file(self) -> None:
-        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        script = STATUSLINE_SCRIPT.read_text()
         self.assertIn(".live", script)
         live_pos = script.index("$PROFILES_DIR/.live")
         active_pos = script.index("$PROFILES_DIR/.active")
@@ -4032,7 +4036,7 @@ class TestStatuslineNamesTheLiveAccount(AutoBaseTest):
 
     def test_the_statusline_still_falls_back_to_the_marker(self) -> None:
         """A profile set saved before this change has no `.live` yet."""
-        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        script = STATUSLINE_SCRIPT.read_text()
         self.assertIn('[ -z "$ACCOUNT" ] && [ -r "$PROFILES_DIR/.active" ]', script)
 
 
@@ -5565,7 +5569,7 @@ class TestGateCarriesTheLoginDeadline(AutoBaseTest):
         self.assertEqual(cc.live_login_deadline(), 0.0)
 
     def test_the_statusline_wakes_a_tick_past_the_deadline(self) -> None:
-        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        script = STATUSLINE_SCRIPT.read_text()
         self.assertIn("LOGIN_DEADLINE", script)
         self.assertIn('tick --5h 0 --7d 0', script)
 
@@ -5576,13 +5580,13 @@ class TestGateCarriesTheLoginDeadline(AutoBaseTest):
         unconsumed field into the last one — which is how adding this fifth
         field silently broke every percentage comparison.
         """
-        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        script = STATUSLINE_SCRIPT.read_text()
         self.assertIn("LOGIN_DEADLINE GATE_SETTLE _REST < \"$PROFILES_DIR/.gate\"", script)
         self.assertIn("T7D _REST < \"$PROFILES_DIR/.gate\"", script)
 
     def test_the_statusline_also_notices_missing_credentials(self) -> None:
         """A deleted credentials file has no deadline to wait for."""
-        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        script = STATUSLINE_SCRIPT.read_text()
         self.assertIn('if [ ! -r "$CREDS_FILE" ]; then', script)
         self.assertIn("DEAD=1", script)
 
@@ -5592,7 +5596,7 @@ class TestGateCarriesTheLoginDeadline(AutoBaseTest):
         The shell cannot parse JSON, but the field that decides everything is
         a plain substring, and both `read` and `case` are builtins.
         """
-        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        script = STATUSLINE_SCRIPT.read_text()
         self.assertIn('IFS= read -r -d "" CREDS_BLOB < "$CREDS_FILE"', script)
         # The quote and colon are the point: `refreshTokenExpiresAt` contains
         # `refreshToken`, so the looser pattern called a dead file alive.
@@ -5605,13 +5609,13 @@ class TestGateCarriesTheLoginDeadline(AutoBaseTest):
 
     def test_only_one_tick_is_spawned_per_render(self) -> None:
         """A dead login with a stale usage payload once matched both gates."""
-        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        script = STATUSLINE_SCRIPT.read_text()
         self.assertIn('[ -z "$SPAWNED_DEAD" ]', script)
         self.assertIn("SPAWNED_DEAD=1", script)
 
     def test_the_dead_login_spawn_respects_the_settle_window(self) -> None:
         """Otherwise a dead login with nowhere to go spawns on every render."""
-        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        script = STATUSLINE_SCRIPT.read_text()
         self.assertIn('[ "$NOW" -ge "${GATE_SETTLE:-0}" ]', script)
 
 

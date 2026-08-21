@@ -24,7 +24,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-SCRIPT = _ROOT / "statusline-command.sh"
+SCRIPT = _ROOT.parent / "statusline-command.sh"
 
 PAYLOAD = {
     "model": {"display_name": "Opus 5"},
@@ -43,10 +43,10 @@ class Harness:
         self.home = home
         self.profiles = home / ".claude-profiles"
         self.profiles.mkdir(parents=True)
-        (home / ".claude").mkdir(parents=True)
+        (home / ".claude" / "cc-switch").mkdir(parents=True)
         self.creds = home / ".claude" / ".credentials.json"
         self.calls = home / "tick-calls.log"
-        self.stub = home / ".claude" / "cc_switch.py"
+        self.stub = home / ".claude" / "cc-switch" / "cc_switch.py"
         self.stub.write_text(f'#!/usr/bin/env bash\necho "$@" >> {self.calls}\n')
         self.stub.chmod(0o755)
 

@@ -31,6 +31,9 @@ CREDS_FILE = CLAUDE_DIR / ".credentials.json"
 MAIN_FILE = HOME / ".claude.json"
 PROFILES_DIR = HOME / ".claude-profiles"
 ACTIVE_FILE = PROFILES_DIR / ".active"
+# The resolved live account, refreshed on every tick so the statusline can
+# name it without parsing JSON or spawning a process.
+LIVE_FILE = PROFILES_DIR / ".live"
 BACKUPS_DIR = PROFILES_DIR / ".backups"
 BACKUP_KEEP = 5
 
@@ -300,25 +303,47 @@ def backup_main() -> None:
     rotate_backups()
 
 
+def _read_json_lenient(path: Path, strict: bool) -> dict[str, Any] | None:
+    """Parse a JSON object; when not strict, unreadable means None, not exit.
+
+    `strict=False` has to mean it for damaged files too, not just missing
+    ones: a half-written credentials file is exactly the situation the
+    non-strict callers exist to survive.
+    """
+    if strict:
+        data, _, _ = read_json_file(path)
+        return data
+    try:
+        data, _, _ = _parse_json_object(path)
+    except (OSError, ValueError, TypeError):  # ValueError covers JSON and UTF-8 errors
+        return None
+    return data
+
+
 def read_current_state(strict: bool = True) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """Read the currently active credentials and oauthAccount.
 
-    When strict=False, returns None instead of exiting when data is missing.
+    When strict=False, returns None instead of exiting when the data is
+    missing, damaged, or incomplete.
     """
     if not CREDS_FILE.exists():
         if strict:
             die(f"missing {CREDS_FILE} — log in to Claude Code first", EXIT_USER)
         return None
-    creds, _, _ = read_json_file(CREDS_FILE)
-    if "claudeAiOauth" not in creds:
+    creds = _read_json_lenient(CREDS_FILE, strict)
+    # The value must be an object, not merely present: a list or string there
+    # sails past a key check and crashes the first `.get` downstream.
+    if creds is None or not isinstance(creds.get("claudeAiOauth"), dict):
         if strict:
-            die(f"{CREDS_FILE} has no 'claudeAiOauth' key")
+            die(f"{CREDS_FILE} has no usable 'claudeAiOauth' object")
         return None
     if not MAIN_FILE.exists():
         if strict:
             die(f"missing {MAIN_FILE} — log in to Claude Code first", EXIT_USER)
         return None
-    main_data, _, _ = read_json_file(MAIN_FILE)
+    main_data = _read_json_lenient(MAIN_FILE, strict)
+    if main_data is None:
+        return None
     oauth = main_data.get("oauthAccount")
     if not isinstance(oauth, dict):
         if strict:
@@ -341,7 +366,7 @@ def load_profile_data(name: str) -> dict[str, Any] | None:
     """Read a profile without exiting — callers decide what a bad one means."""
     try:
         data, _, _ = _parse_json_object(profile_path(name))
-    except (OSError, json.JSONDecodeError, TypeError):
+    except (OSError, ValueError, TypeError):  # ValueError covers JSON and UTF-8 errors
         return None
     return data
 
@@ -524,14 +549,15 @@ def profile_unusable_reason(data: object, now: float) -> str | None:
         return "corrupted"
     creds = data.get("credentials")
     oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
-    if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
+    if not has_usable_refresh_token(oauth):
         return "no credentials"
     if not isinstance(data.get("oauthAccount"), dict):
         return "no account"
-    expires = oauth.get("refreshTokenExpiresAt")
     # A refresh does not push this deadline out — the server returns the same
     # absolute expiry — so past it the account is dead until someone logs in.
-    if isinstance(expires, (int, float)) and expires / 1000 <= now:
+    # An unusable value is not evidence of death, same as everywhere else.
+    expiry = refresh_expiry_epoch(oauth)
+    if expiry is not None and expiry <= now:
         return "refresh token expired"
     err = data.get("authError")
     if isinstance(err, dict):
@@ -561,8 +587,96 @@ def rank_candidates(now: float, exclude: str | None) -> list[Candidate]:
     return ranked
 
 
-def switch_reason(five: float, seven: float, candidate_7d: float) -> str | None:
-    """Why to leave the active account: exhaustion, imbalance, or neither."""
+#: `datetime.fromtimestamp` raises beyond the platform's time_t. Anything past
+#: this is malformed rather than "far future", and must not reach formatting.
+MAX_EPOCH = 32503680000.0  # 3000-01-01
+
+
+def has_usable_refresh_token(oauth: object) -> bool:
+    """A non-empty string, matching what the statusline's pattern accepts.
+
+    The two must agree exactly. When Python called `refreshToken: 123`
+    healthy and the shell called it dead, every render woke a tick that then
+    took the ordinary path and never armed the retry pause — a background
+    process per render, indefinitely.
+    """
+    if not isinstance(oauth, dict):
+        return False
+    token = oauth.get("refreshToken")
+    return isinstance(token, str) and bool(token)
+
+
+def refresh_expiry_epoch(oauth: object) -> float | None:
+    """The refresh token's expiry in epoch seconds, or None when unusable.
+
+    The single definition of "usable", because three copies of this check had
+    already drifted apart. Every rejection here matters:
+
+    * `bool` is an `int` in Python, so `refreshTokenExpiresAt: true` would
+      otherwise read as epoch 0.001 and declare a working login expired.
+    * NaN loses every comparison; infinity would keep a dead token valid.
+    * A finite but absurd value (1e300) passes every numeric check and then
+      raises inside `datetime.fromtimestamp`, taking `list` and `usage` down.
+    """
+    if not isinstance(oauth, dict):
+        return None
+    expires = oauth.get("refreshTokenExpiresAt")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return None
+    try:
+        value = float(expires) / 1000
+    except OverflowError:
+        return None  # an int too large for a float is malformed, not distant
+    if not math.isfinite(value) or not 0 <= value <= MAX_EPOCH:
+        return None
+    return value
+
+
+def live_credentials_status(now: float) -> tuple[str | None, float]:
+    """Why the live login cannot be used, and when it expires.
+
+    One parse and one policy, because the reason and the deadline are two
+    views of the same file and had already drifted into separate copies.
+
+    The deadline is what the statusline compares against, and it cannot parse
+    JSON: damaged credentials therefore report a deadline already in the past
+    rather than "unknown", or the shell would wait forever on a file that is
+    never coming back. A merely absent expiry stays 0 — nothing to act on.
+    """
+    if not CREDS_FILE.exists():
+        return "no credentials", DEADLINE_NOW
+    try:
+        data, _, _ = _parse_json_object(CREDS_FILE)
+    except (OSError, ValueError, TypeError):  # ValueError covers JSON and UTF-8 errors
+        return "unreadable credentials", DEADLINE_NOW
+    oauth = data.get("claudeAiOauth")
+    if not has_usable_refresh_token(oauth):
+        return "no refresh token", DEADLINE_NOW
+    expiry = refresh_expiry_epoch(oauth)
+    if expiry is None:
+        return None, 0.0  # an unusable expiry is not evidence of death
+    return ("login expired" if expiry <= now else None), expiry
+
+
+def live_credentials_dead(now: float) -> str | None:
+    """Why the live login can no longer be used, or None while it works.
+
+    A dead login is worse than an exhausted one: the session stops with
+    "Not logged in" and no usage figures are reported at all, so nothing in
+    the limit path would ever notice.
+    """
+    return live_credentials_status(now)[0]
+
+
+def switch_reason(five: float, seven: float, candidate_7d: float, expired: bool = False) -> str | None:
+    """Why to leave the active account: dead login, exhaustion, imbalance, or none.
+
+    A dead login outranks the others: there is nothing left to spend on this
+    account, and the entry-bar comparison it would otherwise lose to is
+    irrelevant when the alternative is a session that cannot run at all.
+    """
+    if expired:
+        return "expired"
     if five >= EXIT_5H or seven >= EXIT_7D:
         return "limit"
     if seven - candidate_7d >= BALANCE_GAP_7D:
@@ -583,17 +697,54 @@ def earliest_future_reset(names: list[str], now: float) -> float:
         if not isinstance(snapshot, dict):
             continue
         for key in ("five_hour", "seven_day"):
-            resets = parse_iso((snapshot.get(key) or {}).get("resets_at"))
+            window = snapshot.get(key)
+            # A hand-edited profile can hold a string or a list here. This runs
+            # inside recompute_gate, so raising would take down `auto on`,
+            # every switch, and even a no-switch tick.
+            if not isinstance(window, dict):
+                continue
+            resets = parse_iso(window.get("resets_at"))
             if resets is not None and resets > now:
                 upcoming.append(resets)
     return min(upcoming) if upcoming else 0.0
 
 
+#: A deadline already in the past, written when the live credentials are
+#: damaged. The statusline has no way to parse JSON, so this is how it learns
+#: to wake a tick: 0 would mean "no deadline" and it would wait forever.
+DEADLINE_NOW = 1.0
+
+
+def live_login_deadline() -> float:
+    """When the live login stops working; 0 when there is nothing to go on."""
+    return live_credentials_status(_now())[1]
+
+
+def _gate_tenths(value: float) -> int:
+    """A percentage as tenths, never below the value it stands for.
+
+    The statusline compares whole tenths, so a trigger has to be one. The
+    direction is not a matter of taste: a trigger a tenth *below* the real
+    threshold wakes a tick that then declines to switch and writes the same
+    trigger back, a process per render for as long as usage sits in the gap.
+    A tenth *above* costs one more tenth of usage before the check runs.
+
+    Rounding to nine places first. A one-decimal literal times ten is exact
+    in binary, but a *sum* of two is not: `16.1 + 0.1` is 16.200000000000003,
+    and a bare ceiling turns that into 163 rather than 162 — a trigger a
+    tenth past the point where a reason actually appears. `trigger_7d` is
+    exactly such a sum, and its precision comes from the API rather than from
+    anything this file validates.
+    """
+    return math.ceil(round(value * 10, 9))
+
+
 def recompute_gate(active: str | None, now: float) -> None:
     """Write the cheap trigger the statusline consults on every render.
 
-    Format `<not_before> <recheck_after> <trigger_5h> <trigger_7d>`, all
-    integers so bash compares them without a parser; 0 means "no trigger".
+    Format `<not_before> <recheck_after> <trigger_5h> <trigger_7d>
+    <login_deadline> <settle_until>`, all integers so bash compares them
+    without a parser; 0 means "no trigger".
     Balancing needs checks at ordinary percentages too, and this file is what
     keeps that from costing a python process per render.
     """
@@ -602,8 +753,23 @@ def recompute_gate(active: str | None, now: float) -> None:
     trigger_7d = min(EXIT_7D, best_7d + BALANCE_GAP_7D)
     not_before = max(read_epoch_file(SETTLE_FILE), read_epoch_file(EXHAUSTED_FILE))
     others = [p.stem for p in list_profiles() if p.stem != active]
+    # Triggers are written in tenths of a percent, and the statusline scales
+    # its own percentages the same way. Whole numbers could not express a
+    # fractional threshold at all — EXIT_5H=95.1 rounded up to 96, which
+    # 95.2% usage never reaches.
+    #
+    # The fifth field is when the live login dies. Once the session is logged
+    # out no usage is reported at all, so no percentage trigger could ever
+    # fire — this is the only thing that would still wake a tick.
+    #
+    # The sixth is the settle window alone. The dead-login check answers to
+    # that and not to `not_before`, which also carries the exhaustion
+    # deadline: being at a limit is no reason to stay logged out, and that
+    # deadline can be days away.
     line = (
-        f"{int(not_before)} {int(earliest_future_reset(others, now))} {math.floor(EXIT_5H)} {math.floor(trigger_7d)}\n"
+        f"{int(not_before)} {int(earliest_future_reset(others, now))} "
+        f"{_gate_tenths(EXIT_5H)} {_gate_tenths(trigger_7d)} "
+        f"{int(live_login_deadline())} {int(read_epoch_file(SETTLE_FILE))}\n"
     )
     write_text_file(GATE_FILE, line, fatal=False)
 
@@ -738,10 +904,47 @@ def _is_live_account(name: str) -> bool:
     Matched by email, not by profile name: the same account can be saved
     twice under different names, and refreshing the copy would rotate the
     refresh token the running session shares with it.
+
+    A dead login is nobody's. There is no session left to protect, and
+    answering yes hands out the unusable live token in place of the
+    profile's own — which comes back unauthorized and stamps `authError` on
+    the very profile the rescue was reaching for.
     """
+    if live_credentials_dead(_now()) is not None:
+        return False
     state = read_current_state(strict=False)
     live_email = state[1].get("emailAddress") if state else None
     return bool(live_email) and _profile_email(profile_path(name)) == live_email
+
+
+def _live_access_token() -> tuple[str | None, str | None, bool]:
+    """The token of the account Claude Code is signed into, read as-is."""
+    state = read_current_state(strict=False)
+    if state is None:
+        return None, "no live credentials", False
+    return state[0].get("claudeAiOauth", {}).get("accessToken"), None, False
+
+
+def _stored_access_token(oauth: dict[str, Any]) -> tuple[str | None, str | None, bool] | None:
+    """A usable saved token, or None when one has to be fetched.
+
+    A hand-edited profile can hold anything in `expiresAt`; a bad value skips
+    this account rather than aborting the command for every other one.
+    """
+    try:
+        stored_expiry = float(oauth.get("expiresAt") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None, "corrupted expiry", False
+    # "NaN" and "Infinity" are valid JSON floats to Python, and a merely
+    # implausible finite value is just as bad: infinity or 1e300 would treat
+    # a long-dead token as valid, send it to the API, and let the resulting
+    # 401 retire a profile that only needed refreshing. Same bound as the
+    # refresh expiry, for the same reason.
+    if not math.isfinite(stored_expiry) or not 0 <= stored_expiry / 1000 <= MAX_EPOCH:
+        return None, "corrupted expiry", False
+    if stored_expiry / 1000 > time.time() + 60:
+        return oauth.get("accessToken"), None, False
+    return None
 
 
 def access_token_for(name: str, active: str | None) -> tuple[str | None, str | None, bool]:
@@ -752,16 +955,14 @@ def access_token_for(name: str, active: str | None) -> tuple[str | None, str | N
     holds.
     """
     if name == active or _is_live_account(name):
-        state = read_current_state(strict=False)
-        if state is None:
-            return None, "no live credentials", False
-        return state[0].get("claudeAiOauth", {}).get("accessToken"), None, False
+        return _live_access_token()
     data = load_profile_data(name)
     if data is None:
         return None, "corrupted", False
     oauth = data.get("credentials", {}).get("claudeAiOauth", {})
-    if float(oauth.get("expiresAt") or 0) / 1000 > time.time() + 60:
-        return oauth.get("accessToken"), None, False
+    usable = _stored_access_token(oauth)
+    if usable is not None:
+        return usable
     status, payload = oauth_refresh(str(oauth.get("refreshToken") or ""))
     if status != 200 or not isinstance(payload, dict) or "access_token" not in payload:
         message, transient = _refresh_error(name, status, payload)
@@ -874,8 +1075,18 @@ def _preflight_main() -> tuple[dict[str, Any], int, bool]:
 
 
 def _preflight_creds() -> tuple[dict[str, Any] | None, int, bool]:
+    """Read the outgoing credentials for formatting and rollback.
+
+    Damaged content is not fatal here: a corrupt credentials file is one of
+    the reasons to switch away in the first place, so refusing to move would
+    strand the session on the very account that cannot be used. There is
+    simply nothing to roll back to in that case.
+    """
     if CREDS_FILE.exists():
-        old_creds, raw_creds, creds_tnl = read_json_file(CREDS_FILE)
+        try:
+            old_creds, raw_creds, creds_tnl = _parse_json_object(CREDS_FILE)
+        except (OSError, ValueError, TypeError):  # ValueError covers JSON and UTF-8 errors
+            return None, 2, False
         return old_creds, detect_indent(raw_creds), creds_tnl
     if not CLAUDE_DIR.exists():
         die(f"missing {CLAUDE_DIR} — Claude Code has never been run", EXIT_USER)
@@ -892,18 +1103,42 @@ def _apply_switch_atomic(
     creds_indent: int,
     creds_tnl: bool,
 ) -> None:
-    """Apply creds then oauth; roll creds back on oauth failure."""
+    """Apply creds then oauth, leaving a coherent state either way.
+
+    The two files must describe the same account. If the second write fails
+    the first is undone — and when the outgoing credentials were too damaged
+    to keep a copy of, the credentials file is removed instead. "No
+    credentials" is a state the tool already recognises as a dead login and
+    evacuates from; a credentials file paired with someone else's
+    `oauthAccount` is not.
+    """
     atomic_write_json(CREDS_FILE, new_creds, creds_indent, creds_tnl)
     main_data["oauthAccount"] = new_oauth
     try:
         atomic_write_json(MAIN_FILE, main_data, indent_main, tnl_main)
-    except SystemExit:
-        if old_creds is not None:
-            try:
-                atomic_write_json(CREDS_FILE, old_creds, creds_indent, creds_tnl)
-            except SystemExit:
-                pass
+    except BaseException:
+        _undo_credentials(old_creds, creds_indent, creds_tnl)
         raise
+
+
+def _undo_credentials(old_creds: dict[str, Any] | None, indent: int, trailing_newline: bool) -> None:
+    """Put the previous credentials back, or leave none at all.
+
+    Restoring can fail in its own right — a full or read-only filesystem is
+    exactly the kind of thing that made the first write fail. Removing them
+    is the fallback: "no credentials" is a state the tool recognises as a
+    dead login and escapes from, while credentials paired with someone
+    else's `oauthAccount` are a state nothing interprets. If even the
+    removal fails the error is raised rather than suppressed, because
+    leaving that pair behind silently is the one outcome to avoid.
+    """
+    if old_creds is not None:
+        try:
+            atomic_write_json(CREDS_FILE, old_creds, indent, trailing_newline)
+        except (SystemExit, OSError):
+            CREDS_FILE.unlink(missing_ok=True)
+        return
+    CREDS_FILE.unlink(missing_ok=True)
 
 
 def _switch_to(name: str, quiet: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -912,25 +1147,48 @@ def _switch_to(name: str, quiet: bool = False) -> tuple[dict[str, Any], dict[str
     Every switch arms the settle window, manual ones included: the statusline
     keeps reporting the old account's percentages for a moment afterwards, and
     a tick reading those would immediately undo a deliberate `cc-switch use`.
-    """
-    _auto_backup_active(name, quiet=quiet)
 
+    The window is armed BEFORE the swap, and fatally: if it cannot be written
+    there is no safe way to continue, because the very next render could hand
+    a tick the outgoing account's numbers and switch straight back. Failing
+    here leaves everything untouched; failing after the swap would not.
+    """
+    # Everything that can refuse the switch runs first, while nothing has been
+    # written: a malformed target profile or an unreadable ~/.claude.json must
+    # leave no trace. Only then is the barrier armed — and it is armed before
+    # the swap, because a switch we cannot protect must not happen at all.
     new_creds, new_oauth = _load_profile_for_use(name)
     main_data, indent_main, tnl_main = _preflight_main()
     old_creds, creds_indent, creds_tnl = _preflight_creds()
 
-    backup_main()
-    _apply_switch_atomic(
-        new_creds,
-        new_oauth,
-        main_data,
-        indent_main,
-        tnl_main,
-        old_creds,
-        creds_indent,
-        creds_tnl,
-    )
+    write_epoch_file(SETTLE_FILE, _now() + SETTLE_SECONDS)
+    try:
+        # Anything failing before the swap completes leaves a barrier guarding
+        # a switch that never happened, which would silence automatic
+        # switching for the whole window for nothing. The atomic write is
+        # inside this block too: it rolls itself back on failure, so the
+        # barrier must go with it.
+        _auto_backup_active(name, quiet=quiet)
+        backup_main()
+        _apply_switch_atomic(
+            new_creds,
+            new_oauth,
+            main_data,
+            indent_main,
+            tnl_main,
+            old_creds,
+            creds_indent,
+            creds_tnl,
+        )
+    except BaseException:
+        clear_state_file(SETTLE_FILE)
+        raise
     write_active(name)
+    # The switch itself is what invalidates the cache: `_auto_backup_active`
+    # ran before the swap and left it naming the account we just left, so the
+    # statusline would show the old one until some later command happened to
+    # resolve again. Re-armed here because the window opened before the swap.
+    _cache_live_name(name)
     write_epoch_file(SETTLE_FILE, _now() + SETTLE_SECONDS)
     return new_creds, new_oauth
 
@@ -970,7 +1228,7 @@ def _profile_summary(p: Path) -> tuple[str, str]:
     """
     try:
         data, _, _ = _parse_json_object(p)
-    except (OSError, json.JSONDecodeError, TypeError):
+    except (OSError, ValueError, TypeError):  # ValueError covers JSON and UTF-8 errors
         return "<corrupted>", "?"
     oauth = data.get("oauthAccount")
     creds = data.get("credentials")
@@ -994,38 +1252,90 @@ def cmd_list(_args: argparse.Namespace) -> int:
         return EXIT_OK
 
     now = _now()
-    rows: list[tuple[bool, str, str, str, str]] = []
+    rows: list[tuple[bool, str, str, str, str, str]] = []
     for p in profiles:
         name = p.stem
         email, sub = _profile_summary(p)
-        rows.append((name == active, name, email, sub, _profile_note(name, now)))
+        reason, expiry = login_status_for(name, active, now)
+        login = _fmt_login_expiry(expiry, now)
+        rows.append((name == active, name, email, sub, login, _login_note(reason, expiry, now)))
 
     name_w = max(len(r[1]) for r in rows)
     email_w = max(len(r[2]) for r in rows)
-    for is_active, name, email, sub, note in rows:
+    sub_w = max(len(r[3]) for r in rows) + 2
+    for is_active, name, email, sub, login, note in rows:
         marker = "*" if is_active else " "
-        print(f"{marker} {name:<{name_w}}  {email:<{email_w}}  ({sub}){note}")
+        print(f"{marker} {name:<{name_w}}  {email:<{email_w}}  {f'({sub})':<{sub_w}}  login until {login}{note}")
     return EXIT_OK
 
 
-def _profile_note(name: str, now: float) -> str:
-    """Flag a profile that cannot be switched to, or is about to expire."""
+def profile_login_expiry(data: object) -> float | None:
+    """Epoch when this profile's login stops working, or None when unknown.
+
+    The refresh token is what a login is: once it expires, no amount of
+    switching helps and the account needs `claude` to sign in again.
+    """
+    if not isinstance(data, dict):
+        return None
+    creds = data.get("credentials")
+    # Both levels are checked: a hand-edited profile can hold a string or a
+    # list at either one, and `list` must still render every other account.
+    oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+    return refresh_expiry_epoch(oauth)
+
+
+def login_status_for(name: str, active: str | None, now: float) -> tuple[str | None, float | None]:
+    """Why this account cannot be used, and when its login expires.
+
+    Both answers come from one copy: the live credentials for the account
+    that is signed in, the saved profile for every other. Claude Code renews
+    the live credentials in place while the saved profile keeps whatever it
+    held when it was last written, so reading the date from one and the
+    verdict from the other prints a future "login until" beside
+    `! refresh token expired` for anyone who has just signed in again.
+    """
+    if name == active:
+        reason, expiry = live_credentials_status(now)
+        # Missing or damaged answers with the statusline's sentinel, not a
+        # date; formatting it would invent "01 Jan 00:00 (EXPIRED)".
+        return reason, (None if reason is not None else expiry or None)
     data = load_profile_data(name)
-    reason = profile_unusable_reason(data, now)
+    return profile_unusable_reason(data, now), profile_login_expiry(data)
+
+
+def _fmt_login_expiry(expiry: float | None, now: float) -> str:
+    """A date plus how far off it is — the two questions asked together."""
+    if expiry is None:
+        return "unknown"
+    stamp = _dt.datetime.fromtimestamp(expiry).strftime("%d %b %H:%M")
+    remaining = expiry - now
+    if remaining <= 0:
+        return f"{stamp} (EXPIRED)"
+    hours = remaining / 3600
+    if hours < 48:
+        return f"{stamp} (in {hours:.0f}h)"
+    return f"{stamp} (in {hours / 24:.0f}d)"
+
+
+def _login_note(reason: str | None, expiry: float | None, now: float) -> str:
+    """Flag an account that cannot be switched to, or is about to expire.
+
+    Takes the verdict already computed for the displayed date rather than
+    looking it up again, so the two can never come from different copies.
+    """
     if reason is not None:
         return f"  ! {reason}"
-    expires = (data or {}).get("credentials", {}).get("claudeAiOauth", {}).get("refreshTokenExpiresAt")
-    if isinstance(expires, (int, float)):
-        days_left = (expires / 1000 - now) / 86400
-        if days_left < 2:
-            return f"  ! login expires in {days_left * 24:.0f}h"
+    if expiry is not None:
+        hours_left = (expiry - now) / 3600
+        if hours_left < 48:
+            return f"  ! login expires in {hours_left:.0f}h"
     return ""
 
 
 def _profile_email(p: Path) -> str | None:
     try:
         data, _, _ = _parse_json_object(p)
-    except (OSError, json.JSONDecodeError, TypeError):
+    except (OSError, ValueError, TypeError):  # ValueError covers JSON and UTF-8 errors
         return None
     oauth = data.get("oauthAccount")
     if not isinstance(oauth, dict):
@@ -1034,16 +1344,50 @@ def _profile_email(p: Path) -> str | None:
     return email if isinstance(email, str) else None
 
 
-def resolve_active() -> str | None:
-    """The profile whose credentials are actually live.
+def _cache_live_name(name: str | None, live_email: str | None = None) -> None:
+    """Record the resolved account for the statusline to display.
 
-    The live credentials win over the `.active` marker, which is a hint that
-    goes stale the moment someone logs into a different account through Claude
-    Code itself. This is a safety decision, not cosmetics: everything
-    downstream refuses to refresh *the active profile*, so naming the wrong
-    one would rotate the token out from under the running session — exactly
-    what that rule exists to prevent.
+    Written from `resolve_active` itself rather than from one command, so any
+    cc-switch invocation refreshes it — including `current` and `list`, which
+    run when auto-switching is off and no tick would ever fire.
+
+    Those readers hold no lock, so a switch can land between resolving and
+    writing here; the stale name would then sit in the cache until something
+    else resolved again. Re-reading the live email immediately before the
+    write closes that window: if it no longer matches what was resolved, the
+    switch already wrote the correct name and this one is obsolete.
     """
+    if live_email is not None:
+        state = read_current_state(strict=False)
+        current_email = state[1].get("emailAddress") if state else None
+        if current_email != live_email:
+            return  # a switch landed while we were resolving; its write wins
+    desired = f"{name}\n" if name else "\n"
+    # ValueError as well as OSError: invalid UTF-8 in the cache raises
+    # UnicodeDecodeError, and crashing here would make a completed switch
+    # report failure after the credentials had already changed.
+    with contextlib.suppress(OSError, ValueError):
+        if LIVE_FILE.read_text(encoding="utf-8") == desired:
+            return  # unchanged; skip the write
+    if write_text_file(LIVE_FILE, desired, fatal=False):
+        if live_email is not None and _live_email() != live_email:
+            # A switch landed while this write was in flight, so what we just
+            # stored is already wrong. The switch writes the cache under the
+            # lock; re-running the resolve puts its answer back.
+            _cache_live_name(_resolve_active_uncached())
+        return
+    # The cache outranks `.active` in the statusline, so leaving a name we
+    # could not update would display the wrong account indefinitely. Dropping
+    # it falls back to the marker until the next resolve succeeds.
+    try:
+        LIVE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log_decision(f"stale live-account cache could not be cleared: {e}")
+
+
+def _resolve_active_uncached() -> str | None:
     state = read_current_state(strict=False)
     live_email = state[1].get("emailAddress") if state else None
     if live_email:
@@ -1060,11 +1404,39 @@ def resolve_active() -> str | None:
     return marker if marker and profile_path(marker).exists() else None
 
 
+def _live_email() -> str | None:
+    state = read_current_state(strict=False)
+    return state[1].get("emailAddress") if state else None
+
+
+def resolve_active() -> str | None:
+    """The profile whose credentials are actually live.
+
+    The live credentials win over the `.active` marker, which is a hint that
+    goes stale the moment someone logs into a different account through Claude
+    Code itself. This is a safety decision, not cosmetics: everything
+    downstream refuses to refresh *the active profile*, so naming the wrong
+    one would rotate the token out from under the running session — exactly
+    what that rule exists to prevent.
+
+    Every answer refreshes the `.live` cache the statusline displays, so any
+    cc-switch invocation keeps it honest — not only the ones that recompute
+    the gate.
+    """
+    resolved_for = _live_email()
+    name = _resolve_active_uncached()
+    _cache_live_name(name, live_email=resolved_for)
+    return name
+
+
 def cmd_current(_args: argparse.Namespace) -> int:
     ensure_dirs()
     resolved = resolve_active()
     if resolved is not None:
-        print(resolved)
+        now = _now()
+        reason, expiry = login_status_for(resolved, resolved, now)
+        note = _login_note(reason, expiry, now)
+        print(f"{resolved}  (login until {_fmt_login_expiry(expiry, now)}){note}")
         return EXIT_OK
 
     state = read_current_state(strict=False)
@@ -1163,6 +1535,15 @@ def _no_candidate_left(active: str | None, reason: str, now: float, transient: b
     network blip would suppress switching for hours or days while the account
     actually had room. Both fall back to a short retry pause instead.
     """
+    if reason == "expired":
+        # The login deadline is already behind us, so the statusline would
+        # wake a tick on every single render. Back off like any other failed
+        # attempt: nothing changes until an account frees up or a human logs
+        # in, and both are minutes-scale events at best.
+        write_epoch_file(SETTLE_FILE, now + RETRY_SECONDS)
+        log_decision(f"no working account to escape to; retrying after {int(RETRY_SECONDS)}s")
+        recompute_gate(active, now)
+        return EXIT_OK
     if reason != "limit":
         recompute_gate(active, now)
         return EXIT_OK
@@ -1203,7 +1584,7 @@ def _try_candidates(
         if live_5h > ENTER_5H or live_7d > ENTER_7D:
             log_decision(f"skip {candidate.name}: live 5h={live_5h:.0f}% 7d={live_7d:.0f}%")
             continue
-        if switch_reason(five, seven, live_7d) is None:
+        if switch_reason(five, seven, live_7d, expired=reason == "expired") is None:
             log_decision(f"skip {candidate.name}: live 7d={live_7d:.0f}% leaves no reason to move")
             continue
         _perform_auto_switch(active, candidate.name, reason, now)
@@ -1213,9 +1594,33 @@ def _try_candidates(
 
 def _tick_locked(args: argparse.Namespace, now: float) -> int:
     active = resolve_active()
+    dead = live_credentials_dead(now)
+    if dead is not None:
+        # No usage figures arrive once the login is dead, so this cannot wait
+        # for a threshold: evacuate on the credentials alone.
+        log_decision(f"live login unusable ({dead}); looking for a working account")
+        # A dead login has no active account, so none is named here. Whatever
+        # `resolve_active` returned can only be the `.active` marker — a
+        # guess, since a damaged credentials file leaves no email to match a
+        # profile against. Excluding that guess from the ranking hid the one
+        # profile whose saved copy may still hold a working login, and naming
+        # it as live made `confirm_candidate` reach for a token in the very
+        # file that is the problem. The running session stays protected
+        # either way: the rule that never refreshes it matches by email
+        # against the live credentials, so it holds whenever there is a
+        # session left to protect.
+        return _try_candidates(None, rank_candidates(now, None), "expired", (0.0, 0.0), now)
     if active is None:
         return EXIT_OK
     five, seven = float(args.five_hour), float(args.seven_day)
+    # A garbled statusline payload must not be persisted: a NaN makes every
+    # threshold comparison false, so an exhausted account would never be
+    # evacuated, and the snapshot would poison later rankings too.
+    if not (math.isfinite(five) and math.isfinite(seven)):
+        log_decision(f"ignoring non-finite usage from the statusline: 5h={five} 7d={seven}")
+        return EXIT_OK
+    five = min(max(five, 0.0), 100.0)
+    seven = min(max(seven, 0.0), 100.0)
     record_usage_snapshot(active, make_snapshot(five, seven, args.resets_5h or None, args.resets_7d or None))
     ranked = rank_candidates(now, active)
     reason = switch_reason(five, seven, ranked[0].seven_day if ranked else 100.0)
@@ -1236,7 +1641,17 @@ def _tick_is_still_wanted(now: float) -> bool:
     """
     if not auto_enabled():
         return False
-    return not (read_epoch_file(SETTLE_FILE) > now or read_epoch_file(EXHAUSTED_FILE) > now)
+    if read_epoch_file(SETTLE_FILE) > now:
+        return False
+    if read_epoch_file(EXHAUSTED_FILE) <= now:
+        return True
+    # An exhaustion deadline says every account was at its limit, and it can
+    # be days out. A dead login is a different and worse problem — the
+    # session has stopped working entirely — and it outranks limits
+    # everywhere else, so it must not wait behind one. The settle window
+    # above still applies: that one exists to stop a switch from immediately
+    # undoing itself.
+    return live_credentials_dead(now) is not None
 
 
 def cmd_tick(args: argparse.Namespace) -> int:
@@ -1264,7 +1679,13 @@ def cmd_pick(_args: argparse.Namespace) -> int:
         # Resolved inside the lock: a switch completing between an unlocked
         # read and here would leave us calling the newly live account a
         # candidate and refreshing the running session's token.
-        return _pick_locked(resolve_active(), now)
+        #
+        # A dead login has no active account, exactly as in the automatic
+        # rescue: `resolve_active` can then only be echoing the `.active`
+        # marker, and excluding that guess would hide the profile holding
+        # the one working login left.
+        active = None if live_credentials_dead(now) else resolve_active()
+        return _pick_locked(active, now)
 
 
 def _pick_locked(active: str | None, now: float) -> int:
@@ -1308,8 +1729,19 @@ def _usage_row(name: str, active: str | None, now: float) -> dict[str, Any]:
     """Live usage for one profile, falling back to its stored snapshot."""
     data = load_profile_data(name)
     email, _ = _profile_summary(profile_path(name))
-    row: dict[str, Any] = {"profile": name, "email": email, "active": name == active}
-    reason = profile_unusable_reason(data, now)
+    is_active = name == active
+    # The saved copy decides nothing about the account signed in right now:
+    # a stale "refresh token expired" there would report the live account as
+    # dead and show stored limits instead of fetching real ones. A dead live
+    # login is reported as itself rather than as the HTTP failure that
+    # fetching with it would produce.
+    reason, expiry = login_status_for(name, active, now)
+    row: dict[str, Any] = {
+        "profile": name,
+        "email": email,
+        "active": is_active,
+        "login_expires_at": expiry,
+    }
     if reason is not None:
         stored = (data or {}).get("usage")
         row.update(_usage_fields(stored), status=reason, stale=True)
@@ -1323,13 +1755,21 @@ def _usage_row(name: str, active: str | None, now: float) -> dict[str, Any]:
 
 
 def _usage_fields(snapshot: object) -> dict[str, Any]:
-    if not isinstance(snapshot, dict):
-        return {"five_hour": None, "seven_day": None, "resets_5h": None, "resets_7d": None}
+    """Flatten a stored snapshot for display, tolerating any shape.
+
+    One hand-edited profile must not stop `usage` from reporting the others,
+    so a window that is not an object simply reads as unknown.
+    """
+    windows = snapshot if isinstance(snapshot, dict) else {}
+    five = windows.get("five_hour")
+    seven = windows.get("seven_day")
+    five = five if isinstance(five, dict) else {}
+    seven = seven if isinstance(seven, dict) else {}
     return {
-        "five_hour": (snapshot.get("five_hour") or {}).get("utilization"),
-        "seven_day": (snapshot.get("seven_day") or {}).get("utilization"),
-        "resets_5h": (snapshot.get("five_hour") or {}).get("resets_at"),
-        "resets_7d": (snapshot.get("seven_day") or {}).get("resets_at"),
+        "five_hour": five.get("utilization"),
+        "seven_day": seven.get("utilization"),
+        "resets_5h": five.get("resets_at"),
+        "resets_7d": seven.get("resets_at"),
     }
 
 
@@ -1366,14 +1806,21 @@ def cmd_usage(args: argparse.Namespace) -> int:
         return EXIT_OK
     name_w = max(*(len(str(r["profile"])) for r in rows), len("PROFILE"))
     email_w = max(*(len(str(r["email"])) for r in rows), len("EMAIL"))
-    print(f"  {'PROFILE':<{name_w}}  {'EMAIL':<{email_w}}  {'5h':>5}  {'7d':>5}  RESETS 5h / 7d")
-    for row in rows:
+    logins = [_fmt_login_expiry(r["login_expires_at"], now) for r in rows]
+    login_w = max(*(len(t) for t in logins), len("LOGIN UNTIL"))
+    reset_w = max(*(len(_reset_cell(r)) for r in rows), len("RESETS 5h / 7d"))
+    header = (
+        f"  {'PROFILE':<{name_w}}  {'EMAIL':<{email_w}}  {'5h':>5}  {'7d':>5}  "
+        f"{'RESETS 5h / 7d':<{reset_w}}  {'LOGIN UNTIL':<{login_w}}  STATUS"
+    )
+    print(header)
+    for row, login in zip(rows, logins, strict=True):
         marker = "*" if row["active"] else " "
         stale = " (stored)" if row["stale"] else ""
         print(
             f"{marker} {row['profile']:<{name_w}}  {row['email']:<{email_w}}  "
             f"{_pct(row['five_hour']):>5}  {_pct(row['seven_day']):>5}  "
-            f"{_reset_cell(row)}  {row['status']}{stale}"
+            f"{_reset_cell(row):<{reset_w}}  {login:<{login_w}}  {row['status']}{stale}"
         )
     return EXIT_OK
 

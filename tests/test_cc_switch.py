@@ -103,6 +103,10 @@ class BaseTest(unittest.TestCase):
         self.backups_dir = self.profiles_dir / ".backups"
         self.backups_dir.mkdir()
 
+        # EVERY module-level path is redirected here, not just the ones a
+        # given test touches. A path left unpatched silently writes into the
+        # real ~/.claude-profiles — which is how a test profile once ended up
+        # named as the user's live account.
         self._patches = [
             patch.object(cc, "CLAUDE_DIR", self.claude_dir),
             patch.object(cc, "CREDS_FILE", self.creds_file),
@@ -110,6 +114,13 @@ class BaseTest(unittest.TestCase):
             patch.object(cc, "PROFILES_DIR", self.profiles_dir),
             patch.object(cc, "ACTIVE_FILE", self.active_file),
             patch.object(cc, "BACKUPS_DIR", self.backups_dir),
+            patch.object(cc, "LIVE_FILE", self.profiles_dir / ".live"),
+            patch.object(cc, "AUTO_FILE", self.profiles_dir / ".auto"),
+            patch.object(cc, "GATE_FILE", self.profiles_dir / ".gate"),
+            patch.object(cc, "EXHAUSTED_FILE", self.profiles_dir / ".exhausted"),
+            patch.object(cc, "SETTLE_FILE", self.profiles_dir / ".settle"),
+            patch.object(cc, "LOG_FILE", self.profiles_dir / ".auto.log"),
+            patch.object(cc, "LOCK_FILE", self.profiles_dir / ".lock"),
         ]
         for p in self._patches:
             p.start()
@@ -816,7 +827,7 @@ class TestCmdCurrent(BaseTest):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             cc.cmd_current(cc.build_parser().parse_args(["current"]))
-        self.assertEqual(out.getvalue().strip(), "work")
+        self.assertEqual(out.getvalue().split()[0], "work")
 
     def test_falls_back_to_email_match(self) -> None:
         self._write_creds()
@@ -826,7 +837,7 @@ class TestCmdCurrent(BaseTest):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             cc.cmd_current(cc.build_parser().parse_args(["current"]))
-        self.assertEqual(out.getvalue().strip(), "work")
+        self.assertEqual(out.getvalue().split()[0], "work")
 
     def test_stale_active_falls_back(self) -> None:
         """If .active names a removed profile, fall back to email scan."""
@@ -837,7 +848,7 @@ class TestCmdCurrent(BaseTest):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             cc.cmd_current(cc.build_parser().parse_args(["current"]))
-        self.assertEqual(out.getvalue().strip(), "work")
+        self.assertEqual(out.getvalue().split()[0], "work")
 
     def test_no_match_says_undetermined(self) -> None:
         self._write_creds()
@@ -865,7 +876,7 @@ class TestCmdCurrent(BaseTest):
         with contextlib.redirect_stdout(out):
             rc = cc.cmd_current(cc.build_parser().parse_args(["current"]))
         self.assertEqual(rc, cc.EXIT_OK)
-        self.assertEqual(out.getvalue().strip(), "work")
+        self.assertEqual(out.getvalue().split()[0], "work")
 
     def test_skips_non_dict_json_profiles_in_email_scan(self) -> None:
         self._write_creds()
@@ -876,7 +887,7 @@ class TestCmdCurrent(BaseTest):
         with contextlib.redirect_stdout(out):
             rc = cc.cmd_current(cc.build_parser().parse_args(["current"]))
         self.assertEqual(rc, cc.EXIT_OK)
-        self.assertEqual(out.getvalue().strip(), "work")
+        self.assertEqual(out.getvalue().split()[0], "work")
 
 
 class TestCmdRemove(BaseTest):
@@ -973,7 +984,7 @@ class TestMainDispatch(BaseTest):
         with contextlib.redirect_stdout(out):
             rc = cc.main(["current"])
         self.assertEqual(rc, cc.EXIT_OK)
-        self.assertEqual(out.getvalue().strip(), "alice")
+        self.assertEqual(out.getvalue().split()[0], "alice")
 
     def test_main_dispatches_add(self) -> None:
         self._write_creds()
@@ -1052,6 +1063,7 @@ class AutoBaseTest(BaseTest):
         self.exhausted_file = self.profiles_dir / ".exhausted"
         self.settle_file = self.profiles_dir / ".settle"
         self.log_file = self.profiles_dir / ".auto.log"
+        self.live_file = self.profiles_dir / ".live"
         self.lock_file = self.profiles_dir / ".lock"
         self._auto_patches = [
             patch.object(cc, "AUTO_FILE", self.auto_file),
@@ -1059,6 +1071,7 @@ class AutoBaseTest(BaseTest):
             patch.object(cc, "EXHAUSTED_FILE", self.exhausted_file),
             patch.object(cc, "SETTLE_FILE", self.settle_file),
             patch.object(cc, "LOG_FILE", self.log_file),
+            patch.object(cc, "LIVE_FILE", self.live_file),
             patch.object(cc, "LOCK_FILE", self.lock_file),
             patch.object(cc, "_now", lambda: NOW),
             # Any un-mocked network call must fail loudly rather than go out.
@@ -1314,25 +1327,84 @@ class TestGate(AutoBaseTest):
     def _gate(self) -> list[int]:
         return [int(x) for x in self.gate_file.read_text().split()]
 
-    def test_line_is_four_integers(self) -> None:
+    def test_line_is_six_integers(self) -> None:
         """The statusline parses this from bash — the shape is the contract."""
         self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 20.0)
         cc.recompute_gate("me", NOW)
-        self.assertEqual(len(self._gate()), 4)
+        self.assertEqual(len(self._gate()), 6)
+
+    def test_the_sixth_field_is_the_settle_window_alone(self) -> None:
+        """`not_before` also carries the exhaustion deadline; this must not."""
+        self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 20.0)
+        cc.write_epoch_file(self.settle_file, NOW + 60)
+        cc.write_epoch_file(self.exhausted_file, NOW + DAY)
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[0], int(NOW + DAY))
+        self.assertEqual(self._gate()[5], int(NOW + 60))
+
+    def test_a_fractional_threshold_never_triggers_below_itself(self) -> None:
+        """A trigger under the threshold is a tick per render that declines.
+
+        The statusline compares tenths, so `EXIT_5H=95.15` cannot be one. It
+        has to land on 95.2: at 95.1 the shell would wake a tick, Python
+        would decline, and the same trigger would be written back.
+        """
+        self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 20.0)
+        with patch.object(cc, "EXIT_5H", 95.15):
+            cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[2], 952)
+
+    def test_a_threshold_halfway_between_tenths_still_rounds_up(self) -> None:
+        """Nearest-half would send `95.05` down to 950 — banker's, to even.
+
+        The shell would then wake a tick at 95.0%, Python would decline
+        because 95.0 is under the threshold, and the same trigger would be
+        written back: a process per render for the whole tenth in between.
+        """
+        self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 20.0)
+        with patch.object(cc, "EXIT_5H", 95.05):
+            cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[2], 951)
+
+    def test_a_tenth_threshold_lands_exactly_on_itself(self) -> None:
+        """`95.1 * 10` is 950.9999999999999 — a bare ceiling is not enough."""
+        self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 20.0)
+        with patch.object(cc, "EXIT_5H", 95.1):
+            cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[2], 951)
+
+    def test_a_sum_landing_just_above_a_tenth_is_not_pushed_past_it(self) -> None:
+        """`16.1 + 0.1` is 16.200000000000003, and a bare ceiling reads 163.
+
+        One decimal times ten is exact in binary; a sum of two is not, and
+        `trigger_7d` is exactly such a sum. Overshooting delays the tick that
+        would have balanced the accounts by a whole tenth of a percent.
+        """
+        self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 16.1)
+        with patch.object(cc, "BALANCE_GAP_7D", 0.1):
+            cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[3], 162)
+
+    def test_the_balance_trigger_is_rounded_the_same_way_as_the_limit(self) -> None:
+        """Its precision comes from the API, which nothing here validates."""
+        self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 20.0)
+        with patch.object(cc, "BALANCE_GAP_7D", 5.15):
+            cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[3], 252)
 
     def test_trigger_uses_the_balance_gap(self) -> None:
         self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 20.0)
         cc.recompute_gate("me", NOW)
-        self.assertEqual(self._gate()[3], int(20 + cc.BALANCE_GAP_7D))
+        self.assertEqual(self._gate()[3], int((20 + cc.BALANCE_GAP_7D) * 10))
 
     def test_trigger_capped_by_exit_threshold(self) -> None:
         self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, cc.ENTER_7D)
         cc.recompute_gate("me", NOW)
-        self.assertEqual(self._gate()[3], int(cc.EXIT_7D))
+        self.assertEqual(self._gate()[3], int(cc.EXIT_7D * 10))
 
     def test_trigger_is_exit_threshold_without_candidates(self) -> None:
         cc.recompute_gate("me", NOW)
-        self.assertEqual(self._gate()[2:], [int(cc.EXIT_5H), int(cc.EXIT_7D)])
+        self.assertEqual(self._gate()[2:4], [int(cc.EXIT_5H * 10), int(cc.EXIT_7D * 10)])
 
     def test_recheck_after_is_earliest_other_reset(self) -> None:
         self._save_with_usage("a", _creds("a"), _account("a@x"), 1.0, 1.0, _iso(NOW + 2 * HOUR), _iso(NOW + DAY))
@@ -2342,11 +2414,18 @@ class TestExactTimeArithmetic(AutoBaseTest):
 
     def test_login_warning_counts_real_hours(self) -> None:
         self._save_with_usage("soon", _creds("t", refresh_expires=int((NOW + 6 * HOUR) * 1000)), _account("s@x"))
-        self.assertIn("6h", cc._profile_note("soon", NOW))
+        self.assertIn("6h", _note("soon"))
 
     def test_no_warning_just_past_the_window(self) -> None:
         self._save_with_usage("fine", _creds("t", refresh_expires=int((NOW + 3 * DAY) * 1000)), _account("f@x"))
-        self.assertEqual(cc._profile_note("fine", NOW), "")
+        self.assertEqual(_note("fine"), "")
+
+
+
+def _note(name: str, active: str | None = None, now: float = NOW) -> str:
+    """The `list` note for one account, from the verdict its date comes from."""
+    reason, expiry = cc.login_status_for(name, active, now)
+    return cc._login_note(reason, expiry, now)
 
 
 class TestRemainingBoundaries(TickTestCase):
@@ -2373,11 +2452,11 @@ class TestRemainingBoundaries(TickTestCase):
     def test_login_warning_at_exactly_two_days_is_silent(self) -> None:
         """Two days out is comfortable; the warning is for the last stretch."""
         self._save_with_usage("edge", _creds("t", refresh_expires=int((NOW + 2 * DAY) * 1000)), _account("e@x"))
-        self.assertEqual(cc._profile_note("edge", NOW), "")
+        self.assertEqual(_note("edge"), "")
 
     def test_login_warning_just_under_two_days_fires(self) -> None:
         self._save_with_usage("edge", _creds("t", refresh_expires=int((NOW + 2 * DAY - HOUR) * 1000)), _account("e@x"))
-        self.assertIn("login expires in", cc._profile_note("edge", NOW))
+        self.assertIn("login expires in", _note("edge"))
 
     def test_quiet_switch_prints_nothing(self) -> None:
         """The statusline-driven path must stay silent; `use` must not."""
@@ -2793,7 +2872,7 @@ class TestThresholdValidation(unittest.TestCase):
             self.assertEqual(cc._env_seconds("CC_SWITCH_TEST_SECONDS", 60.0), 0.0)
 
     def test_configured_thresholds_are_floor_safe(self) -> None:
-        """The gate writes these through math.floor on every recompute."""
+        """The gate writes these through `_gate_tenths` on every recompute."""
         for value in (cc.EXIT_5H, cc.EXIT_7D, cc.ENTER_5H, cc.ENTER_7D, cc.BALANCE_GAP_7D):
             self.assertTrue(math.isfinite(value))
             self.assertIsInstance(math.floor(value), int)
@@ -2999,6 +3078,69 @@ class TestResolveActiveTrustsLiveCredentials(AutoBaseTest):
     def test_without_credentials_the_marker_is_all_we_have(self) -> None:
         self.creds_file.unlink()
         self.assertEqual(cc.resolve_active(), "me")
+
+
+class TestPickRescuesADeadLoginToo(AutoBaseTest):
+    """`pick` runs the same decision as the tick and needs the same rule.
+
+    Fixing the automatic rescue alone left the manual command refusing to
+    look at the profile the marker names — the one place a user reaches for
+    when the session has stopped working.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 60.0)
+        cc.write_active("me")
+
+    def test_the_marker_profile_is_restored_when_it_is_all_there_is(self) -> None:
+        self.creds_file.unlink()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(10.0, 60.0))), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(cc.read_active(), "me")
+        live = json.loads(self.creds_file.read_text())
+        self.assertEqual(live["claudeAiOauth"]["accessToken"], "token-me")
+
+    def test_it_is_confirmed_with_its_own_stored_token(self) -> None:
+        """There is no live token to confirm with — that is the whole problem."""
+        self.creds_file.unlink()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(10.0, 60.0))) as fetch, _silence():
+            cc.cmd_pick(argparse.Namespace())
+        fetch.assert_called_once_with("token-me")
+
+    def test_a_lower_account_still_wins_over_the_marker(self) -> None:
+        self.creds_file.unlink()
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("v@x"), 5.0, 20.0)
+
+        def _usage(token: str) -> tuple[int, dict]:
+            return (200, _api_usage(10.0, 60.0)) if token == "token-me" else (200, _api_usage(5.0, 20.0))
+
+        with patch.object(cc, "fetch_usage", side_effect=_usage), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_a_healthy_login_still_excludes_the_active_account(self) -> None:
+        """The rule is for a dead login only; otherwise nothing changes."""
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("v@x"), 5.0, 20.0)
+
+        def _usage(token: str) -> tuple[int, dict]:
+            return (200, _api_usage(10.0, 10.0)) if token == "token-me" else (200, _api_usage(5.0, 20.0))
+
+        with patch.object(cc, "fetch_usage", side_effect=_usage), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_nothing_usable_still_says_so(self) -> None:
+        self.creds_file.unlink()
+        self._save_with_usage(
+            "me", _creds("token-me", refresh_expires=int((NOW - DAY) * 1000)), _account("me@example.com")
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_pick(argparse.Namespace())
+        self.assertIn("No usable account with headroom", out.getvalue())
 
 
 class TestPickTakesTheLowestAccount(AutoBaseTest):
@@ -3321,6 +3463,66 @@ class TestLiveAccountIsProtectedByIdentity(AutoBaseTest):
         self.assertFalse(cc._is_live_account("me-backup"))
 
 
+class TestADeadLoginBelongsToNobody(AutoBaseTest):
+    """Identity by email protects a running session. There is none here.
+
+    Answering "this profile is the live account" for a login that no longer
+    works handed out the unusable live token in place of the profile's own.
+    The API rejected it, and `mark_auth_error` stamped the rejection on the
+    one profile the rescue was reaching for — locking it out of every later
+    ranking.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-live", refresh_expires=int((NOW - 1) * 1000)))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage(
+            "me",
+            _creds("token-saved", refresh_expires=int((NOW + 30 * DAY) * 1000)),
+            _account("me@example.com"),
+            10.0,
+            40.0,
+        )
+        cc.write_active("me")
+        self._enable_auto()
+
+    def test_the_profile_is_no_longer_called_the_live_account(self) -> None:
+        self.assertFalse(cc._is_live_account("me"))
+
+    def test_its_own_stored_token_is_used(self) -> None:
+        token, error, _ = cc.access_token_for("me", None)
+        self.assertEqual((token, error), ("token-saved", None))
+
+    def test_the_rescue_confirms_with_that_token(self) -> None:
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(5.0, 20.0))) as fetch:
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        fetch.assert_called_once_with("token-saved")
+
+    def test_the_rescue_restores_the_account(self) -> None:
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(5.0, 20.0))):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        live = json.loads(self.creds_file.read_text())
+        self.assertEqual(live["claudeAiOauth"]["accessToken"], "token-saved")
+
+    def test_no_auth_error_is_stamped_on_the_recovery_profile(self) -> None:
+        """That mark would keep it out of every ranking from then on."""
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(5.0, 20.0))):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertNotIn("authError", json.loads(self._profile_path("me").read_text()))
+
+    def test_pick_reaches_it_the_same_way(self) -> None:
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(5.0, 20.0))) as fetch, _silence():
+            cc.cmd_pick(argparse.Namespace())
+        fetch.assert_called_once_with("token-saved")
+
+    def test_a_rejection_of_its_own_token_is_still_recorded(self) -> None:
+        """The mark is honest when it is the profile's own credentials."""
+        with patch.object(cc, "fetch_usage", return_value=(401, {})):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertIn("authError", json.loads(self._profile_path("me").read_text()))
+
+
 class TestTickRecheckedUnderTheLock(TickTestCase):
     """Everything read before the lock is re-read after acquiring it.
 
@@ -3445,13 +3647,33 @@ class TestFractionalThresholds(TickTestCase):
         self.assertEqual(stored["five_hour"]["utilization"], 12.4)
         self.assertEqual(stored["seven_day"]["utilization"], 33.6)
 
-    def test_the_gate_trigger_is_floored_so_it_can_only_fire_early(self) -> None:
-        """A floored trigger wakes the tick sooner; the tick then re-decides."""
-        with patch.object(cc, "EXIT_5H", 95.9):
+    def test_the_gate_trigger_is_written_in_tenths(self) -> None:
+        """Whole numbers cannot express a fractional threshold either way.
+
+        Rounded down, the gate fires below the real threshold and the tick
+        rewrites the same trigger on every render. Rounded up, 95.1 became 96
+        and 95.2% usage never reached it at all.
+        """
+        with patch.object(cc, "EXIT_5H", 95.1):
             cc.recompute_gate("me", NOW)
         trigger_5h = int(self.gate_file.read_text().split()[2])
-        self.assertEqual(trigger_5h, 95)
-        self.assertLessEqual(trigger_5h, 95.9)
+        self.assertEqual(trigger_5h, 951)
+
+    def test_a_fractional_threshold_is_reachable(self) -> None:
+        """95.2% usage must clear a 95.1% threshold, in the shell's units."""
+        with patch.object(cc, "EXIT_5H", 95.1):
+            cc.recompute_gate("me", NOW)
+        trigger_5h = int(self.gate_file.read_text().split()[2])
+        self.assertGreaterEqual(int(95.2 * 10), trigger_5h)
+        self.assertLess(int(95.0 * 10), trigger_5h)
+
+    def test_a_fractional_balance_trigger_does_not_spawn_on_every_render(self) -> None:
+        """The other half: candidate 20.9, active 25.1, gap 5 — no reason."""
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("v@x"), 5.0, 20.9)
+        cc.recompute_gate("me", NOW)
+        trigger_7d = int(self.gate_file.read_text().split()[3])
+        self.assertLess(int(25.1 * 10), trigger_7d)
+        self.assertIsNone(cc.switch_reason(10.0, 25.1, 20.9))
 
 
 class TestStatuslinePassesExactValues(unittest.TestCase):
@@ -3467,10 +3689,2098 @@ class TestStatuslinePassesExactValues(unittest.TestCase):
         self.assertNotIn('--5h "$FIVE_I"', self.script)
         self.assertIn('"${FIVE_I:-0}" -ge', self.script)
 
-    def test_the_gate_comparison_floors_rather_than_rounds(self) -> None:
-        """Rounding up would make the sieve miss a tick it should have spawned."""
-        self.assertIn("FIVE_I=${FIVE_H%%.*}", self.script)
-        self.assertIn("WEEK_I=${WEEK%%.*}", self.script)
+    def test_the_gate_comparison_works_in_tenths(self) -> None:
+        """Both sides scale identically, so a fractional threshold is exact."""
+        self.assertIn("FIVE_I=$(( ${FIVE_INT:-0} * 10 + ${FIVE_FRAC:0:1} ))", self.script)
+        self.assertIn("WEEK_I=$(( ${WEEK_INT:-0} * 10 + ${WEEK_FRAC:0:1} ))", self.script)
+
+
+class TestMalformedProfilesAreSkippedNotFatal(AutoBaseTest):
+    """One hand-edited profile must never take a command down with it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 40.0)
+        cc.write_active("me")
+
+    def _corrupt_expiry(self, name: str, value: object) -> None:
+        cc.save_profile(name, _creds(f"token-{name}"), _account(f"{name}@x"))
+        path = self._profile_path(name)
+        data = json.loads(path.read_text())
+        data["credentials"]["claudeAiOauth"]["expiresAt"] = value
+        path.write_text(json.dumps(data, indent=2))
+
+    def test_a_string_expiry_skips_the_profile(self) -> None:
+        self._corrupt_expiry("broken", "soon")
+        token, error, transient = cc.access_token_for("broken", "me")
+        self.assertIsNone(token)
+        self.assertEqual(error, "corrupted expiry")
+        self.assertFalse(transient)
+
+    def test_an_object_expiry_skips_the_profile(self) -> None:
+        self._corrupt_expiry("broken", {"at": "later"})
+        token, error, _ = cc.access_token_for("broken", "me")
+        self.assertIsNone(token)
+        self.assertEqual(error, "corrupted expiry")
+
+    def test_usage_still_reports_the_healthy_accounts(self) -> None:
+        self._corrupt_expiry("broken", "soon")
+        self._save_with_usage("good", _creds("token-good"), _account("g@x"), 1.0, 2.0)
+        out = io.StringIO()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(7.0, 8.0))), contextlib.redirect_stdout(out):
+            cc.cmd_usage(argparse.Namespace(json=False))
+        text = out.getvalue()
+        self.assertIn("good", text)
+        self.assertIn("corrupted expiry", text)
+
+    def test_a_tick_switches_past_the_broken_profile(self) -> None:
+        self._corrupt_expiry("broken", "soon")
+        self._save_with_usage("good", _creds("token-good"), _account("g@x"), 1.0, 2.0)
+        self._enable_auto()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 2.0))):
+            cc.cmd_tick(self._tick_args(cc.EXIT_5H, 40.0))
+        self.assertEqual(cc.read_active(), "good")
+
+    def test_a_malformed_stored_snapshot_renders_as_unknown(self) -> None:
+        cc.save_profile("odd", _creds("token-odd"), _account("o@x"))
+        path = self._profile_path("odd")
+        data = json.loads(path.read_text())
+        data["usage"] = {"five_hour": "nonsense", "seven_day": [1, 2]}
+        path.write_text(json.dumps(data, indent=2))
+        fields = cc._usage_fields(data["usage"])
+        self.assertIsNone(fields["five_hour"])
+        self.assertIsNone(fields["resets_7d"])
+
+    def test_usage_survives_a_malformed_snapshot_on_an_unusable_profile(self) -> None:
+        cc.save_profile("odd", _creds("token-odd", refresh_expires=int((NOW - 1) * 1000)), _account("o@x"))
+        path = self._profile_path("odd")
+        data = json.loads(path.read_text())
+        data["usage"] = {"five_hour": "nonsense", "seven_day": [1, 2]}
+        path.write_text(json.dumps(data, indent=2))
+        out = io.StringIO()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(7.0, 8.0))), contextlib.redirect_stdout(out):
+            rc = cc.cmd_usage(argparse.Namespace(json=False))
+        self.assertEqual(rc, cc.EXIT_OK)
+        self.assertIn("me", out.getvalue())
+
+
+class TestTickRejectsGarbledUsage(TickTestCase):
+    """A garbled statusline payload must not be persisted or acted on."""
+
+    def test_a_nan_percentage_is_ignored(self) -> None:
+        with patch.object(cc, "fetch_usage", side_effect=AssertionError("must not run")):
+            rc = cc.cmd_tick(self._tick_args(float("nan"), float("nan")))
+        self.assertEqual(rc, cc.EXIT_OK)
+        self.assertEqual(cc.read_active(), "me")
+        self.assertIn("non-finite", self._log_text())
+
+    def test_a_nan_percentage_does_not_poison_the_snapshot(self) -> None:
+        before = self._stored_usage("me")
+        with patch.object(cc, "fetch_usage", side_effect=AssertionError("must not run")):
+            cc.cmd_tick(self._tick_args(float("nan"), 40.0))
+        self.assertEqual(self._stored_usage("me"), before)
+
+    def test_an_infinite_percentage_is_ignored(self) -> None:
+        with patch.object(cc, "fetch_usage", side_effect=AssertionError("must not run")):
+            cc.cmd_tick(self._tick_args(float("inf"), 40.0))
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_an_out_of_range_percentage_is_clamped(self) -> None:
+        """Clamped rather than dropped: 101% still means 'full'."""
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(120.0, -5.0))
+        stored = self._stored_usage("me")
+        self.assertEqual(stored["five_hour"]["utilization"], 100.0)
+        self.assertEqual(stored["seven_day"]["utilization"], 0.0)
+
+    def test_a_clamped_full_account_still_evacuates(self) -> None:
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(120.0, 40.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+
+class TestARefusedSwitchIsInert(AutoBaseTest):
+    """A switch that cannot start must leave nothing behind.
+
+    The settle barrier is armed for a switch that is about to happen. Arming
+    it for one that never starts would silence automatic switching for the
+    whole window, for nothing.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 40.0)
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"), 5.0, 20.0)
+        cc.write_active("me")
+
+    def test_a_malformed_target_leaves_no_barrier_behind(self) -> None:
+        """A refused switch must not suppress auto-switching afterwards.
+
+        The barrier is armed for a switch that is about to happen; arming it
+        for one that never starts would silence the automatic path for the
+        whole settle window, for nothing.
+        """
+        self._profile_path("vlad").write_text("{not json")
+        with contextlib.suppress(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.settle_file.exists())
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_a_profile_missing_its_credentials_leaves_no_barrier(self) -> None:
+        self._profile_path("vlad").write_text(json.dumps({"oauthAccount": _account("v@x")}))
+        with contextlib.suppress(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.settle_file.exists())
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_an_unreadable_main_config_leaves_no_barrier(self) -> None:
+        self.main_file.write_text("{not json")
+        with contextlib.suppress(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.settle_file.exists())
+
+    def test_a_failing_backup_releases_the_barrier(self) -> None:
+        """The barrier guards a switch; if the switch aborts it must go."""
+        with (
+            patch.object(cc, "_auto_backup_active", side_effect=SystemExit(2)),
+            self.assertRaises(SystemExit),
+            _silence(),
+        ):
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.settle_file.exists())
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_a_failing_main_backup_releases_the_barrier(self) -> None:
+        with (
+            patch.object(cc, "backup_main", side_effect=SystemExit(2)),
+            self.assertRaises(SystemExit),
+            _silence(),
+        ):
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.settle_file.exists())
+
+    def test_an_unexpected_error_also_releases_it(self) -> None:
+        with (
+            patch.object(cc, "backup_main", side_effect=RuntimeError("disk gremlin")),
+            self.assertRaises(RuntimeError),
+            _silence(),
+        ):
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.settle_file.exists())
+
+    def test_a_failing_atomic_write_releases_the_barrier(self) -> None:
+        """The swap rolls itself back, so the barrier must go with it."""
+        with (
+            patch.object(cc, "_apply_switch_atomic", side_effect=SystemExit(2)),
+            self.assertRaises(SystemExit),
+            _silence(),
+        ):
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.settle_file.exists())
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_an_unexpected_error_in_the_swap_releases_it_too(self) -> None:
+        with (
+            patch.object(cc, "_apply_switch_atomic", side_effect=RuntimeError("disk full")),
+            self.assertRaises(RuntimeError),
+            _silence(),
+        ):
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.settle_file.exists())
+
+    def test_a_successful_switch_keeps_the_barrier(self) -> None:
+        """The release must not fire on the happy path."""
+        with _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(cc.read_active(), "vlad")
+        self.assertEqual(cc.read_epoch_file(self.settle_file), int(NOW + cc.SETTLE_SECONDS))
+
+    def test_a_refused_switch_does_not_touch_the_profiles(self) -> None:
+        before = self._profile_path("me").read_text()
+        self._profile_path("vlad").write_text("{not json")
+        with contextlib.suppress(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(self._profile_path("me").read_text(), before)
+
+
+class TestUnwritableSettleFileAbortsTheSwitch(AutoBaseTest):
+    """Without the settle barrier a switch is not safe to perform.
+
+    The statusline keeps reporting the outgoing account's percentages for a
+    moment; a tick reading those with no barrier in place switches straight
+    back, silently undoing what the user asked for. Since the barrier is
+    armed before the swap, failing to write it leaves everything untouched.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 40.0)
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"), 5.0, 20.0)
+        cc.write_active("me")
+        self.settle_file.mkdir()  # a directory cannot be replaced by a file
+
+    def test_the_switch_is_refused(self) -> None:
+        with self.assertRaises(SystemExit) as ctx, _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertNotEqual(ctx.exception.code, cc.EXIT_OK)
+
+    def test_the_credentials_are_untouched(self) -> None:
+        before = self.creds_file.read_text()
+        with contextlib.suppress(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(self.creds_file.read_text(), before)
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_no_half_applied_switch_is_left_behind(self) -> None:
+        """The whole point: nothing partial for a later tick to act on."""
+        self._enable_auto()
+        with contextlib.suppress(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(cc.read_active(), "me")
+        self.assertEqual(
+            json.loads(self.creds_file.read_text())["claudeAiOauth"]["accessToken"], "token-me"
+        )
+        self.assertEqual(json.loads(self.main_file.read_text())["oauthAccount"]["emailAddress"], "me@example.com")
+
+    def test_the_saved_profiles_are_intact(self) -> None:
+        before = {n: self._profile_path(n).read_text() for n in ("me", "vlad")}
+        with contextlib.suppress(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        for name, text in before.items():
+            self.assertEqual(self._profile_path(name).read_text(), text, name)
+
+
+class TestSettleBarrierProtectsAManualSwitch(AutoBaseTest):
+    """A manual switch survives the very next statusline render."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 95.0)
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"), 5.0, 20.0)
+        cc.write_active("me")
+        self._enable_auto()
+
+    def test_stale_usage_right_after_a_switch_does_not_reverse_it(self) -> None:
+        with _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(cc.read_active(), "vlad")
+        # The render still describes the account we just left.
+        with patch.object(cc, "fetch_usage", side_effect=AssertionError("must not evaluate")):
+            cc.cmd_tick(self._tick_args(10.0, 95.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_the_barrier_is_armed_by_the_switch(self) -> None:
+        with _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(cc.read_epoch_file(self.settle_file), int(NOW + cc.SETTLE_SECONDS))
+
+    def test_an_automatic_switch_arms_it_too(self) -> None:
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(5.0, 20.0))):
+            cc.cmd_tick(self._tick_args(cc.EXIT_5H, 95.0))
+        self.assertEqual(cc.read_active(), "vlad")
+        self.assertEqual(cc.read_epoch_file(self.settle_file), int(NOW + cc.SETTLE_SECONDS))
+
+
+class TestStatuslineNamesTheLiveAccount(AutoBaseTest):
+    """`.live` is written by cc-switch; `.active` is only a fallback."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-vlad"))
+        self._write_main(_account("vlad@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 40.0)
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"), 5.0, 20.0)
+        cc.write_active("me")  # stale marker
+
+    def test_resolving_records_the_live_account(self) -> None:
+        self.assertEqual(cc.resolve_active(), "vlad")
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_an_unresolvable_account_writes_an_empty_name(self) -> None:
+        """A cleared cache is right: showing a name we cannot confirm misleads."""
+        self._write_main(_account("stranger@example.com"))
+        self.assertIsNone(cc.resolve_active())
+        self.assertEqual(self.live_file.read_text().strip(), "")
+
+    def test_the_cache_refreshes_without_the_gate(self) -> None:
+        """The WARNING case: auto off, no tick — `current` still corrects it."""
+        self.live_file.write_text("me\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cc.cmd_current(argparse.Namespace())
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_an_unchanged_name_is_not_rewritten(self) -> None:
+        cc.resolve_active()
+        before = self.live_file.stat().st_mtime_ns
+        cc.resolve_active()
+        self.assertEqual(self.live_file.stat().st_mtime_ns, before)
+
+    def test_the_statusline_prefers_the_live_file(self) -> None:
+        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        self.assertIn(".live", script)
+        live_pos = script.index("$PROFILES_DIR/.live")
+        active_pos = script.index("$PROFILES_DIR/.active")
+        self.assertLess(live_pos, active_pos)
+
+    def test_the_statusline_still_falls_back_to_the_marker(self) -> None:
+        """A profile set saved before this change has no `.live` yet."""
+        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        self.assertIn('[ -z "$ACCOUNT" ] && [ -r "$PROFILES_DIR/.active" ]', script)
+
+
+class TestJsonSpecialFloatsAreRejected(AutoBaseTest):
+    """"NaN" and "Infinity" are valid JSON floats to Python.
+
+    They pass `float()` without raising, so a try/except alone is not the
+    guard it looks like: infinity would treat a dead token as valid forever.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+
+    def _profile_with_expiry(self, value: object) -> None:
+        cc.save_profile("odd", _creds("token-odd"), _account("odd@x"))
+        path = self._profile_path("odd")
+        data = json.loads(path.read_text())
+        data["credentials"]["claudeAiOauth"]["expiresAt"] = value
+        path.write_text(json.dumps(data, indent=2))
+
+    def test_infinity_does_not_make_a_dead_token_valid(self) -> None:
+        self._profile_with_expiry(float("inf"))
+        with patch.object(cc, "oauth_refresh", side_effect=AssertionError("must not refresh")):
+            token, error, _ = cc.access_token_for("odd", "me")
+        self.assertIsNone(token)
+        self.assertEqual(error, "corrupted expiry")
+
+    def test_nan_does_not_trigger_a_refresh(self) -> None:
+        self._profile_with_expiry(float("nan"))
+        with patch.object(cc, "oauth_refresh", side_effect=AssertionError("must not refresh")):
+            token, error, _ = cc.access_token_for("odd", "me")
+        self.assertIsNone(token)
+        self.assertEqual(error, "corrupted expiry")
+
+    def test_the_json_text_forms_are_rejected_too(self) -> None:
+        """json.loads turns bare NaN/Infinity into the float, not a string."""
+        path = self._profile_path("odd")
+        cc.save_profile("odd", _creds("token-odd"), _account("odd@x"))
+        raw = path.read_text().replace('"expiresAt": 9999999999000', '"expiresAt": Infinity')
+        path.write_text(raw)
+        token, error, _ = cc.access_token_for("odd", "me")
+        self.assertIsNone(token)
+        self.assertEqual(error, "corrupted expiry")
+
+    def test_an_ordinary_expiry_still_works(self) -> None:
+        self._profile_with_expiry(int((NOW + DAY) * 1000))
+        with patch.object(cc, "time") as fake_time:
+            fake_time.time.return_value = NOW
+            token, error, _ = cc.access_token_for("odd", "me")
+        self.assertEqual((token, error), ("token-odd", None))
+
+
+class TestMalformedSnapshotsDoNotBreakTheGate(AutoBaseTest):
+    """The decision path needs the same tolerance the display path got.
+
+    `recompute_gate` runs on `auto on`, on every switch, and on a no-switch
+    tick — raising there takes all three down.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 40.0)
+        cc.save_profile("odd", _creds("token-odd"), _account("odd@x"))
+        path = self._profile_path("odd")
+        data = json.loads(path.read_text())
+        data["usage"] = {"five_hour": "nonsense", "seven_day": [1, 2]}
+        path.write_text(json.dumps(data, indent=2))
+        cc.write_active("me")
+
+    def test_the_reset_scan_skips_the_malformed_windows(self) -> None:
+        self.assertEqual(cc.earliest_future_reset(["odd"], NOW), 0.0)
+
+    def test_a_healthy_profile_beside_it_is_still_read(self) -> None:
+        self._save_with_usage("good", _creds("token-good"), _account("g@x"), 1.0, 1.0, _iso(NOW + HOUR))
+        self.assertEqual(cc.earliest_future_reset(["odd", "good"], NOW), NOW + HOUR)
+
+    def test_recompute_gate_survives(self) -> None:
+        cc.recompute_gate("me", NOW)
+        self.assertTrue(self.gate_file.exists())
+
+    def test_auto_on_survives(self) -> None:
+        with _silence():
+            rc = cc.cmd_auto(argparse.Namespace(action="on"))
+        self.assertEqual(rc, cc.EXIT_OK)
+        self.assertTrue(cc.auto_enabled())
+
+    def test_a_no_switch_tick_survives(self) -> None:
+        self._enable_auto()
+        self._save_with_usage("good", _creds("token-good"), _account("g@x"), 1.0, 39.0)
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 39.0))):
+            rc = cc.cmd_tick(self._tick_args(10.0, 40.0))
+        self.assertEqual(rc, cc.EXIT_OK)
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_a_switch_survives(self) -> None:
+        """The malformed profile is the only candidate, so it must be usable.
+
+        Its unreadable snapshot reads as "usage unknown", which ranks it as
+        free — the same treatment a profile with no snapshot gets, and the
+        live check is what actually decides.
+        """
+        self._enable_auto()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 1.0))):
+            cc.cmd_tick(self._tick_args(cc.EXIT_5H, 40.0))
+        self.assertEqual(cc.read_active(), "odd")
+
+    def test_a_malformed_snapshot_is_replaced_by_the_live_reading(self) -> None:
+        """Switching to it repairs the profile rather than leaving it broken."""
+        self._enable_auto()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(7.0, 8.0))):
+            cc.cmd_tick(self._tick_args(cc.EXIT_5H, 40.0))
+        repaired = json.loads(self._profile_path("odd").read_text())["usage"]
+        self.assertEqual(repaired["five_hour"]["utilization"], 7.0)
+        self.assertEqual(repaired["seven_day"]["utilization"], 8.0)
+
+
+class TestSwitchingRefreshesTheDisplayedAccount(AutoBaseTest):
+    """A switch must update `.live` itself, with nothing else running.
+
+    `_auto_backup_active` resolves (and caches) the account being left, so a
+    switch that only writes `.active` leaves the statusline showing the old
+    name. These read the file directly — calling `resolve_active()` first
+    would repair the cache and hide the defect.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 40.0)
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"), 5.0, 20.0)
+        cc.write_active("me")
+        cc.resolve_active()  # prime the cache with the pre-switch account
+        self.assertEqual(self.live_file.read_text().strip(), "me")
+
+    def test_manual_use_updates_the_cache(self) -> None:
+        with _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_an_automatic_switch_updates_the_cache(self) -> None:
+        self._enable_auto()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(5.0, 20.0))):
+            cc.cmd_tick(self._tick_args(cc.EXIT_5H, 40.0))
+        self.assertEqual(cc.read_active(), "vlad")
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_pick_updates_the_cache(self) -> None:
+        def _usage(token: str) -> tuple[int, object]:
+            return (200, _api_usage(10.0, 60.0)) if token == "token-me" else (200, _api_usage(5.0, 20.0))
+
+        with patch.object(cc, "fetch_usage", side_effect=_usage), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_the_statusline_would_name_the_new_account(self) -> None:
+        """End to end: the file the shell actually reads holds the new name."""
+        with _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        displayed = self.live_file.read_text().strip()
+        self.assertEqual(displayed, "vlad")
+        self.assertNotEqual(displayed, "me")
+
+
+class TestUnwritableLiveCacheIsNotSilentlyStale(AutoBaseTest):
+    """A cache that cannot be updated must not keep showing the old name.
+
+    `.live` wins over `.active` in the statusline, so a failed update would
+    leave the wrong account on display indefinitely. Removing it is the
+    honest outcome: the statusline falls back to `.active`, and the very next
+    successful resolve repopulates it.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-vlad"))
+        self._write_main(_account("vlad@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"))
+        cc.write_active("vlad")
+        self.live_file.write_text("me\n")  # a stale cached name
+
+    def test_a_failed_update_removes_the_stale_name(self) -> None:
+        with patch.object(cc, "write_text_file", return_value=False):
+            cc.resolve_active()
+        self.assertFalse(self.live_file.exists())
+
+    def test_the_statusline_then_falls_back_to_the_marker(self) -> None:
+        with patch.object(cc, "write_text_file", return_value=False):
+            cc.resolve_active()
+        # `.active` is what the shell reads next, and it names the right one.
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_a_successful_update_repopulates_it(self) -> None:
+        with patch.object(cc, "write_text_file", return_value=False):
+            cc.resolve_active()
+        self.assertEqual(cc.resolve_active(), "vlad")
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_an_already_absent_cache_is_not_an_error(self) -> None:
+        """Two processes can hit the same failure; the second finds it gone."""
+        self.live_file.unlink()
+        with patch.object(cc, "write_text_file", return_value=False):
+            cc.resolve_active()
+        self.assertFalse(self.live_file.exists())
+        self.assertNotIn("could not be cleared", self._log_text())
+
+    def test_an_unremovable_stale_cache_is_reported(self) -> None:
+        """Nothing else can be done, but it must not pass unnoticed."""
+        with (
+            patch.object(cc, "write_text_file", return_value=False),
+            patch.object(cc.Path, "unlink", side_effect=OSError("read-only")),
+        ):
+            cc.resolve_active()
+        self.assertIn("stale", self._log_text())
+
+
+class TestLoginExpiryIsVisible(AutoBaseTest):
+    """Every command that names an account says when its login runs out.
+
+    Knowing the date is what turns a surprise "Not logged in" into a planned
+    `claude` sign-in.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The live credentials carry the same expiry as the saved copy, as
+        # they do in reality; the active row reads the live one.
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW + 20 * DAY) * 1000)))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage(
+            "me", _creds("token-me", refresh_expires=int((NOW + 20 * DAY) * 1000)), _account("me@example.com")
+        )
+        self._save_with_usage(
+            "vlad", _creds("token-vlad", refresh_expires=int((NOW + 6 * HOUR) * 1000)), _account("vlad@example.com")
+        )
+        cc.write_active("me")
+
+    def _run(self, fn: object, args: argparse.Namespace) -> str:
+        out = io.StringIO()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 2.0))), contextlib.redirect_stdout(out):
+            fn(args)
+        return out.getvalue()
+
+    def test_current_shows_the_expiry(self) -> None:
+        text = self._run(cc.cmd_current, argparse.Namespace())
+        self.assertIn("me", text)
+        self.assertIn("login until", text)
+        self.assertIn(_dt.datetime.fromtimestamp(NOW + 20 * DAY).strftime("%d %b"), text)
+
+    def test_list_shows_it_for_every_profile(self) -> None:
+        text = self._run(cc.cmd_list, argparse.Namespace())
+        self.assertEqual(text.count("login until"), 2)
+
+    def test_usage_has_a_login_column(self) -> None:
+        text = self._run(cc.cmd_usage, argparse.Namespace(json=False))
+        self.assertIn("LOGIN UNTIL", text)
+        self.assertIn(_dt.datetime.fromtimestamp(NOW + 6 * HOUR).strftime("%d %b %H:%M"), text)
+
+    def test_usage_json_carries_the_raw_epoch(self) -> None:
+        """Machine-readable output gives the timestamp, not a rendered string."""
+        rows = {r["profile"]: r for r in json.loads(self._run(cc.cmd_usage, argparse.Namespace(json=True)))}
+        self.assertEqual(rows["me"]["login_expires_at"], NOW + 20 * DAY)
+        self.assertEqual(rows["vlad"]["login_expires_at"], NOW + 6 * HOUR)
+
+    def test_a_near_expiry_is_shown_in_hours(self) -> None:
+        text = self._run(cc.cmd_list, argparse.Namespace())
+        self.assertIn("(in 6h)", text)
+
+    def test_a_distant_expiry_is_shown_in_days(self) -> None:
+        text = self._run(cc.cmd_list, argparse.Namespace())
+        self.assertIn("(in 20d)", text)
+
+    def test_an_expired_login_says_so(self) -> None:
+        self._save_with_usage(
+            "dead", _creds("token-dead", refresh_expires=int((NOW - DAY) * 1000)), _account("d@x")
+        )
+        self.assertIn("EXPIRED", self._run(cc.cmd_list, argparse.Namespace()))
+
+    def test_an_unknown_expiry_says_unknown(self) -> None:
+        cc.save_profile("old", _creds("token-old"), _account("o@x"))  # no expiry field
+        self.assertIn("unknown", self._run(cc.cmd_list, argparse.Namespace()))
+
+
+class TestLenientStateReads(AutoBaseTest):
+    """`strict=False` has to survive damaged files, not just missing ones.
+
+    A half-written credentials or config file is exactly the situation the
+    non-strict callers exist to handle; exiting there would take down a tick
+    that was trying to escape that very account.
+    """
+
+    def test_damaged_credentials_return_none(self) -> None:
+        self.creds_file.write_text("{not json")
+        self._write_main(_account("me@example.com"))
+        self.assertIsNone(cc.read_current_state(strict=False))
+
+    def test_damaged_main_config_returns_none(self) -> None:
+        self._write_creds(_creds("token-me"))
+        self.main_file.write_text("{not json")
+        self.assertIsNone(cc.read_current_state(strict=False))
+
+    def test_a_non_object_main_config_returns_none(self) -> None:
+        self._write_creds(_creds("token-me"))
+        self.main_file.write_text("[1, 2, 3]")
+        self.assertIsNone(cc.read_current_state(strict=False))
+
+    def test_strict_still_exits_on_damage(self) -> None:
+        """The manual commands keep their loud failure."""
+        self._write_creds(_creds("token-me"))
+        self.main_file.write_text("{not json")
+        with self.assertRaises(SystemExit), _silence():
+            cc.read_current_state(strict=True)
+
+    def test_healthy_files_still_read(self) -> None:
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        state = cc.read_current_state(strict=False)
+        self.assertIsNotNone(state)
+        self.assertEqual(state[1]["emailAddress"], "me@example.com")
+
+
+class TestLoginExpiryHelpers(unittest.TestCase):
+    def test_reads_the_refresh_expiry(self) -> None:
+        data = {"credentials": _creds("t", refresh_expires=int((NOW + DAY) * 1000)), "oauthAccount": {}}
+        self.assertEqual(cc.profile_login_expiry(data), NOW + DAY)
+
+    def test_a_missing_field_is_unknown(self) -> None:
+        self.assertIsNone(cc.profile_login_expiry({"credentials": _creds("t")}))
+
+    def test_a_non_dict_profile_is_unknown(self) -> None:
+        self.assertIsNone(cc.profile_login_expiry("nonsense"))
+
+    def test_a_non_dict_credentials_block_is_unknown(self) -> None:
+        """A hand-edited profile must not break the listing for the others."""
+        self.assertIsNone(cc.profile_login_expiry({"credentials": "nonsense"}))
+
+    def test_a_non_dict_oauth_block_is_unknown(self) -> None:
+        self.assertIsNone(cc.profile_login_expiry({"credentials": {"claudeAiOauth": [1, 2]}}))
+
+    def test_a_non_finite_expiry_is_unknown(self) -> None:
+        data = {"credentials": {"claudeAiOauth": {"refreshTokenExpiresAt": float("inf")}}}
+        self.assertIsNone(cc.profile_login_expiry(data))
+
+    def test_formatting_unknown(self) -> None:
+        self.assertEqual(cc._fmt_login_expiry(None, NOW), "unknown")
+
+    def test_formatting_expired(self) -> None:
+        self.assertIn("EXPIRED", cc._fmt_login_expiry(NOW - 1, NOW))
+
+    def test_formatting_hours_under_two_days(self) -> None:
+        self.assertIn("(in 47h)", cc._fmt_login_expiry(NOW + 47 * HOUR, NOW))
+
+    def test_formatting_days_at_two_days_and_beyond(self) -> None:
+        self.assertIn("(in 2d)", cc._fmt_login_expiry(NOW + 48 * HOUR, NOW))
+
+    def test_the_date_itself_is_always_present(self) -> None:
+        rendered = cc._fmt_login_expiry(NOW + DAY, NOW)
+        self.assertIn(_dt.datetime.fromtimestamp(NOW + DAY).strftime("%d %b %H:%M"), rendered)
+
+
+class TestDeadLoginTriggersAnEvacuation(TickTestCase):
+    """An expired login is a reason to switch in its own right.
+
+    It is worse than an exhausted one: the session stops with "Not logged
+    in", and no usage figures are reported at all, so nothing in the limit
+    path would ever notice.
+    """
+
+    def _kill_the_live_login(self) -> None:
+        creds = _creds("token-me", refresh_expires=int((NOW - 1) * 1000))
+        self._write_creds(creds)
+
+    def test_an_expired_login_evacuates_without_any_usage(self) -> None:
+        self._kill_the_live_login()
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "vlad")
+        self.assertIn("live login unusable", self._log_text())
+
+    def test_missing_credentials_evacuate_too(self) -> None:
+        self.creds_file.unlink()
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_unreadable_credentials_evacuate_too(self) -> None:
+        self.creds_file.write_text("{not json")
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_credentials_without_a_refresh_token_evacuate(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": {"accessToken": "a"}}))
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_a_healthy_login_is_left_alone(self) -> None:
+        """Level usage, healthy login: no reason of any kind to move."""
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW + DAY) * 1000)))
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("v@x"), 5.0, 40.0)
+        with self._patch_usage(5.0, 40.0):
+            cc.cmd_tick(self._tick_args(10.0, 40.0))
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_an_unknown_expiry_is_not_treated_as_dead(self) -> None:
+        """Older saved logins have no expiry field; that is not evidence."""
+        self.assertIsNone(cc.live_credentials_dead(NOW))
+
+    def test_the_marker_profile_is_not_excluded_from_the_rescue(self) -> None:
+        """`.active` is a guess once there is no live email to match it against.
+
+        Excluding it hid the one profile whose saved copy still held a
+        working login: the tick reported no working account and backed off
+        while the fix sat in `me.json`.
+        """
+        self.creds_file.unlink()
+        self._profile_path("vlad").unlink()
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "me")
+        # "?" and not "me": with the credentials gone, nothing knew who was
+        # signed in — the marker is a guess the log must not launder as fact.
+        self.assertIn("switch ? -> me (expired)", self._log_text())
+
+    def test_the_rescue_restores_the_credentials_file(self) -> None:
+        self.creds_file.unlink()
+        self._profile_path("vlad").unlink()
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        live = json.loads(self.creds_file.read_text())
+        self.assertEqual(live["claudeAiOauth"]["accessToken"], "token-me")
+
+    def test_the_rescue_does_not_overwrite_the_profile_it_restores(self) -> None:
+        """There are no live credentials to back up; saving them would erase it."""
+        self.creds_file.unlink()
+        self._profile_path("vlad").unlink()
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        saved = json.loads(self._profile_path("me").read_text())
+        self.assertEqual(saved["credentials"]["claudeAiOauth"]["accessToken"], "token-me")
+
+    def test_the_marker_profile_is_confirmed_with_its_own_token(self) -> None:
+        """There is no live token to confirm with — that is the whole problem."""
+        self.creds_file.unlink()
+        self._profile_path("vlad").unlink()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(5.0, 20.0))) as fetch:
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        fetch.assert_called_once_with("token-me")
+
+    def test_the_live_account_is_still_never_refreshed(self) -> None:
+        """Email identity, not the marker, is what protects a running token."""
+        self._kill_the_live_login()
+        self._save_with_usage(
+            "me",
+            _creds("token-me", refresh_expires=int((NOW + DAY) * 1000)),
+            _account("me@example.com"),
+            1.0,
+            1.0,
+        )
+        with patch.object(cc, "oauth_refresh", side_effect=AssertionError("must not refresh")), \
+                self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_the_entry_bar_still_applies(self) -> None:
+        """A dead login is not a reason to move onto an exhausted account."""
+        self._kill_the_live_login()
+        with self._patch_usage(10.0, cc.ENTER_7D + 5):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_an_expired_login_beats_a_balance_veto(self) -> None:
+        """Level usage gives no balance reason — the dead login must still win."""
+        self._kill_the_live_login()
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("v@x"), 5.0, 40.0)
+        with self._patch_usage(5.0, 40.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_the_reason_is_recorded(self) -> None:
+        self._kill_the_live_login()
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertIn("(expired)", self._log_text())
+
+
+class TestRefreshExpiryValidation(unittest.TestCase):
+    """One definition of a usable expiry, because three had drifted apart."""
+
+    def _oauth(self, value: object) -> dict[str, object]:
+        return {"refreshToken": "r", "refreshTokenExpiresAt": value}
+
+    def test_an_ordinary_millisecond_timestamp(self) -> None:
+        self.assertEqual(cc.refresh_expiry_epoch(self._oauth(int(NOW * 1000))), NOW)
+
+    def test_a_float_timestamp(self) -> None:
+        self.assertEqual(cc.refresh_expiry_epoch(self._oauth(NOW * 1000)), NOW)
+
+    def test_true_is_rejected(self) -> None:
+        """JSON true is a Python int: it would read as epoch 0.001."""
+        self.assertIsNone(cc.refresh_expiry_epoch(self._oauth(True)))
+
+    def test_false_is_rejected(self) -> None:
+        self.assertIsNone(cc.refresh_expiry_epoch(self._oauth(False)))
+
+    def test_nan_is_rejected(self) -> None:
+        self.assertIsNone(cc.refresh_expiry_epoch(self._oauth(float("nan"))))
+
+    def test_infinity_is_rejected(self) -> None:
+        self.assertIsNone(cc.refresh_expiry_epoch(self._oauth(float("inf"))))
+
+    def test_a_huge_but_finite_value_is_rejected(self) -> None:
+        """1e300 passes every numeric check, then crashes fromtimestamp."""
+        self.assertIsNone(cc.refresh_expiry_epoch(self._oauth(1e300)))
+
+    def test_a_negative_value_is_rejected(self) -> None:
+        self.assertIsNone(cc.refresh_expiry_epoch(self._oauth(-1)))
+
+    def test_a_string_is_rejected(self) -> None:
+        self.assertIsNone(cc.refresh_expiry_epoch(self._oauth("soon")))
+
+    def test_a_missing_field_is_rejected(self) -> None:
+        self.assertIsNone(cc.refresh_expiry_epoch({"refreshToken": "r"}))
+
+    def test_a_non_dict_is_rejected(self) -> None:
+        self.assertIsNone(cc.refresh_expiry_epoch("nonsense"))
+
+    def test_the_upper_bound_is_formattable(self) -> None:
+        """Whatever passes must survive the display path."""
+        rendered = cc._fmt_login_expiry(cc.MAX_EPOCH, NOW)
+        self.assertIn("(in", rendered)
+
+
+class TestUnreadableBytesAreSurvivable(AutoBaseTest):
+    """Invalid UTF-8 raises UnicodeDecodeError, not a JSON error.
+
+    It is a ValueError, so catching only OSError/JSONDecodeError/TypeError
+    let it escape and crash the very callers that exist to tolerate damage.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+        cc.write_active("me")
+
+    def test_resolve_active_survives_invalid_bytes(self) -> None:
+        """No live email to match against, so the marker is all there is."""
+        self.creds_file.write_bytes(b"\xff\xfe not utf-8")
+        self._write_main(_account("me@example.com"))
+        self.assertEqual(cc.resolve_active(), "me")
+
+    def test_resolve_active_returns_nothing_without_a_marker(self) -> None:
+        self.creds_file.write_bytes(b"\xff\xfe not utf-8")
+        self._write_main(_account("me@example.com"))
+        self.active_file.unlink()
+        self.assertIsNone(cc.resolve_active())
+
+    def test_read_current_state_survives_invalid_bytes(self) -> None:
+        self.creds_file.write_bytes(b"\xff\xfe")
+        self._write_main(_account("me@example.com"))
+        self.assertIsNone(cc.read_current_state(strict=False))
+
+    def test_the_main_config_too(self) -> None:
+        self._write_creds(_creds("token-me"))
+        self.main_file.write_bytes(b"\xff\xfe")
+        self.assertIsNone(cc.read_current_state(strict=False))
+
+    def test_a_profile_with_invalid_bytes_is_skipped(self) -> None:
+        self._profile_path("odd").write_bytes(b"\xff\xfe")
+        self.assertIsNone(cc.load_profile_data("odd"))
+
+    def test_the_credentials_status_reports_it(self) -> None:
+        self.creds_file.write_bytes(b"\xff\xfe")
+        reason, deadline = cc.live_credentials_status(NOW)
+        self.assertEqual(reason, "unreadable credentials")
+        self.assertEqual(deadline, cc.DEADLINE_NOW)
+
+    def test_list_still_renders(self) -> None:
+        self._profile_path("odd").write_bytes(b"\xff\xfe")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_list(argparse.Namespace())
+        self.assertIn("me", out.getvalue())
+
+
+class TestStructureIsCheckedNotJustPresence(AutoBaseTest):
+    """A key being present says nothing about what is under it.
+
+    `{"claudeAiOauth": []}` passed a key check and then crashed the first
+    `.get` downstream — in `usage`, on the active account.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+        cc.write_active("me")
+
+    def test_a_list_under_the_oauth_key_is_rejected(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": []}))
+        self.assertIsNone(cc.read_current_state(strict=False))
+
+    def test_a_string_under_the_oauth_key_is_rejected(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": "nonsense"}))
+        self.assertIsNone(cc.read_current_state(strict=False))
+
+    def test_null_under_the_oauth_key_is_rejected(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": None}))
+        self.assertIsNone(cc.read_current_state(strict=False))
+
+    def test_usage_survives_it(self) -> None:
+        """The crash the reviewer traced: `usage` on the active account."""
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": []}))
+        out = io.StringIO()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 2.0))), contextlib.redirect_stdout(out):
+            rc = cc.cmd_usage(argparse.Namespace(json=False))
+        self.assertEqual(rc, cc.EXIT_OK)
+        self.assertIn("me", out.getvalue())
+
+    def test_the_access_token_lookup_reports_it(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": []}))
+        token, error, _ = cc.access_token_for("me", "me")
+        self.assertIsNone(token)
+        self.assertEqual(error, "no live credentials")
+
+    def test_it_counts_as_a_dead_login(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": []}))
+        self.assertEqual(cc.live_credentials_dead(NOW), "no refresh token")
+
+    def test_strict_mode_still_exits(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": []}))
+        with self.assertRaises(SystemExit), _silence():
+            cc.read_current_state(strict=True)
+
+    def test_a_healthy_object_still_reads(self) -> None:
+        self._write_creds(_creds("token-me"))
+        state = cc.read_current_state(strict=False)
+        self.assertIsNotNone(state)
+
+
+class TestTheEmailScanSkipsDamagedProfiles(AutoBaseTest):
+    """Resolving by email reads every profile; one bad file must not stop it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-vlad"))
+        self._write_main(_account("vlad@example.com"))
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"))
+
+    def test_invalid_utf8_in_another_profile_is_skipped(self) -> None:
+        self._profile_path("aaa").write_bytes(b"\xff\xfe")  # sorts before vlad
+        self.assertEqual(cc.resolve_active(), "vlad")
+
+    def test_the_email_reader_returns_none_for_it(self) -> None:
+        self._profile_path("aaa").write_bytes(b"\xff\xfe")
+        self.assertIsNone(cc._profile_email(self._profile_path("aaa")))
+
+    def test_list_still_renders_every_other_profile(self) -> None:
+        self._profile_path("aaa").write_bytes(b"\xff\xfe")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_list(argparse.Namespace())
+        self.assertIn("vlad", out.getvalue())
+
+    def test_current_still_answers(self) -> None:
+        self._profile_path("aaa").write_bytes(b"\xff\xfe")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_current(argparse.Namespace())
+        self.assertIn("vlad", out.getvalue())
+
+    def test_ranking_skips_it(self) -> None:
+        self._profile_path("aaa").write_bytes(b"\xff\xfe")
+        self.assertEqual([c.name for c in cc.rank_candidates(NOW, "vlad")], [])
+
+
+class TestOversizedIntegersAreMalformed(AutoBaseTest):
+    """An int beyond float range raises OverflowError, not ValueError."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+        cc.write_active("me")
+
+    def test_the_expiry_validator_rejects_it(self) -> None:
+        self.assertIsNone(cc.refresh_expiry_epoch({"refreshTokenExpiresAt": 10**400}))
+
+    def test_candidate_confirmation_skips_the_profile(self) -> None:
+        cc.save_profile("odd", _creds("token-odd"), _account("odd@x"))
+        path = self._profile_path("odd")
+        path.write_text(path.read_text().replace('"expiresAt": 9999999999000', f'"expiresAt": {10**400}'))
+        token, error, _ = cc.access_token_for("odd", "me")
+        self.assertIsNone(token)
+        self.assertEqual(error, "corrupted expiry")
+
+    def test_usage_still_reports_the_other_accounts(self) -> None:
+        cc.save_profile("odd", _creds("token-odd"), _account("odd@x"))
+        path = self._profile_path("odd")
+        path.write_text(path.read_text().replace('"expiresAt": 9999999999000', f'"expiresAt": {10**400}'))
+        out = io.StringIO()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 2.0))), contextlib.redirect_stdout(out):
+            cc.cmd_usage(argparse.Namespace(json=False))
+        self.assertIn("me", out.getvalue())
+
+    def test_list_renders_it_as_unknown(self) -> None:
+        cc.save_profile("odd", _creds("token-odd"), _account("odd@x"))
+        path = self._profile_path("odd")
+        data = path.read_text().replace('"expiresAt": 9999999999000', '"expiresAt": 9999999999000, "refreshTokenExpiresAt": ' + str(10**400))
+        path.write_text(data)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_list(argparse.Namespace())
+        self.assertIn("unknown", out.getvalue())
+
+
+class TestAccessTokenExpiryIsBounded(AutoBaseTest):
+    """An implausible `expiresAt` made a dead token look valid.
+
+    It was then sent to the API, and the 401 retired a profile that only
+    needed refreshing.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+        cc.write_active("me")
+
+    def _profile_with_access_expiry(self, value: object) -> None:
+        cc.save_profile("odd", _creds("token-odd"), _account("odd@x"))
+        path = self._profile_path("odd")
+        data = json.loads(path.read_text())
+        data["credentials"]["claudeAiOauth"]["expiresAt"] = value
+        path.write_text(json.dumps(data, indent=2))
+
+    def test_a_huge_finite_expiry_is_rejected(self) -> None:
+        self._profile_with_access_expiry(1e300)
+        token, error, _ = cc.access_token_for("odd", "me")
+        self.assertIsNone(token)
+        self.assertEqual(error, "corrupted expiry")
+
+    def test_the_stale_token_is_never_sent(self) -> None:
+        self._profile_with_access_expiry(1e300)
+        with patch.object(cc, "fetch_usage", side_effect=AssertionError("must not send")) as usage:
+            cc.confirm_candidate("odd", "me")
+        usage.assert_not_called()
+
+    def test_the_profile_is_not_retired(self) -> None:
+        """The damage this caused: a refreshable account marked authError."""
+        self._profile_with_access_expiry(1e300)
+        cc.confirm_candidate("odd", "me")
+        self.assertNotIn("authError", json.loads(self._profile_path("odd").read_text()))
+
+    def test_a_negative_expiry_is_rejected(self) -> None:
+        self._profile_with_access_expiry(-1)
+        token, error, _ = cc.access_token_for("odd", "me")
+        self.assertEqual((token, error), (None, "corrupted expiry"))
+
+    def test_an_ordinary_expiry_still_works(self) -> None:
+        self._profile_with_access_expiry(int((NOW + DAY) * 1000))
+        with patch.object(cc, "time") as fake_time:
+            fake_time.time.return_value = NOW
+            token, error, _ = cc.access_token_for("odd", "me")
+        self.assertEqual((token, error), ("token-odd", None))
+
+
+class TestActiveRowReportsTheLiveLogin(AutoBaseTest):
+    """Signing in again renews the live login but not the saved copy."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Live credentials: renewed. Saved profile: the old, expired copy.
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW + 30 * DAY) * 1000)))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage(
+            "me", _creds("token-me", refresh_expires=int((NOW - DAY) * 1000)), _account("me@example.com")
+        )
+        cc.write_active("me")
+
+    def _rows(self) -> dict[str, dict[str, object]]:
+        out = io.StringIO()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 2.0))), contextlib.redirect_stdout(out):
+            cc.cmd_usage(argparse.Namespace(json=True))
+        return {r["profile"]: r for r in json.loads(out.getvalue())}
+
+    def test_the_active_row_uses_the_live_expiry(self) -> None:
+        self.assertEqual(self._rows()["me"]["login_expires_at"], NOW + 30 * DAY)
+
+    def test_it_does_not_report_the_stale_saved_expiry(self) -> None:
+        """Otherwise `usage` tells the user a working login is expired."""
+        self.assertNotEqual(self._rows()["me"]["login_expires_at"], NOW - DAY)
+
+    def test_an_inactive_profile_still_uses_its_own(self) -> None:
+        self._save_with_usage(
+            "vlad", _creds("token-vlad", refresh_expires=int((NOW + DAY) * 1000)), _account("v@x")
+        )
+        self.assertEqual(self._rows()["vlad"]["login_expires_at"], NOW + DAY)
+
+    def test_the_table_shows_the_live_date(self) -> None:
+        out = io.StringIO()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 2.0))), contextlib.redirect_stdout(out):
+            cc.cmd_usage(argparse.Namespace(json=False))
+        self.assertIn(_dt.datetime.fromtimestamp(NOW + 30 * DAY).strftime("%d %b"), out.getvalue())
+        self.assertNotIn("EXPIRED", out.getvalue())
+
+
+class TestPythonAndTheShellAgreeOnAToken:
+    """Both sides must accept exactly the same values.
+
+    When Python called `refreshToken: 123` healthy and the shell called it
+    dead, every render woke a tick that then took the ordinary path and never
+    armed the retry pause — one background process per render, forever.
+    """
+
+    def test_a_real_token_is_usable(self) -> None:
+        assert cc.has_usable_refresh_token({"refreshToken": "r"})
+
+    def test_a_number_is_not_usable(self) -> None:
+        assert not cc.has_usable_refresh_token({"refreshToken": 123})
+
+    def test_true_is_not_usable(self) -> None:
+        assert not cc.has_usable_refresh_token({"refreshToken": True})
+
+    def test_an_empty_string_is_not_usable(self) -> None:
+        assert not cc.has_usable_refresh_token({"refreshToken": ""})
+
+    def test_null_is_not_usable(self) -> None:
+        assert not cc.has_usable_refresh_token({"refreshToken": None})
+
+    def test_a_missing_field_is_not_usable(self) -> None:
+        assert not cc.has_usable_refresh_token({})
+
+    def test_a_non_dict_is_not_usable(self) -> None:
+        assert not cc.has_usable_refresh_token("nonsense")
+
+
+class TestANumericTokenIsDeadEverywhere(TickTestCase):
+    """The divergence in its end-to-end form."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": 123}}))
+
+    def test_python_calls_it_dead(self) -> None:
+        self.assertEqual(cc.live_credentials_dead(NOW), "no refresh token")
+
+    def test_the_tick_evacuates_rather_than_looping(self) -> None:
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_with_nowhere_to_go_it_arms_the_pause(self) -> None:
+        """Without this the shell would wake a tick on every render.
+
+        Every saved copy has to be dead too — the marker's own profile is a
+        place to go, and the rescue takes it.
+        """
+        self._profile_path("vlad").unlink()
+        self._save_with_usage(
+            "me", _creds("token-me", refresh_expires=int((NOW - DAY) * 1000)), _account("me@example.com")
+        )
+        cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_epoch_file(self.settle_file), int(NOW + cc.RETRY_SECONDS))
+
+    def test_the_last_saved_copy_is_still_a_place_to_go(self) -> None:
+        """The marker names it, but the marker is not evidence of anything."""
+        self._profile_path("vlad").unlink()
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "me")
+        # The settle window after a switch, not the retry pause of a failure.
+        self.assertEqual(cc.read_epoch_file(self.settle_file), int(NOW + cc.SETTLE_SECONDS))
+
+
+class TestEveryCommandReportsTheLiveExpiry(AutoBaseTest):
+    """Signing in again renews the live login but not the saved copy.
+
+    The rule has to hold in `current`, `list` and `usage` alike — applying it
+    to one of them is what this class exists to prevent.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW + 30 * DAY) * 1000)))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage(
+            "me", _creds("token-me", refresh_expires=int((NOW - DAY) * 1000)), _account("me@example.com"), 10.0, 40.0
+        )
+        self._save_with_usage(
+            "vlad", _creds("token-vlad", refresh_expires=int((NOW + DAY) * 1000)), _account("v@x"), 5.0, 20.0
+        )
+        cc.write_active("me")
+        self.live_date = _dt.datetime.fromtimestamp(NOW + 30 * DAY).strftime("%d %b")
+
+    def _out(self, fn: object, args: argparse.Namespace) -> str:
+        buf = io.StringIO()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 2.0))), contextlib.redirect_stdout(buf):
+            fn(args)
+        return buf.getvalue()
+
+    @staticmethod
+    def _row(text: str, name: str) -> str:
+        """The line for one profile; the active marker shifts the columns."""
+        return next(ln for ln in text.splitlines() if name in ln.split()[:2])
+
+    def test_current_reports_the_live_expiry(self) -> None:
+        text = self._out(cc.cmd_current, argparse.Namespace())
+        self.assertIn(self.live_date, text)
+        self.assertNotIn("EXPIRED", text)
+
+    def test_list_reports_the_live_expiry(self) -> None:
+        text = self._out(cc.cmd_list, argparse.Namespace())
+        self.assertIn(self.live_date, text)
+        self.assertNotIn("EXPIRED", text)
+
+    def test_usage_reports_the_live_expiry(self) -> None:
+        text = self._out(cc.cmd_usage, argparse.Namespace(json=False))
+        self.assertIn(self.live_date, text)
+
+    def test_usage_fetches_live_limits_for_the_active_account(self) -> None:
+        """A stale saved expiry must not downgrade it to stored numbers."""
+        text = self._out(cc.cmd_usage, argparse.Namespace(json=False))
+        me_row = next(ln for ln in text.splitlines() if " me " in ln)
+        self.assertIn("active", me_row)
+        self.assertNotIn("(stored)", me_row)
+        self.assertNotIn("refresh token expired", me_row)
+
+    def test_the_helper_agrees_for_the_active_account(self) -> None:
+        self.assertEqual(cc.login_status_for("me", "me", NOW)[1], NOW + 30 * DAY)
+
+    def test_the_helper_uses_the_saved_copy_for_the_others(self) -> None:
+        self.assertEqual(cc.login_status_for("vlad", "me", NOW)[1], NOW + DAY)
+
+    def test_list_does_not_call_the_live_login_dead(self) -> None:
+        """The date and the verdict have to come from the same copy.
+
+        Reading one from the live credentials and the other from the saved
+        profile printed a future "login until" beside `! refresh token
+        expired` — the exact state of anyone who has just signed in again.
+        """
+        me_row = self._row(self._out(cc.cmd_list, argparse.Namespace()), "me")
+        self.assertIn(self.live_date, me_row)
+        self.assertNotIn("refresh token expired", me_row)
+
+    def test_current_does_not_call_the_live_login_dead(self) -> None:
+        text = self._out(cc.cmd_current, argparse.Namespace())
+        self.assertIn(self.live_date, text)
+        self.assertNotIn("refresh token expired", text)
+
+    def test_usage_does_not_call_the_live_login_dead(self) -> None:
+        me_row = self._row(self._out(cc.cmd_usage, argparse.Namespace(json=False)), "me")
+        self.assertIn("active", me_row)
+        self.assertNotIn("refresh token expired", me_row)
+
+    def test_the_others_are_still_judged_by_their_saved_copy(self) -> None:
+        """The rule is "use the live copy for the live account", not "excuse all"."""
+        vlad_row = self._row(self._out(cc.cmd_list, argparse.Namespace()), "vlad")
+        self.assertIn("login expires in 24h", vlad_row)
+
+    def test_an_inactive_dead_profile_is_named_not_just_dated(self) -> None:
+        self._save_with_usage(
+            "dead", _creds("token-dead", refresh_expires=int((NOW - DAY) * 1000)), _account("d@x")
+        )
+        dead_row = self._row(self._out(cc.cmd_list, argparse.Namespace()), "dead")
+        self.assertIn("! refresh token expired", dead_row)
+
+    def test_an_inactive_expired_profile_is_still_flagged(self) -> None:
+        """The rule must not blanket-excuse every profile."""
+        self._save_with_usage(
+            "old", _creds("token-old", refresh_expires=int((NOW - DAY) * 1000)), _account("o@x")
+        )
+        self.assertIn("EXPIRED", self._out(cc.cmd_list, argparse.Namespace()))
+
+
+class TestTheWarningWindowFollowsTheLiveLogin(AutoBaseTest):
+    """"Expires soon" is the same question as "expired", one step earlier."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW + 6 * HOUR) * 1000)))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage(
+            "me",
+            _creds("token-me", refresh_expires=int((NOW + 30 * DAY) * 1000)),
+            _account("me@example.com"),
+            10.0,
+            40.0,
+        )
+        cc.write_active("me")
+
+    def test_the_live_login_raises_the_warning(self) -> None:
+        """The saved copy says a month; only the live one is running out."""
+        self.assertIn("login expires in 6h", _note("me", "me"))
+
+    def test_the_saved_copy_alone_stays_quiet(self) -> None:
+        self.assertEqual(_note("me", None), "")
+
+    def test_list_shows_the_warning(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_list(argparse.Namespace())
+        self.assertIn("login expires in 6h", out.getvalue())
+
+
+class TestUnknownLoginExpiryIsNotInvented(AutoBaseTest):
+    """The sentinel deadline is a signal to the shell, not a date.
+
+    Formatting it produced "01 Jan 00:00 (EXPIRED)" — a fabricated moment
+    presented to the user as fact.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+        cc.write_active("me")
+
+    def test_missing_credentials_report_unknown(self) -> None:
+        self.assertIsNone(cc.login_status_for("me", "me", NOW)[1])
+
+    def test_damaged_credentials_report_unknown(self) -> None:
+        self.creds_file.write_text("{not json")
+        self.assertIsNone(cc.login_status_for("me", "me", NOW)[1])
+
+    def test_credentials_without_a_token_report_unknown(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": {"accessToken": "a"}}))
+        self.assertIsNone(cc.login_status_for("me", "me", NOW)[1])
+
+    def test_current_says_unknown_rather_than_a_date(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_current(argparse.Namespace())
+        self.assertIn("unknown", out.getvalue())
+        self.assertNotIn("01 Jan", out.getvalue())
+
+    def test_list_says_unknown_rather_than_a_date(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_list(argparse.Namespace())
+        self.assertIn("unknown", out.getvalue())
+        self.assertNotIn("01 Jan", out.getvalue())
+
+    def test_list_names_why_the_live_login_is_unusable(self) -> None:
+        """"unknown" alone leaves the user with no idea what to do."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_list(argparse.Namespace())
+        self.assertIn("! no credentials", out.getvalue())
+
+    def test_current_names_why_the_live_login_is_unusable(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_current(argparse.Namespace())
+        self.assertIn("! no credentials", out.getvalue())
+
+    def test_usage_reports_the_live_reason_without_fetching(self) -> None:
+        """Asking the API with a dead login only turns it into an HTTP error."""
+        out = io.StringIO()
+        with patch.object(cc, "fetch_usage", side_effect=AssertionError("must not fetch")):
+            with contextlib.redirect_stdout(out):
+                cc.cmd_usage(argparse.Namespace(json=False))
+        self.assertIn("no credentials", out.getvalue())
+
+    def test_the_sentinel_never_reaches_formatting(self) -> None:
+        """Whatever the status reports, no caller may render the sentinel."""
+        self.assertIn("EXPIRED", cc._fmt_login_expiry(cc.DEADLINE_NOW, NOW))
+        self.assertIsNone(cc.login_status_for("me", "me", NOW)[1])
+
+    def test_a_healthy_login_still_reports_its_date(self) -> None:
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW + DAY) * 1000)))
+        self.assertEqual(cc.login_status_for("me", "me", NOW)[1], NOW + DAY)
+
+
+class TestTheTwoAccountFilesNeverDisagree(AutoBaseTest):
+    """A half-applied switch is worse than a refused one.
+
+    The credentials and the account object must describe the same login; a
+    mismatch is a state nothing in the tool knows how to interpret.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 40.0)
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"), 5.0, 20.0)
+        cc.write_active("me")
+
+    def _fail_the_second_write(self) -> object:
+        real = cc.atomic_write_json
+
+        def _inner(path: Path, data: dict, indent: int, trailing_nl: bool) -> None:
+            if path == self.main_file:
+                raise SystemExit(2)
+            real(path, data, indent, trailing_nl)
+
+        return patch.object(cc, "atomic_write_json", _inner)
+
+    def test_the_credentials_are_rolled_back(self) -> None:
+        with self._fail_the_second_write(), self.assertRaises(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        creds = json.loads(self.creds_file.read_text())
+        self.assertEqual(creds["claudeAiOauth"]["accessToken"], "token-me")
+
+    def test_the_two_files_still_agree(self) -> None:
+        with self._fail_the_second_write(), self.assertRaises(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(json.loads(self.main_file.read_text())["oauthAccount"]["emailAddress"], "me@example.com")
+        self.assertEqual(cc.resolve_active(), "me")
+
+    def test_damaged_outgoing_credentials_are_removed_not_mismatched(self) -> None:
+        """With nothing to restore, the coherent outcome is no credentials.
+
+        That is a dead login, which the tool already escapes from — unlike a
+        credentials file paired with somebody else's account object.
+        """
+        self.creds_file.write_text("{not json")
+        with self._fail_the_second_write(), self.assertRaises(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.creds_file.exists())
+        self.assertEqual(json.loads(self.main_file.read_text())["oauthAccount"]["emailAddress"], "me@example.com")
+
+    def test_that_state_is_recognised_as_a_dead_login(self) -> None:
+        self.creds_file.write_text("{not json")
+        with self._fail_the_second_write(), self.assertRaises(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(cc.live_credentials_dead(NOW), "no credentials")
+
+    def _fail_every_credentials_write(self) -> object:
+        """The disk that broke the first write can break the rollback too."""
+        real = cc.atomic_write_json
+
+        def _inner(path: Path, data: dict, indent: int, trailing_nl: bool) -> None:
+            if path == self.main_file:
+                raise SystemExit(2)
+            if path == self.creds_file and data.get("claudeAiOauth", {}).get("accessToken") == "token-me":
+                raise OSError(28, "No space left on device")
+            real(path, data, indent, trailing_nl)
+
+        return patch.object(cc, "atomic_write_json", _inner)
+
+    def test_a_failed_rollback_removes_the_credentials(self) -> None:
+        """Restoring can fail in its own right; a mismatched pair may not stand."""
+        with self._fail_every_credentials_write(), self.assertRaises(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertFalse(self.creds_file.exists())
+        self.assertEqual(json.loads(self.main_file.read_text())["oauthAccount"]["emailAddress"], "me@example.com")
+
+    def test_a_failed_rollback_leaves_a_state_the_tool_escapes_from(self) -> None:
+        with self._fail_every_credentials_write(), self.assertRaises(SystemExit), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(cc.live_credentials_dead(NOW), "no credentials")
+
+    def test_a_removal_that_also_fails_is_surfaced(self) -> None:
+        """Silence here would leave exactly the pair this all exists to prevent."""
+        with self._fail_every_credentials_write(), patch.object(
+            Path, "unlink", side_effect=OSError(30, "Read-only file system")
+        ), self.assertRaises(OSError), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+
+    def test_an_unexpected_error_rolls_back_too(self) -> None:
+        real = cc.atomic_write_json
+
+        def _inner(path: Path, data: dict, indent: int, trailing_nl: bool) -> None:
+            if path == self.main_file:
+                raise RuntimeError("disk gremlin")
+            real(path, data, indent, trailing_nl)
+
+        with patch.object(cc, "atomic_write_json", _inner), self.assertRaises(RuntimeError), _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(json.loads(self.creds_file.read_text())["claudeAiOauth"]["accessToken"], "token-me")
+
+    def test_a_successful_switch_writes_both(self) -> None:
+        with _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(json.loads(self.creds_file.read_text())["claudeAiOauth"]["accessToken"], "token-vlad")
+        self.assertEqual(json.loads(self.main_file.read_text())["oauthAccount"]["emailAddress"], "vlad@example.com")
+
+
+class TestRankingTreatsUnusableExpiriesConsistently(AutoBaseTest):
+    """`profile_unusable_reason` was a fourth copy of the same check.
+
+    It read `refreshTokenExpiresAt: true` as epoch 0.001 and dropped an
+    otherwise usable account from the pool as "expired".
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 10.0, 40.0)
+        cc.write_active("me")
+
+    def _candidate_with_expiry(self, value: object) -> None:
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("v@x"), 5.0, 20.0)
+        path = self._profile_path("vlad")
+        data = json.loads(path.read_text())
+        data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] = value
+        path.write_text(json.dumps(data, indent=2))
+
+    def test_a_boolean_expiry_does_not_retire_the_profile(self) -> None:
+        self._candidate_with_expiry(True)
+        data = cc.load_profile_data("vlad")
+        self.assertIsNone(cc.profile_unusable_reason(data, NOW))
+
+    def test_a_huge_expiry_does_not_retire_the_profile(self) -> None:
+        self._candidate_with_expiry(1e300)
+        self.assertIsNone(cc.profile_unusable_reason(cc.load_profile_data("vlad"), NOW))
+
+    def test_such_a_profile_is_still_rankable(self) -> None:
+        self._candidate_with_expiry(True)
+        self.assertEqual([c.name for c in cc.rank_candidates(NOW, "me")], ["vlad"])
+
+    def test_a_genuinely_expired_profile_is_still_retired(self) -> None:
+        self._candidate_with_expiry(int((NOW - 1) * 1000))
+        self.assertEqual(cc.profile_unusable_reason(cc.load_profile_data("vlad"), NOW), "refresh token expired")
+
+
+class TestMalformedExpiryNeverCrashesTheDisplay(AutoBaseTest):
+    """`list` and `usage` must survive any value a profile can hold."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+        cc.write_active("me")
+
+    def _profile_with(self, value: object) -> None:
+        cc.save_profile("odd", _creds("token-odd"), _account("odd@x"))
+        path = self._profile_path("odd")
+        data = json.loads(path.read_text())
+        data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] = value
+        path.write_text(json.dumps(data, indent=2))
+
+    def _list_output(self) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_list(argparse.Namespace())
+        return out.getvalue()
+
+    def _usage_output(self) -> str:
+        out = io.StringIO()
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(1.0, 2.0))), contextlib.redirect_stdout(out):
+            cc.cmd_usage(argparse.Namespace(json=False))
+        return out.getvalue()
+
+    def test_list_survives_a_huge_expiry(self) -> None:
+        self._profile_with(1e300)
+        self.assertIn("unknown", self._list_output())
+
+    def test_usage_survives_a_huge_expiry(self) -> None:
+        self._profile_with(1e300)
+        self.assertIn("unknown", self._usage_output())
+
+    def test_list_survives_a_boolean_expiry(self) -> None:
+        self._profile_with(True)
+        self.assertIn("unknown", self._list_output())
+
+    def test_list_survives_a_negative_expiry(self) -> None:
+        self._profile_with(-5)
+        self.assertIn("unknown", self._list_output())
+
+    def test_current_survives_a_huge_expiry(self) -> None:
+        cc.save_profile("me", _creds("token-me"), _account("me@example.com"))
+        path = self._profile_path("me")
+        data = json.loads(path.read_text())
+        data["credentials"]["claudeAiOauth"]["refreshTokenExpiresAt"] = 1e300
+        path.write_text(json.dumps(data, indent=2))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_current(argparse.Namespace())
+        self.assertIn("unknown", out.getvalue())
+
+    def test_a_boolean_expiry_does_not_evacuate_a_working_login(self) -> None:
+        """The worst outcome: a healthy account abandoned over a typo."""
+        self.creds_file.write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", "refreshTokenExpiresAt": True}})
+        )
+        self.assertIsNone(cc.live_credentials_dead(NOW))
+
+    def test_a_huge_expiry_does_not_evacuate_a_working_login(self) -> None:
+        self.creds_file.write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", "refreshTokenExpiresAt": 1e300}})
+        )
+        self.assertIsNone(cc.live_credentials_dead(NOW))
+
+
+class TestLiveCredentialsDeadEdgeCases(AutoBaseTest):
+    """`live_credentials_dead` decides whether a session can run at all.
+
+    A wrong "dead" here evacuates a perfectly good account; a wrong "alive"
+    strands the session. Both directions are pinned, including the JSON
+    special floats that parse without raising.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_main(_account("me@example.com"))
+
+    def _write_expiry(self, value: object) -> None:
+        self.creds_file.write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", "refreshTokenExpiresAt": value}})
+        )
+
+    def test_a_nan_expiry_is_not_treated_as_dead(self) -> None:
+        """NaN loses every comparison, so it must not decide anything."""
+        self._write_expiry(float("nan"))
+        self.assertIsNone(cc.live_credentials_dead(NOW))
+
+    def test_an_infinite_expiry_is_not_treated_as_dead(self) -> None:
+        self._write_expiry(float("inf"))
+        self.assertIsNone(cc.live_credentials_dead(NOW))
+
+    def test_a_negative_infinite_expiry_is_not_treated_as_dead(self) -> None:
+        self._write_expiry(float("-inf"))
+        self.assertIsNone(cc.live_credentials_dead(NOW))
+
+    def test_a_string_expiry_is_not_treated_as_dead(self) -> None:
+        self._write_expiry("soon")
+        self.assertIsNone(cc.live_credentials_dead(NOW))
+
+    def test_an_expiry_exactly_now_is_dead(self) -> None:
+        self._write_expiry(int(NOW * 1000))
+        self.assertEqual(cc.live_credentials_dead(NOW), "login expired")
+
+    def test_an_expiry_one_second_ahead_is_alive(self) -> None:
+        self._write_expiry(int((NOW + 1) * 1000))
+        self.assertIsNone(cc.live_credentials_dead(NOW))
+
+    def test_a_missing_file_is_dead(self) -> None:
+        self.assertEqual(cc.live_credentials_dead(NOW), "no credentials")
+
+    def test_a_damaged_file_is_dead(self) -> None:
+        self.creds_file.write_text("{not json")
+        self.assertEqual(cc.live_credentials_dead(NOW), "unreadable credentials")
+
+    def test_a_non_object_file_is_dead(self) -> None:
+        self.creds_file.write_text("[1, 2]")
+        self.assertEqual(cc.live_credentials_dead(NOW), "unreadable credentials")
+
+    def test_credentials_without_a_refresh_token_are_dead(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": {"accessToken": "a"}}))
+        self.assertEqual(cc.live_credentials_dead(NOW), "no refresh token")
+
+    def test_a_non_dict_oauth_block_is_dead(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": "nonsense"}))
+        self.assertEqual(cc.live_credentials_dead(NOW), "no refresh token")
+
+
+class TestAnExhaustionDeadlineDoesNotTrapADeadLogin(TickTestCase):
+    """Being at a limit is no reason to stay logged out.
+
+    `.exhausted` records when the accounts were all full, and it can be days
+    out. A dead login outranks limits everywhere else in the decision, but
+    the pre-lock deadline check ran first and returned before that ordering
+    was ever consulted.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        cc.write_epoch_file(self.exhausted_file, NOW + 3 * DAY)
+
+    def test_a_dead_login_still_evacuates(self) -> None:
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW - 1) * 1000)))
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_missing_credentials_still_evacuate(self) -> None:
+        self.creds_file.unlink()
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_a_healthy_login_is_still_held_back(self) -> None:
+        """The deadline keeps doing its job for the case it was written for."""
+        with self._patch_usage(1.0, 1.0):
+            cc.cmd_tick(self._tick_args(99.0, 99.0))
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_the_settle_window_still_holds_a_dead_login(self) -> None:
+        """That barrier stops a switch undoing itself; it is not a limit."""
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW - 1) * 1000)))
+        cc.write_epoch_file(self.settle_file, NOW + 30)
+        with self._patch_usage(5.0, 20.0):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_with_nowhere_to_go_it_still_backs_off(self) -> None:
+        """No spin: the retry pause replaces the deadline that was bypassed."""
+        self.creds_file.unlink()
+        self._profile_path("vlad").unlink()
+        self._save_with_usage(
+            "me", _creds("token-me", refresh_expires=int((NOW - DAY) * 1000)), _account("me@example.com")
+        )
+        cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_epoch_file(self.settle_file), int(NOW + cc.RETRY_SECONDS))
+
+
+class TestDeadLoginBacksOffWhenTrapped(TickTestCase):
+    """A dead login with nowhere to go must not spawn a tick per render.
+
+    The login deadline is already in the past, so without a pause the
+    statusline would relaunch cc-switch on every single render — network
+    checks and all — for as long as the situation lasts.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW - 1) * 1000)))
+
+    def test_a_pause_is_armed_when_no_candidate_works(self) -> None:
+        with patch.object(cc, "fetch_usage", return_value=(0, {"error": "offline"})):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_epoch_file(self.settle_file), int(NOW + cc.RETRY_SECONDS))
+
+    def test_a_pause_is_armed_when_every_candidate_is_full(self) -> None:
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(10.0, cc.ENTER_7D + 5))):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "me")
+        self.assertEqual(cc.read_epoch_file(self.settle_file), int(NOW + cc.RETRY_SECONDS))
+
+    def test_the_reason_is_logged(self) -> None:
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(10.0, cc.ENTER_7D + 5))):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertIn("no working account to escape to", self._log_text())
+
+    def test_no_exhaustion_deadline_is_written(self) -> None:
+        """A dead login is not evidence that the other accounts are spent."""
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(10.0, cc.ENTER_7D + 5))):
+            cc.cmd_tick(self._tick_args(0.0, 0.0, _iso(NOW + DAY), _iso(NOW + DAY)))
+        self.assertFalse(self.exhausted_file.exists())
+
+    def test_the_pause_blocks_the_immediate_next_tick(self) -> None:
+        """The point of the back-off: the next render costs nothing."""
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(10.0, cc.ENTER_7D + 5))):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        armed = cc.read_epoch_file(self.settle_file)
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(5.0, 20.0))) as usage:
+            rc = cc.cmd_tick(self._tick_args(0.0, 0.0))
+        usage.assert_not_called()
+        self.assertEqual(rc, cc.EXIT_OK)
+        self.assertEqual(cc.read_active(), "me")
+        self.assertEqual(cc.read_epoch_file(self.settle_file), armed)
+
+    def test_a_working_candidate_still_wins_immediately(self) -> None:
+        """The back-off must not delay a rescue that is actually available."""
+        with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(5.0, 20.0))):
+            cc.cmd_tick(self._tick_args(0.0, 0.0))
+        self.assertEqual(cc.read_active(), "vlad")
+
+
+class TestSwitchReasonRanking(unittest.TestCase):
+    def test_expired_outranks_everything(self) -> None:
+        self.assertEqual(cc.switch_reason(1.0, 1.0, 1.0, expired=True), "expired")
+
+    def test_expired_outranks_a_limit(self) -> None:
+        self.assertEqual(cc.switch_reason(cc.EXIT_5H, 10.0, 5.0, expired=True), "expired")
+
+    def test_without_the_flag_the_old_order_holds(self) -> None:
+        self.assertEqual(cc.switch_reason(cc.EXIT_5H, 10.0, 5.0), "limit")
+        self.assertIsNone(cc.switch_reason(1.0, 1.0, 1.0))
+
+
+class TestGateCarriesTheLoginDeadline(AutoBaseTest):
+    """The only trigger that can fire once no usage is reported."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+        cc.write_active("me")
+
+    def test_the_deadline_is_written(self) -> None:
+        self._write_creds(_creds("token-me", refresh_expires=int((NOW + DAY) * 1000)))
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(int(self.gate_file.read_text().split()[4]), int(NOW + DAY))
+
+    def test_an_unknown_deadline_is_zero(self) -> None:
+        """A login saved before expiries were recorded: nothing to go on."""
+        self._write_creds(_creds("token-me"))  # no refreshTokenExpiresAt
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(int(self.gate_file.read_text().split()[4]), 0)
+
+    def test_missing_credentials_give_a_past_deadline(self) -> None:
+        """Damaged is not unknown: it is a reason to act, not to wait."""
+        cc.recompute_gate("me", NOW)
+        deadline = int(self.gate_file.read_text().split()[4])
+        self.assertEqual(deadline, int(cc.DEADLINE_NOW))
+        self.assertLess(deadline, NOW)
+
+    def test_unreadable_credentials_give_a_past_deadline(self) -> None:
+        """The shell cannot parse JSON — this is how it learns to wake a tick."""
+        self.creds_file.write_text("{not json")
+        self.assertEqual(cc.live_login_deadline(), cc.DEADLINE_NOW)
+
+    def test_credentials_without_a_refresh_token_give_a_past_deadline(self) -> None:
+        self.creds_file.write_text(json.dumps({"claudeAiOauth": {"accessToken": "a"}}))
+        self.assertEqual(cc.live_login_deadline(), cc.DEADLINE_NOW)
+
+    def test_a_non_finite_deadline_is_zero(self) -> None:
+        """Readable credentials with a nonsense expiry: unknown, not damaged."""
+        self.creds_file.write_text(
+            json.dumps({"claudeAiOauth": {"refreshToken": "r", "refreshTokenExpiresAt": float("inf")}})
+        )
+        self.assertEqual(cc.live_login_deadline(), 0.0)
+
+    def test_an_out_of_range_deadline_is_zero(self) -> None:
+        self.creds_file.write_text(
+            json.dumps({"claudeAiOauth": {"refreshToken": "r", "refreshTokenExpiresAt": 1e300}})
+        )
+        self.assertEqual(cc.live_login_deadline(), 0.0)
+
+    def test_a_boolean_deadline_is_zero(self) -> None:
+        """JSON true is a Python int; epoch 0.001 would look long expired."""
+        self.creds_file.write_text(
+            json.dumps({"claudeAiOauth": {"refreshToken": "r", "refreshTokenExpiresAt": True}})
+        )
+        self.assertEqual(cc.live_login_deadline(), 0.0)
+
+    def test_the_statusline_wakes_a_tick_past_the_deadline(self) -> None:
+        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        self.assertIn("LOGIN_DEADLINE", script)
+        self.assertIn('tick --5h 0 --7d 0', script)
+
+    def test_the_statusline_reads_the_fifth_field(self) -> None:
+        """Behaviour lives in tests/test_statusline.py; this pins the shape.
+
+        Both reads must name a trailing variable, because `read` folds every
+        unconsumed field into the last one — which is how adding this fifth
+        field silently broke every percentage comparison.
+        """
+        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        self.assertIn("LOGIN_DEADLINE GATE_SETTLE _REST < \"$PROFILES_DIR/.gate\"", script)
+        self.assertIn("T7D _REST < \"$PROFILES_DIR/.gate\"", script)
+
+    def test_the_statusline_also_notices_missing_credentials(self) -> None:
+        """A deleted credentials file has no deadline to wait for."""
+        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        self.assertIn('if [ ! -r "$CREDS_FILE" ]; then', script)
+        self.assertIn("DEAD=1", script)
+
+    def test_the_statusline_notices_damaged_credentials(self) -> None:
+        """Corrupted after the deadline was recorded: neither test would fire.
+
+        The shell cannot parse JSON, but the field that decides everything is
+        a plain substring, and both `read` and `case` are builtins.
+        """
+        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        self.assertIn('IFS= read -r -d "" CREDS_BLOB < "$CREDS_FILE"', script)
+        # The quote and colon are the point: `refreshTokenExpiresAt` contains
+        # `refreshToken`, so the looser pattern called a dead file alive.
+        self.assertIn("*'\"refreshToken\":\"'*", script)
+        self.assertIn("*'\"refreshToken\":\"\"'*", script)
+        # Matched against the compacted copy, so one spelling covers every
+        # amount of whitespace JSON allows around the colon.
+        self.assertIn("COMPACT=${CREDS_BLOB//[[:space:]]/}", script)
+        self.assertNotIn('*\'"refreshToken": "\'*', script)
+
+    def test_only_one_tick_is_spawned_per_render(self) -> None:
+        """A dead login with a stale usage payload once matched both gates."""
+        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        self.assertIn('[ -z "$SPAWNED_DEAD" ]', script)
+        self.assertIn("SPAWNED_DEAD=1", script)
+
+    def test_the_dead_login_spawn_respects_the_settle_window(self) -> None:
+        """Otherwise a dead login with nowhere to go spawns on every render."""
+        script = (Path(cc.__file__).parent / "statusline-command.sh").read_text()
+        self.assertIn('[ "$NOW" -ge "${GATE_SETTLE:-0}" ]', script)
+
+
+class TestCacheWriteLosesToAConcurrentSwitch(AutoBaseTest):
+    """An unlocked reader must not overwrite the cache a switch just wrote.
+
+    `current` and `list` resolve without the lock. If a switch completes in
+    between, the reader's answer is already obsolete — writing it would leave
+    the statusline naming the old account until something resolved again.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"))
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"))
+        cc.write_active("me")
+
+    def _switch_happens_now(self) -> None:
+        """Simulate another process completing a switch to vlad."""
+        self._write_creds(_creds("token-vlad"))
+        self._write_main(_account("vlad@example.com"))
+        cc.write_active("vlad")
+        self.live_file.write_text("vlad\n")
+
+    def test_a_stale_answer_is_not_written(self) -> None:
+        original = cc._resolve_active_uncached
+
+        def _resolve_then_switch() -> str | None:
+            answer = original()
+            self._switch_happens_now()
+            return answer
+
+        with patch.object(cc, "_resolve_active_uncached", _resolve_then_switch):
+            cc.resolve_active()
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_an_uncontended_answer_is_written(self) -> None:
+        """The guard must not block the ordinary path."""
+        cc.resolve_active()
+        self.assertEqual(self.live_file.read_text().strip(), "me")
+
+    def test_a_switch_of_its_own_still_updates_the_cache(self) -> None:
+        with _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_a_switch_landing_mid_write_is_repaired(self) -> None:
+        """The pre-write check narrows the race; this closes what is left.
+
+        The switch lands *during* the reader's write, so the reader's stale
+        value ("me") is what hits disk last. Only the post-write check can
+        put the live account back into a file the statusline prefers over
+        `.active`.
+        """
+        original = cc.write_text_file
+        switched: list[bool] = []
+
+        def _switch_mid_write(path: object, text: str, fatal: bool = True) -> bool:
+            if path == self.live_file and not switched:
+                switched.append(True)
+                self._switch_happens_now()  # writes "vlad"
+            return original(path, text, fatal=fatal)  # then the stale "me" lands
+
+        with patch.object(cc, "write_text_file", _switch_mid_write):
+            cc.resolve_active()
+        self.assertTrue(switched, "the race was never triggered")
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_invalid_bytes_in_the_cache_do_not_crash_a_switch(self) -> None:
+        """UnicodeDecodeError is a ValueError, not an OSError.
+
+        Crashing here would report failure after the credentials had already
+        been swapped — the switch happened, the command says it did not.
+        """
+        self.live_file.write_bytes(b"\xff\xfe")
+        with _silence():
+            cc.cmd_use(argparse.Namespace(name="vlad"))
+        self.assertEqual(cc.read_active(), "vlad")
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+    def test_invalid_bytes_in_the_cache_do_not_crash_a_read(self) -> None:
+        self.live_file.write_bytes(b"\xff\xfe")
+        self.assertEqual(cc.resolve_active(), "me")
+        self.assertEqual(self.live_file.read_text().strip(), "me")
+
+    def test_the_guard_is_skipped_when_no_email_was_captured(self) -> None:
+        """Direct calls without a captured email still write — used by switches."""
+        cc._cache_live_name("vlad")
+        self.assertEqual(self.live_file.read_text().strip(), "vlad")
+
+
+# `HOME` is the base the others are derived from; only the derived paths are
+# redirected, and no test writes to `HOME` itself. Captured at import, before
+# any test patches them.
+_NOT_REDIRECTED = frozenset({"HOME"})
+_REAL_PATHS = {
+    name: Path(str(value))
+    for name, value in vars(cc).items()
+    if name.isupper() and isinstance(value, Path) and name not in _NOT_REDIRECTED
+}
+
+
+class TestSuiteNeverTouchesTheRealHome(unittest.TestCase):
+    """Every module path must be redirected away from its real location.
+
+    A path the base class forgets writes into the user's real files during an
+    ordinary test run — silently, until it corrupts live credentials.
+    """
+
+    NOT_REDIRECTED = _NOT_REDIRECTED
+    REAL_PATHS = _REAL_PATHS
+
+    def test_the_real_paths_are_what_we_think_they_are(self) -> None:
+        """Guards the guard: a renamed constant must not silently drop out."""
+        self.assertGreaterEqual(len(self.REAL_PATHS), 12)
+        self.assertIn("CREDS_FILE", self.REAL_PATHS)
+        self.assertIn("LIVE_FILE", self.REAL_PATHS)
+        self.assertNotIn("HOME", self.REAL_PATHS)
+
+    def test_only_the_base_directory_is_exempt(self) -> None:
+        """Every exemption must be one that cannot be written to."""
+        self.assertEqual(self.NOT_REDIRECTED, frozenset({"HOME"}))
+        self.assertEqual(Path(str(cc.HOME)), Path.home())
+
+    def test_the_base_class_redirects_every_path_constant(self) -> None:
+        """Compared against each path's REAL value, not against one directory.
+
+        Checking only `~/.claude-profiles` would miss CREDS_FILE, MAIN_FILE
+        and CLAUDE_DIR — they live elsewhere under $HOME, so a dropped patch
+        on those would let tests overwrite real credentials and still pass.
+        """
+
+        class _Probe(BaseTest):
+            def runTest(self) -> None:  # noqa: N802 - unittest API
+                pass
+
+        probe = _Probe()
+        probe.setUp()
+        try:
+            for name, real in self.REAL_PATHS.items():
+                current = Path(str(getattr(cc, name)))
+                self.assertNotEqual(current, real, f"{name} still points at the real {real}")
+                self.assertFalse(
+                    current.is_relative_to(Path.home()),
+                    f"{name} points inside the real home: {current}",
+                )
+        finally:
+            probe.tearDown()
+
+    def test_dropping_any_single_patch_would_be_caught(self) -> None:
+        """The failure mode this class exists for, exercised directly."""
+
+        class _Probe(BaseTest):
+            def runTest(self) -> None:  # noqa: N802 - unittest API
+                pass
+
+        probe = _Probe()
+        probe.setUp()
+        try:
+            for name in ("CREDS_FILE", "MAIN_FILE", "CLAUDE_DIR", "LIVE_FILE", "PROFILES_DIR"):
+                real = self.REAL_PATHS[name]
+                with patch.object(cc, name, real):
+                    current = Path(str(getattr(cc, name)))
+                    self.assertEqual(current, real)
+                    self.assertTrue(current.is_relative_to(Path.home()))
+        finally:
+            probe.tearDown()
 
 
 class TestParser(AutoBaseTest):

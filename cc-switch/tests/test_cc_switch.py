@@ -13,6 +13,7 @@ import math
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -1416,6 +1417,146 @@ class TestBurnCell(unittest.TestCase):
 
     def test_a_bool_is_not_a_percentage(self) -> None:
         self.assertEqual(cc._burn_cell({"seven_day": True, "resets_7d": None}, NOW), "?")
+
+
+class TestEveryKnobIsActuallyWired(unittest.TestCase):
+    """Each documented variable reaches the global that acts on it.
+
+    The validators are tested through a throwaway name and the behaviour is
+    tested by patching the global, so between the two nothing ever read the
+    *documented* spelling. A typo in one of these strings, or a binding left
+    off after adding a knob, is invisible to every other test here and to the
+    README — the setting simply does nothing.
+
+    Run in a subprocess because these are read once at import.
+    """
+
+    #: (environment variable, module global, value to set, expected float)
+    KNOBS = (
+        ("CC_SWITCH_EXIT_5H", "EXIT_5H", "96", 96.0),
+        ("CC_SWITCH_EXIT_7D", "EXIT_7D", "98", 98.0),
+        ("CC_SWITCH_ENTER_5H", "ENTER_5H", "80", 80.0),
+        ("CC_SWITCH_ENTER_7D", "ENTER_7D", "85", 85.0),
+        ("CC_SWITCH_BALANCE_GAP_7D", "BALANCE_GAP_7D", "7", 7.0),
+        ("CC_SWITCH_SETTLE_SECONDS", "SETTLE_SECONDS", "30", 30.0),
+        ("CC_SWITCH_RETRY_SECONDS", "RETRY_SECONDS", "120", 120.0),
+        ("CC_SWITCH_MIN_HEADROOM_7D", "MIN_HEADROOM_7D", "25", 25.0),
+        ("CC_SWITCH_URGENCY_ALPHA", "URGENCY_ALPHA", "2", 2.0),
+        ("CC_SWITCH_CROSSOVER_POLL_SECONDS", "CROSSOVER_POLL_SECONDS", "600", 600.0),
+    )
+
+    def _read_global(self, env_var: str, attr: str, value: str) -> float:
+        env = dict(os.environ, **{env_var: value})
+        env.pop("PYTHONPATH", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", f"import cc_switch; print(cc_switch.{attr})"],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(cc.__file__).parent),
+            env=env,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return float(proc.stdout.strip())
+
+    def test_every_documented_knob_reaches_its_global(self) -> None:
+        for env_var, attr, value, expected in self.KNOBS:
+            with self.subTest(env_var=env_var):
+                self.assertEqual(self._read_global(env_var, attr, value), expected)
+
+    def test_the_readme_lists_exactly_these_knobs(self) -> None:
+        """A knob nobody can discover is a knob nobody can use."""
+        readme = (Path(cc.__file__).parent / "README.md").read_text()
+        for env_var, _, _, _ in self.KNOBS:
+            self.assertIn(env_var, readme)
+
+
+class TestAlphaZeroReproducesTheOldRule(AutoBaseTest):
+    """The compatibility claim the README makes, pinned rather than asserted.
+
+    At ALPHA 0 the ranking must be the pre-change one exactly — weekly usage
+    ascending, then 5h, then name. It survives the demotion tier only because
+    that tier is monotone in usage: headroom >= MIN_HEADROOM_7D is the same as
+    usage <= 100 - MIN_HEADROOM_7D, so demoting a candidate can never move it
+    past one with more usage. That is not obvious, and a change to either bar
+    could break it silently.
+
+    These drive the real `rank_candidates` rather than a copy of its sort key,
+    so the production ordering is what is being compared.
+    """
+
+    def _save(self, name: str, seven: float, five: float = 0.0, reset: float | None = None) -> None:
+        self._save_with_usage(name, _creds(name), _account(f"{name}@x"), five, seven,
+                              None, _iso(reset) if reset else None)
+
+    def _ranked(self) -> list[str]:
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            return [c.name for c in cc.rank_candidates(NOW, None)]
+
+    def _old_rule(self) -> list[str]:
+        """The pre-change key, computed from the same stored snapshots."""
+        rows = []
+        for path in cc.list_profiles():
+            five, seven = cc.effective_usage((cc.load_profile_data(path.stem) or {}).get("usage"), NOW)
+            rows.append((seven, five, path.stem))
+        return [name for _, _, name in sorted(rows)]
+
+    def test_a_demoted_candidate_does_not_jump_a_roomier_one(self) -> None:
+        """The case raised in review: 92% has only 8pp of headroom and is
+        demoted, but it sorted behind 50% under the old rule anyway."""
+        self._save("spent", 92.0)
+        self._save("roomy", 50.0)
+        self.assertEqual(self._ranked(), ["roomy", "spent"])
+        self.assertEqual(self._ranked(), self._old_rule())
+
+    def test_two_demoted_candidates_keep_their_relative_order(self) -> None:
+        self._save("a", 92.0)
+        self._save("b", 93.0)
+        self.assertEqual(self._ranked(), self._old_rule())
+
+    def test_the_tier_boundary_does_not_reorder(self) -> None:
+        """Either side of `100 - MIN_HEADROOM_7D`, where the tier flips."""
+        edge = 100.0 - cc.MIN_HEADROOM_7D
+        self._save("just_under", edge - 0.1)
+        self._save("at_edge", edge)
+        self._save("just_over", edge + 0.1)
+        self.assertEqual(self._ranked(), ["just_under", "at_edge", "just_over"])
+        self.assertEqual(self._ranked(), self._old_rule())
+
+    def test_the_five_hour_tiebreak_survives(self) -> None:
+        self._save("busy", 40.0, five=80.0)
+        self._save("idle", 40.0, five=1.0)
+        self.assertEqual(self._ranked(), ["idle", "busy"])
+        self.assertEqual(self._ranked(), self._old_rule())
+
+    def test_deadlines_do_not_reorder_anything(self) -> None:
+        """The whole point of ALPHA 0: the window leaves the comparison."""
+        self._save("spent_but_urgent", 92.0, reset=NOW + 0.25 * HOUR)
+        self._save("roomy_but_distant", 50.0, reset=NOW + 6 * DAY)
+        self.assertEqual(self._ranked(), ["roomy_but_distant", "spent_but_urgent"])
+        self.assertEqual(self._ranked(), self._old_rule())
+
+    def test_alpha_one_does_reorder_the_same_board(self) -> None:
+        """Proves the tests above pin ALPHA 0 and not a board that happens to
+        sort the same way whatever the exponent.
+
+        The deadline is two hours rather than minutes: inside
+        MIN_USEFUL_TTR_HOURS the account is demoted for being about to reset,
+        which would hide the reordering this is checking for.
+        """
+        self._save("spent_but_urgent", 92.0, reset=NOW + 2 * HOUR)
+        self._save("roomy_but_distant", 50.0, reset=NOW + 6 * DAY)
+        self.assertEqual(self._ranked(), ["roomy_but_distant", "spent_but_urgent"])
+        with patch.object(cc, "URGENCY_ALPHA", 1.0), patch.object(cc, "MIN_HEADROOM_7D", 0.0):
+            self.assertEqual([c.name for c in cc.rank_candidates(NOW, None)],
+                             ["spent_but_urgent", "roomy_but_distant"])
+
+    def test_the_equivalent_is_the_candidates_own_percentage(self) -> None:
+        """Which is what makes switch_reason, the gate and pick reduce too."""
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            for seven, ttr_c, ttr_a in ((34.0, 12.0, 168.0), (0.0, 0.5, 3.0), (94.0, 168.0, 0.5)):
+                cand = cc.Candidate("c", 0.0, seven, ttr_c, cc.weekly_pressure(seven, ttr_c))
+                self.assertAlmostEqual(cc.candidate_equivalent_7d(cand, ttr_a), seven)
 
 
 class TestUrgencyKnobValidation(unittest.TestCase):

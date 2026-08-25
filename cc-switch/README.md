@@ -6,8 +6,8 @@ field in `~/.claude.json`. Running sessions pick the change up without a
 restart. Profiles live in `~/.claude-profiles/<name>.json`.
 
 Manual: `add` / `use` / `list` / `current` / `remove`, plus `usage` to refresh
-and print every account's limits and `pick` to move to the account with the
-lowest weekly usage.
+and print every account's limits and `pick` to move to the account that has
+to burn its weekly quota fastest.
 
 `current`, `list` and `usage` all report when each login expires — the date
 plus how far off it is (`27 Aug 15:10 (in 6d)`). That is the refresh token's
@@ -35,11 +35,50 @@ so the statusline can wake a tick on time alone. That rescue considers every
 saved profile, including the one `.active` names: with no live credentials
 there is no email to identify the running account by, so the marker is a
 guess, and the profile it points at may hold the only working login left. The other two are the ordinary
-ones: the active account hit a limit (5h ≥ 95% or 7d ≥ 99%), or weekly usage
-drifted apart (another account is ≥ 5pp lower). The rule is always "rank every usable profile and take the
-lowest weekly one", never "leave the current one", which is why it cannot
-loop. When nothing clears the entry bar the active account stays put and the
-earliest server-provided reset is recorded in `.exhausted`.
+ones: the active account hit a limit (5h ≥ 95% or 7d ≥ 99%), or another
+account has more urgent quota to spend. The rule is always "rank every usable
+profile and take the one that has to burn fastest", never "leave the current
+one", which is why it cannot loop. When nothing clears the entry bar the
+active account stays put and the earliest server-provided reset is recorded
+in `.exhausted`.
+
+Urgency is the required burn rate — `headroom / hours-to-reset ** α`, where
+headroom is `100 − weekly %` and α is `CC_SWITCH_URGENCY_ALPHA`, 1 by default.
+At 1 that reads directly as percentage points per hour: what you would have to
+spend for nothing to be destroyed when the window rolls over. Weekly quota is
+use-it-or-lose-it, so the question was never "who has the most left" but
+"whose is about to be thrown away". An account at 75% resetting in twelve
+hours has to burn 2.1pp/h; one at 20% resetting in six days has to burn
+0.6pp/h — so the first is used first and its remaining quarter is not lost.
+Ranking by lowest weekly usage did the opposite, every time.
+
+A window with no known reset counts as a fresh week, the least urgent answer
+there is and the only one that cannot invent urgency out of missing data. That
+is also what a window past its reset reads as, alongside the zeroed usage
+`_window_value` already gives it, so the two describe one coherent account.
+
+Two cases are worth stating because they are not generalizations, they are the
+same rule. **α = 0** removes deadlines from the comparison entirely and
+restores "lowest weekly usage wins" exactly, not approximately — it is the
+escape hatch. And whenever every window resets at the same time, or none is
+known, the deadline term cancels and the comparison reduces to that same old
+thing at *any* α.
+
+The 5pp gap still means five percentage points, measured on the active
+account's own window: internally a candidate is restated as what it would be
+worth here — `100 − burn_rate × hours_this_account_has_left` — which turns the
+whole comparison back into `active % − candidate % ≥ 5pp`, the expression it
+always was. That is why one number still reaches the statusline.
+
+Two kinds of account get no urgency credit and are judged on their plain
+weekly percentage instead: one whose window closes within the hour, because
+its headroom cannot be spent before it rolls over, and one under
+`CC_SWITCH_MIN_HEADROOM_7D` (10pp), because there is too little left to be
+worth the refresh-token rotation a switch costs. Neither is ruled out — that
+looked equivalent and was not, since `pick` has no limit branch and would have
+sat on a 99% account with a 94% one available. They are also demoted in the
+ranking so a forced evacuation prefers somewhere it can actually stay, while
+still landing on them rather than nowhere.
 
 A candidate is confirmed live before any swap, so a revoked or expired login
 is never switched into. Only the winner is confirmed, because refreshing
@@ -63,7 +102,10 @@ switch racing a statusline tick could undo itself, and two refreshes of the
 same expired token would retire a perfectly good account.
 
 `pick` checks every candidate live before deciding, then takes the genuinely
-lowest one — stored snapshots only order the checks. It follows the same
+most urgent one — stored snapshots only order the checks. It follows the
+automatic rule deliberately: a human's `pick` and a statusline tick
+disagreeing about the best account is what one shared scorer exists to
+prevent. It follows the same
 dead-login rule as the automatic path: with no live credentials it considers
 every profile, the one `.active` names included.
 
@@ -103,9 +145,44 @@ while a trigger above it simply waits one more tenth.
 
 Thresholds are overridable via `CC_SWITCH_EXIT_5H`, `CC_SWITCH_EXIT_7D`,
 `CC_SWITCH_ENTER_5H`, `CC_SWITCH_ENTER_7D`, `CC_SWITCH_BALANCE_GAP_7D`,
-`CC_SWITCH_SETTLE_SECONDS`, and `CC_SWITCH_RETRY_SECONDS`. Percentages must be
+`CC_SWITCH_SETTLE_SECONDS`, `CC_SWITCH_RETRY_SECONDS`,
+`CC_SWITCH_MIN_HEADROOM_7D`, `CC_SWITCH_URGENCY_ALPHA` and
+`CC_SWITCH_CROSSOVER_POLL_SECONDS`. Percentages must be
 finite and within 0..100, and each entry bar must stay at or below its exit
 threshold — a NaN would otherwise pass silently and crash every later tick.
+The urgency exponent is not a percentage and has its own bound of 0..10: it is
+raised to the window's hours, and a large one overflows a float inside the
+gate, which is a crashing tick on every render — while anything past about 5
+is already earliest-deadline-first, so the bound costs nothing real. The
+crossover poll is a ceiling on how late a decision can be; 0 turns it off and
+any positive value is floored at 60 seconds.
+
+`recheck_after` now covers the active account's own resets too, which it
+deliberately did not before. Under "lowest weekly usage wins" its own reset
+only lowered its own figure, and low usage was never a reason to leave; under
+a burn rate it drops the account from "25pp in twelve hours" to "100pp in a
+week", which can hand the lead to a candidate — and no percentage trigger can
+catch that, because usage *falls* at a reset.
+
+The same field carries a bounded poll, and it is the one place this stops
+being purely event-driven. Pressure grows as one over the hours remaining, so
+an account whose window closes sooner gains it faster and overtakes with
+nothing else moving — no reset boundary crossed and no usage change to trigger
+on. Differentiating the trigger written above gives its drift the sign of
+(candidate hours − active hours), so it goes stale in the missed-switch
+direction over exactly that condition and no other, which is also exactly the
+condition for such a crossover. The poll is therefore armed only while some
+candidate resets before the active account, and never at α = 0, where pressure
+does not depend on time at all. A poll rather than a closed form because the
+closed form exists only at α = 1 and only for an idle account, while the real
+motion is usage and time together.
+
+A candidate that could not be reached recorded nothing, so the identical
+trigger is written straight back and the next render wakes another tick that
+fails the same way. The retry pause is the only thing that bounds it, and it
+used to be armed for limit evacuations alone — survivable while the balance
+trigger sat at least a gap above zero, and not once the trigger can be
+inverted down to it. It now applies whatever the reason was.
 
 An exhaustion deadline never holds a dead login back. `.exhausted` records
 that every account was at its limit and can be days out, while being logged

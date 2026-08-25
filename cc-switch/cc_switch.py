@@ -67,6 +67,38 @@ DEFAULT_EXIT_7D = 99.0
 DEFAULT_ENTER_5H = 90.0
 DEFAULT_ENTER_7D = 94.0
 DEFAULT_BALANCE_GAP_7D = 5.0
+#: A weekly window, in hours — and the answer whenever a deadline is unknown.
+#: A window we have no reset for has not started as far as we can tell, so it
+#: has the whole week ahead and is the least urgent thing on the board. It is
+#: also the only answer that cannot invent urgency out of missing data.
+WINDOW_HOURS = 168.0
+#: Floor on hours-to-reset. Without it a window closing in seconds produces an
+#: unbounded required burn rate and swamps every other account.
+MIN_TTR_HOURS = 0.5
+#: Below this a candidate's headroom cannot physically be spent before its
+#: window rolls over, and below MIN_HEADROOM there is too little of it to be
+#: worth a token rotation. Either disqualifies a candidate as a reason to
+#: *rebalance* — never as somewhere to escape a limit, where any account beats
+#: none. Nothing is lost by declining: the reset itself wakes a tick that
+#: reconsiders the account holding a full week.
+MIN_USEFUL_TTR_HOURS = 1.0
+DEFAULT_MIN_HEADROOM_7D = 10.0
+#: 0 ranks by headroom alone — today's rule exactly — 1 by percentage points
+#: per hour, and larger values approach earliest-deadline-first.
+DEFAULT_URGENCY_ALPHA = 1.0
+#: Anything past about 5 is already earliest-deadline-first, and the same
+#: arithmetic overflows a float around 123 (168 ** 123 is 5e273, but the ratio
+#: WINDOW_HOURS / MIN_TTR_HOURS raised to it is not), at which point every
+#: comparison silently becomes false. 10 is clear of both.
+MAX_URGENCY_ALPHA = 10.0
+#: Ceiling on how late a crossover decision can be. Pressure grows as one over
+#: the hours remaining, so an account whose window closes sooner gains it
+#: faster and overtakes with nothing else moving — and no percentage trigger
+#: can catch that.
+DEFAULT_CROSSOVER_POLL_SECONDS = 900.0
+#: A poll faster than the settle window cannot change any answer and only
+#: costs processes.
+MIN_CROSSOVER_POLL_SECONDS = 60.0
 DEFAULT_SETTLE_SECONDS = 60.0
 # Pause after an unreachable candidate: long enough not to hammer a throttled
 # endpoint, short enough that a blip costs minutes rather than days.
@@ -114,6 +146,46 @@ def _env_seconds(name: str, default: float) -> float:
     return value
 
 
+def _env_alpha(name: str, default: float) -> float:
+    """Read the urgency exponent. Not a percentage, so not `_env_float`.
+
+    `_env_float`'s 0..100 range is wrong in both directions here. The exponent
+    is applied to window hours, and a large one overflows a float inside
+    `recompute_gate` — which is to say a crashing tick on every statusline
+    render once `.auto` is on. Anything past about 5 is already
+    earliest-deadline-first, so the bound costs nothing real.
+
+    0 is deliberately allowed and is the compatibility escape hatch: it
+    restores ranking by lowest weekly usage exactly. Negative is not — it
+    would rank the *least* urgent account first.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        die(f"invalid {name}: {raw!r} (expected a number)", EXIT_USER)
+    if not math.isfinite(value):
+        die(f"invalid {name}: {raw!r} (must be a finite number)", EXIT_USER)
+    if not 0 <= value <= MAX_URGENCY_ALPHA:
+        die(f"invalid {name}: {raw!r} (must be between 0 and {MAX_URGENCY_ALPHA:.0f})", EXIT_USER)
+    return value
+
+
+def _env_poll_seconds(name: str, default: float) -> float:
+    """Read the crossover poll interval, with its own two-sided contract.
+
+    `_env_seconds` permits 0, and 0 here would mean `recheck_after = now` — a
+    python process on every single render. So 0 is given an explicit meaning
+    instead, turn the poll off, and any positive value is floored.
+    """
+    value = _env_seconds(name, default)
+    if value <= 0:
+        return 0.0
+    return max(value, MIN_CROSSOVER_POLL_SECONDS)
+
+
 EXIT_5H = _env_float("CC_SWITCH_EXIT_5H", DEFAULT_EXIT_5H)
 EXIT_7D = _env_float("CC_SWITCH_EXIT_7D", DEFAULT_EXIT_7D)
 ENTER_5H = _env_float("CC_SWITCH_ENTER_5H", DEFAULT_ENTER_5H)
@@ -121,6 +193,9 @@ ENTER_7D = _env_float("CC_SWITCH_ENTER_7D", DEFAULT_ENTER_7D)
 BALANCE_GAP_7D = _env_float("CC_SWITCH_BALANCE_GAP_7D", DEFAULT_BALANCE_GAP_7D)
 SETTLE_SECONDS = _env_seconds("CC_SWITCH_SETTLE_SECONDS", DEFAULT_SETTLE_SECONDS)
 RETRY_SECONDS = _env_seconds("CC_SWITCH_RETRY_SECONDS", DEFAULT_RETRY_SECONDS)
+MIN_HEADROOM_7D = _env_float("CC_SWITCH_MIN_HEADROOM_7D", DEFAULT_MIN_HEADROOM_7D)
+URGENCY_ALPHA = _env_alpha("CC_SWITCH_URGENCY_ALPHA", DEFAULT_URGENCY_ALPHA)
+CROSSOVER_POLL_SECONDS = _env_poll_seconds("CC_SWITCH_CROSSOVER_POLL_SECONDS", DEFAULT_CROSSOVER_POLL_SECONDS)
 
 
 def check_threshold_consistency(
@@ -506,10 +581,38 @@ def log_decision(message: str) -> None:
 # ---- Usage snapshots --------------------------------------------------
 
 
+class Score(NamedTuple):
+    """One usage snapshot reduced to everything a decision needs.
+
+    `effective_usage` returns two percentages and drops the deadlines that
+    give them meaning, which is how a freshly fetched utilization could end up
+    weighed against a stale one. Nothing here is optional: the ranking, the
+    re-check after a live fetch, and the gate all read the same four numbers
+    from the same function.
+    """
+
+    five_hour: float
+    seven_day: float
+    ttr_hours: float
+    pressure: float
+
+
 class Candidate(NamedTuple):
+    """A `Score` with the profile name in front. Field order is the contract."""
+
     name: str
     five_hour: float
     seven_day: float
+    ttr_hours: float
+    pressure: float
+
+    @property
+    def headroom(self) -> float:
+        return 100.0 - self.seven_day
+
+
+#: Anything carrying the fields the balance comparison reads.
+Scored = Score | Candidate
 
 
 def _window(utilization: float, resets_at: str | None) -> dict[str, Any]:
@@ -545,7 +648,14 @@ def _window_value(window: object, now: float) -> float:
     if resets is not None and now > resets:
         return 0.0
     value = window.get("utilization")
-    return float(value) if isinstance(value, (int, float)) else 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        # `json.loads` accepts a bare NaN literal and `usage_from_api` does an
+        # unchecked `float()`. A NaN utilization used to be accidentally safe
+        # here — `min(EXIT_7D, nan + 5)` returns EXIT_7D — but the gate now
+        # clamps with `max(0.0, ...)`, and `max(0.0, nan)` is 0.0: a trigger of
+        # zero, which the statusline satisfies on every single render.
+        return 0.0
+    return float(value)
 
 
 def effective_usage(snapshot: object, now: float) -> tuple[float, float]:
@@ -559,6 +669,73 @@ def effective_usage(snapshot: object, now: float) -> tuple[float, float]:
     if not isinstance(snapshot, dict):
         return 0.0, 0.0
     return _window_value(snapshot.get("five_hour"), now), _window_value(snapshot.get("seven_day"), now)
+
+
+def hours_until(reset_epoch: float | None, now: float) -> float:
+    """Hours of window left, floored and capped.
+
+    A window we know nothing about — `resets_at` absent, unparsable, or
+    already behind us — has not started as far as we can tell, so it gets the
+    full nominal week: the least urgent answer available, and the only one
+    that cannot invent urgency out of missing data. Past a reset,
+    `_window_value` zeroes the utilization at the same moment, so "no usage
+    and a whole week ahead" arrive together and describe one coherent account.
+    """
+    if reset_epoch is None:
+        return WINDOW_HOURS
+    remaining = (reset_epoch - now) / 3600.0
+    if not math.isfinite(remaining) or remaining <= 0.0:
+        return WINDOW_HOURS
+    return min(max(remaining, MIN_TTR_HOURS), WINDOW_HOURS)
+
+
+def weekly_pressure(seven_day: float, ttr_hours: float) -> float:
+    """Percentage points per hour you would have to burn to waste nothing.
+
+    Weekly quota is use-it-or-lose-it, so the question is never "who has the
+    most left" but "whose is about to be destroyed". An account at 75% with
+    twelve hours to go has to burn 2.1pp/h; one at 20% with six days has to
+    burn 0.6pp/h, and the first is the one to spend.
+
+    At URGENCY_ALPHA 0, `ttr_hours ** 0` is exactly 1.0 and this collapses to
+    plain headroom, so ranking by it descending *is* ranking by weekly usage
+    ascending — the old rule reproduced rather than approximated. At 1 it is
+    pp/hour. Larger values approach earliest-deadline-first.
+
+    A non-finite utilization reads as no headroom at all: `json.loads` accepts
+    a bare `NaN` literal, and one reaching the gate would turn `max(0.0, nan)`
+    into 0.0 — a trigger of zero, which the statusline satisfies on every
+    single render.
+    """
+    headroom = 100.0 - seven_day
+    if not math.isfinite(headroom):
+        return 0.0
+    return headroom / ttr_hours**URGENCY_ALPHA
+
+
+def effective_ttr_hours(snapshot: object, now: float) -> float:
+    """Hours until this snapshot's *weekly* window resets.
+
+    The companion `effective_usage` forgot. Tolerates any shape, like every
+    other reader here: a hand-edited profile can hold a string or a list where
+    a window object belongs, and this runs inside `recompute_gate`, so raising
+    would take down `auto on`, every switch, and even a no-switch tick.
+    """
+    window = snapshot.get("seven_day") if isinstance(snapshot, dict) else None
+    resets = parse_iso(window.get("resets_at")) if isinstance(window, dict) else None
+    return hours_until(resets, now)
+
+
+def score_usage(snapshot: object, now: float) -> Score:
+    """The one scorer. Ranking, the live re-check and the gate all call it."""
+    five, seven = effective_usage(snapshot, now)
+    ttr = effective_ttr_hours(snapshot, now)
+    return Score(five, seven, ttr, weekly_pressure(seven, ttr))
+
+
+def scored_candidate(name: str, snapshot: object, now: float) -> Candidate:
+    score = score_usage(snapshot, now)
+    return Candidate(name, score.five_hour, score.seven_day, score.ttr_hours, score.pressure)
 
 
 def record_usage_snapshot(name: str, snapshot: dict[str, Any]) -> None:
@@ -605,11 +782,51 @@ def profile_unusable_reason(data: object, now: float) -> str | None:
     return None
 
 
+def useful_balance_target(candidate: Scored) -> bool:
+    """Whether this account is worth *rebalancing* onto.
+
+    Two ways to fail. A window closing within the hour cannot absorb anything
+    before it rolls over, and headroom under MIN_HEADROOM_7D is not worth the
+    refresh-token rotation a switch costs — the one operation that can lose an
+    account. Neither is a judgement about escaping a limit, where any account
+    beats none, and neither loses anything: the reset itself wakes a tick that
+    reconsiders the account holding a full week.
+
+    At URGENCY_ALPHA 0 there is no urgency bonus to take away, so the
+    deadline half is inert and only the headroom bar applies.
+    """
+    if URGENCY_ALPHA > 0 and candidate.ttr_hours < MIN_USEFUL_TTR_HOURS:
+        return False
+    return 100.0 - candidate.seven_day >= MIN_HEADROOM_7D
+
+
 def rank_candidates(now: float, exclude: str | None) -> list[Candidate]:
-    """Usable profiles that clear the entry bar, lowest weekly usage first.
+    """Usable profiles that clear the entry bar, highest required burn rate first.
 
     This is the whole loop-prevention argument: one evaluation over a total
-    order picks the best account, rather than reacting to the current one.
+    order picks the best account, rather than reacting to the current one. The
+    order does not mention the active account at all — only the hysteresis gap
+    in `switch_reason` does, and only to suppress moves. Leaving A for B needs
+    `P_B >= P_A + g_A` and coming back needs `P_A >= P_B + g_B`; adding the two
+    gives `0 >= g_A + g_B`, false while both gaps are positive. BALANCE_GAP_7D
+    is kept above zero at import and `ttr` is bounded, so no cycle can close
+    without a change in the world — exactly as before.
+
+    Accounts that are not worth rebalancing onto are demoted rather than
+    dropped. The `inf` in `candidate_equivalent_7d` already keeps them out of
+    every *balance* decision, but a forced evacuation asks this list for
+    somewhere to go and would otherwise take the first name on it: an account
+    at 93% resetting within the hour has the highest burn rate on the board
+    and would win, only to hit the exit threshold again minutes later. Demoted
+    and not removed, because an evacuation with nowhere else to go must still
+    land somewhere rather than writing `.exhausted` with usable accounts on
+    the disk.
+
+    Ties break on weekly usage, then 5h, then name. Equal pressure with
+    unequal budgets is reachable above ALPHA 0 — 50pp over half a week burns
+    as fast as 100pp over a whole one — and the larger budget is the better
+    bet. At ALPHA 0 equal pressure implies equal weekly usage, so the extra
+    key is inert and the order is what it always was.
     """
     ranked: list[Candidate] = []
     for path in list_profiles():
@@ -619,11 +836,11 @@ def rank_candidates(now: float, exclude: str | None) -> list[Candidate]:
         data = load_profile_data(name)
         if profile_unusable_reason(data, now) is not None:
             continue
-        five, seven = effective_usage((data or {}).get("usage"), now)
-        if five > ENTER_5H or seven > ENTER_7D:
+        candidate = scored_candidate(name, (data or {}).get("usage"), now)
+        if candidate.five_hour > ENTER_5H or candidate.seven_day > ENTER_7D:
             continue
-        ranked.append(Candidate(name, five, seven))
-    ranked.sort(key=lambda c: (c.seven_day, c.five_hour, c.name))
+        ranked.append(candidate)
+    ranked.sort(key=lambda c: (not useful_balance_target(c), -c.pressure, c.seven_day, c.five_hour, c.name))
     return ranked
 
 
@@ -708,12 +925,67 @@ def live_credentials_dead(now: float) -> str | None:
     return live_credentials_status(now)[0]
 
 
+def candidate_equivalent_7d(candidate: Scored, active_ttr_hours: float) -> float:
+    """What a candidate is worth, restated in the active account's weekly %.
+
+    Pressure is headroom per hour of the candidate's *own* window, so two
+    accounts with different deadlines are not directly comparable and the
+    hysteresis gap has no fixed size in that unit. Scaling the gap by the
+    active window instead — leave only when
+    `P_cand - P_active >= BALANCE_GAP_7D / ttr_active ** ALPHA` — and
+    multiplying through by `ttr_active ** ALPHA` turns the whole comparison
+    back into percentage points, because `P_active * ttr_active ** ALPHA` is
+    just `100 - active_7d`. What is left is literally the old expression,
+    `active_7d - candidate_7d >= BALANCE_GAP_7D`, with this in the second
+    place. That is why `switch_reason`, the gate and `pick` all still work in
+    whole percentage points and why BALANCE_GAP_7D still means five of them.
+
+    At ALPHA 0 the conversion factor is exactly 1.0, and whenever both windows
+    are equal or unknown it cancels, so this returns the candidate's real
+    weekly utilization and every caller reproduces the old rule rather than
+    approximating it.
+
+    A candidate that is not worth rebalancing onto gets its plain weekly
+    percentage back — judged by the old rule, with no urgency credit — rather
+    than being ruled out. Ruling it out looked equivalent and was not:
+    `switch_reason` decides `limit` and `expired` before it ever reads this
+    value, but `pick` has no such branch and compares against the active
+    account directly, so an unusable answer here left it sitting on a 99%
+    account with a 94% one available and refusing to move. Withholding the
+    bonus blocks the churn just as well — a candidate at 90% half an hour
+    from its reset scores 90, not the -2780 the bonus would have given it.
+    """
+    if not useful_balance_target(candidate):
+        return candidate.seven_day
+    value = 100.0 - candidate.pressure * active_ttr_hours**URGENCY_ALPHA
+    return value if math.isfinite(value) else 100.0
+
+
+def best_balance_equivalent(ranked: list[Candidate], active_ttr_hours: float) -> float:
+    """The most attractive candidate, in the active account's percentage points.
+
+    `min` over the whole list rather than the head of it: the order is by burn
+    rate and demotes candidates that are not worth rebalancing onto, so the
+    head is not always the most attractive one.
+
+    100.0 with no candidates keeps the old `best_7d` fallback exactly — it
+    clamps to EXIT_7D in the gate and can never clear the gap here.
+    """
+    return min((candidate_equivalent_7d(c, active_ttr_hours) for c in ranked), default=100.0)
+
+
 def switch_reason(five: float, seven: float, candidate_7d: float, expired: bool = False) -> str | None:
     """Why to leave the active account: dead login, exhaustion, imbalance, or none.
 
     A dead login outranks the others: there is nothing left to spend on this
     account, and the entry-bar comparison it would otherwise lose to is
     irrelevant when the alternative is a session that cannot run at all.
+
+    `candidate_7d` is the candidate's *equivalent* weekly percentage from
+    `candidate_equivalent_7d` — its real figure whenever the two windows are
+    equal or unknown, and its deadline-adjusted worth otherwise. Keeping the
+    comparison in percentage points is what lets BALANCE_GAP_7D stay five of
+    them and lets this stay the one place the three reasons are ordered.
     """
     if expired:
         return "expired"
@@ -779,6 +1051,60 @@ def _gate_tenths(value: float) -> int:
     return math.ceil(round(value * 10, 9))
 
 
+def _active_ttr_hours(active: str | None, now: float) -> float:
+    """Hours left in the active account's weekly window, from its saved snapshot.
+
+    Read from disk rather than threaded through, so `recompute_gate` keeps its
+    two-argument signature at every call site. The ones that decide anything
+    write the snapshot first: `_tick_locked` records the statusline's figures
+    before recomputing, and `_perform_auto_switch` runs after
+    `confirm_candidate` stored a fresh one. `cmd_auto on` and `cmd_remove`
+    read whatever is on disk — the same staleness `rank_candidates` already
+    lives with, and in the safe direction: an unknown window is a full week,
+    the largest multiplier, hence the highest trigger, hence a late wake
+    rather than a process per render.
+    """
+    if active is None:
+        return WINDOW_HOURS
+    return effective_ttr_hours((load_profile_data(active) or {}).get("usage"), now)
+
+
+def _recheck_after(ranked: list[Candidate], active_ttr_hours: float, now: float) -> float:
+    """When to wake a tick on time alone; 0.0 when nothing is scheduled.
+
+    Two things now change the answer with no usage change at all.
+
+    A reset zeroes a snapshot, and that includes the *active* account's own,
+    which used to be excluded and had to be: under "lowest weekly usage wins"
+    its own reset only lowered its figure, and low usage was never a reason to
+    leave. Under a burn rate it drops the account from "25pp in twelve hours"
+    to "100pp in a week", which can hand a candidate the lead — and no
+    percentage trigger can catch it, because usage *falls* at a reset. There
+    is no loop in including it: `earliest_future_reset` only collects resets
+    strictly ahead of now, so the one that just passed is skipped and the next
+    render supplies a fresh future one.
+
+    The second has no boundary to hang a deadline on. Pressure grows as one
+    over the hours remaining, so a candidate whose window closes before the
+    active account's gains it faster and overtakes with nothing else moving.
+    Differentiating the trigger this file writes gives it the sign of
+    (candidate ttr - active ttr), so it goes stale in the missed-switch
+    direction over exactly that condition and no other — which is also
+    exactly the condition for a crossover from below. A bounded poll is armed
+    only while it holds, and never at ALPHA 0, where pressure does not depend
+    on time at all. A poll rather than a closed form because the closed form
+    exists only at ALPHA 1 and only for an idle active account, while the real
+    motion is usage and time together.
+    """
+    deadline = earliest_future_reset([p.stem for p in list_profiles()], now)
+    if CROSSOVER_POLL_SECONDS <= 0 or URGENCY_ALPHA <= 0:
+        return deadline
+    if not any(c.ttr_hours < active_ttr_hours for c in ranked):
+        return deadline
+    poll = now + CROSSOVER_POLL_SECONDS
+    return poll if deadline <= 0 else min(deadline, poll)
+
+
 def recompute_gate(active: str | None, now: float) -> None:
     """Write the cheap trigger the statusline consults on every render.
 
@@ -789,10 +1115,19 @@ def recompute_gate(active: str | None, now: float) -> None:
     keeps that from costing a python process per render.
     """
     ranked = rank_candidates(now, active)
-    best_7d = ranked[0].seven_day if ranked else 100.0
-    trigger_7d = min(EXIT_7D, best_7d + BALANCE_GAP_7D)
+    active_ttr = _active_ttr_hours(active, now)
+    # The statusline can only compare one number, so the balance rule is
+    # inverted into the utilization at which it first becomes true:
+    #     u* = equivalent_7d(best) + BALANCE_GAP_7D
+    # which is `best_7d + BALANCE_GAP_7D` unchanged whenever the two windows
+    # are equal or unknown. The upper clamp is the old one — with no
+    # candidates the equivalent is 100 and the limit branch already fires at
+    # EXIT_7D, and an `inf` equivalent lands there too. The lower clamp is
+    # new: an equivalent goes far below zero for a candidate that beats us
+    # from any usage at all, and a negative trigger is not expressible in
+    # tenths.
+    trigger_7d = min(EXIT_7D, max(0.0, best_balance_equivalent(ranked, active_ttr) + BALANCE_GAP_7D))
     not_before = max(read_epoch_file(SETTLE_FILE), read_epoch_file(EXHAUSTED_FILE))
-    others = [p.stem for p in list_profiles() if p.stem != active]
     # Triggers are written in tenths of a percent, and the statusline scales
     # its own percentages the same way. Whole numbers could not express a
     # fractional threshold at all — EXIT_5H=95.1 rounded up to 96, which
@@ -807,7 +1142,7 @@ def recompute_gate(active: str | None, now: float) -> None:
     # deadline: being at a limit is no reason to stay logged out, and that
     # deadline can be days away.
     line = (
-        f"{int(not_before)} {int(earliest_future_reset(others, now))} "
+        f"{int(not_before)} {int(_recheck_after(ranked, active_ttr, now))} "
         f"{_gate_tenths(EXIT_5H)} {_gate_tenths(trigger_7d)} "
         f"{int(live_login_deadline())} {int(read_epoch_file(SETTLE_FILE))}\n"
     )
@@ -1556,6 +1891,8 @@ def cmd_auto(args: argparse.Namespace) -> int:
         f"Thresholds: leave at 5h>={EXIT_5H:.0f}% or 7d>={EXIT_7D:.0f}%, "
         f"enter below 5h {ENTER_5H:.0f}% / 7d {ENTER_7D:.0f}%, balance gap {BALANCE_GAP_7D:.0f}pp"
     )
+    rule = "lowest weekly usage" if URGENCY_ALPHA == 0 else "headroom per hour until the weekly reset"
+    print(f"Ranking: urgency exponent {URGENCY_ALPHA:g} ({rule}), minimum headroom {MIN_HEADROOM_7D:.0f}pp")
     return EXIT_OK
 
 
@@ -1584,12 +1921,19 @@ def _no_candidate_left(active: str | None, reason: str, now: float, transient: b
         log_decision(f"no working account to escape to; retrying after {int(RETRY_SECONDS)}s")
         recompute_gate(active, now)
         return EXIT_OK
-    if reason != "limit":
-        recompute_gate(active, now)
-        return EXIT_OK
     if transient:
+        # Ahead of the reason test, not behind it. A candidate we could not
+        # reach recorded nothing, so the ranking and therefore the gate are
+        # byte-for-byte what they were and the next render wakes another tick
+        # that fails the same way, with nothing to converge on. This pause is
+        # the only thing that bounds it, and it used to be armed for limits
+        # alone — survivable while the balance trigger was at least a gap
+        # above zero, and not since the trigger can be inverted down to it.
         write_epoch_file(SETTLE_FILE, now + RETRY_SECONDS)
         log_decision(f"no candidate reachable; retrying after {int(RETRY_SECONDS)}s")
+        recompute_gate(active, now)
+        return EXIT_OK
+    if reason != "limit":
         recompute_gate(active, now)
         return EXIT_OK
     deadline = earliest_future_reset([p.stem for p in list_profiles()], now)
@@ -1604,15 +1948,18 @@ def _try_candidates(
     active: str | None,
     ranked: list[Candidate],
     reason: str,
-    active_usage: tuple[float, float],
+    active_score: Score,
     now: float,
 ) -> int:
     """Confirm candidates in order; the first authorized one with headroom wins.
 
     Each candidate is confirmed at most once, so this terminates even when
-    every stored snapshot turns out to have been optimistic.
+    every stored snapshot turns out to have been optimistic. The live score is
+    built from the snapshot `confirm_candidate` just returned, deadline
+    included, so a fresh utilization is never weighed against the stale
+    deadline the stored ranking used.
     """
-    five, seven = active_usage
+    five, seven = active_score.five_hour, active_score.seven_day
     unreachable = False
     for candidate in ranked:
         result = confirm_candidate(candidate.name, active)
@@ -1620,13 +1967,21 @@ def _try_candidates(
             unreachable = unreachable or result.transient
             log_decision(f"skip {candidate.name}: {result.error}")
             continue
-        live_5h, live_7d = effective_usage(result.usage, now)
-        if live_5h > ENTER_5H or live_7d > ENTER_7D:
-            log_decision(f"skip {candidate.name}: live 5h={live_5h:.0f}% 7d={live_7d:.0f}%")
+        live = score_usage(result.usage, now)
+        if live.five_hour > ENTER_5H or live.seven_day > ENTER_7D:
+            log_decision(f"skip {candidate.name}: live 5h={live.five_hour:.0f}% 7d={live.seven_day:.0f}%")
             continue
-        if switch_reason(five, seven, live_7d, expired=reason == "expired") is None:
-            log_decision(f"skip {candidate.name}: live 7d={live_7d:.0f}% leaves no reason to move")
+        equivalent = candidate_equivalent_7d(live, active_score.ttr_hours)
+        if switch_reason(five, seven, equivalent, expired=reason == "expired") is None:
+            log_decision(
+                f"skip {candidate.name}: live 7d={live.seven_day:.0f}% resetting in "
+                f"{live.ttr_hours:.1f}h leaves no reason to move"
+            )
             continue
+        log_decision(
+            f"take {candidate.name}: 7d={live.seven_day:.0f}% resetting in {live.ttr_hours:.1f}h, "
+            f"burn {live.pressure:.2f}pp/h against {active_score.pressure:.2f}pp/h"
+        )
         _perform_auto_switch(active, candidate.name, reason, now)
         return EXIT_OK
     return _no_candidate_left(active, reason, now, transient=unreachable)
@@ -1649,7 +2004,7 @@ def _tick_locked(args: argparse.Namespace, now: float) -> int:
         # either way: the rule that never refreshes it matches by email
         # against the live credentials, so it holds whenever there is a
         # session left to protect.
-        return _try_candidates(None, rank_candidates(now, None), "expired", (0.0, 0.0), now)
+        return _try_candidates(None, rank_candidates(now, None), "expired", score_usage(None, now), now)
     if active is None:
         return EXIT_OK
     five, seven = float(args.five_hour), float(args.seven_day)
@@ -1661,16 +2016,18 @@ def _tick_locked(args: argparse.Namespace, now: float) -> int:
         return EXIT_OK
     five = min(max(five, 0.0), 100.0)
     seven = min(max(seven, 0.0), 100.0)
-    record_usage_snapshot(
-        active,
-        make_snapshot(five, seven, timestamp_arg_to_iso(args.resets_5h), timestamp_arg_to_iso(args.resets_7d)),
-    )
+    snapshot = make_snapshot(five, seven, timestamp_arg_to_iso(args.resets_5h), timestamp_arg_to_iso(args.resets_7d))
+    record_usage_snapshot(active, snapshot)
+    # Scored from the object just written rather than re-read: this is the one
+    # place the active account's percentages and its deadline are certain to
+    # describe the same instant.
+    active_score = score_usage(snapshot, now)
     ranked = rank_candidates(now, active)
-    reason = switch_reason(five, seven, ranked[0].seven_day if ranked else 100.0)
+    reason = switch_reason(five, seven, best_balance_equivalent(ranked, active_score.ttr_hours))
     if reason is None:
         recompute_gate(active, now)
         return EXIT_OK
-    return _try_candidates(active, ranked, reason, (five, seven), now)
+    return _try_candidates(active, ranked, reason, active_score, now)
 
 
 def _tick_is_still_wanted(now: float) -> bool:
@@ -1732,39 +2089,43 @@ def cmd_pick(_args: argparse.Namespace) -> int:
 
 
 def _pick_locked(active: str | None, now: float) -> int:
-    """Check every candidate live, then take the genuinely lowest one.
+    """Check every candidate live, then take the one with the most urgent quota.
 
-    Stopping at the first candidate that is not better than the active
-    account would miss a lower one behind it — stored snapshots order the
-    checks, but only the live numbers decide.
+    Stopping at the first candidate that is not better than the active account
+    would miss a stronger one behind it — stored snapshots order the checks,
+    but only the live numbers decide. The rule is the automatic one
+    deliberately: a human's `pick` and a statusline tick disagreeing about the
+    best account is exactly what sharing a scorer exists to prevent.
     """
-    active_7d = 100.0
+    active_7d, active_ttr = 100.0, WINDOW_HOURS
     if active and profile_path(active).exists():
         current = confirm_candidate(active, active)
         if current.usage is not None:
-            _, active_7d = effective_usage(current.usage, now)
+            score = score_usage(current.usage, now)
+            active_7d, active_ttr = score.seven_day, score.ttr_hours
 
-    best: tuple[str, float] | None = None
+    best: tuple[str, float, float] | None = None  # name, live 7d, equivalent 7d
     for candidate in rank_candidates(now, active):
         result = confirm_candidate(candidate.name, active)
         if result.usage is None:
             print(f"Skipping '{candidate.name}': {result.error}")
             continue
-        live_5h, live_7d = effective_usage(result.usage, now)
-        if live_5h > ENTER_5H or live_7d > ENTER_7D:
-            print(f"Skipping '{candidate.name}': 5h {live_5h:.0f}%, 7d {live_7d:.0f}%")
+        live = score_usage(result.usage, now)
+        if live.five_hour > ENTER_5H or live.seven_day > ENTER_7D:
+            print(f"Skipping '{candidate.name}': 5h {live.five_hour:.0f}%, 7d {live.seven_day:.0f}%")
             continue
-        if best is None or live_7d < best[1]:
-            best = (candidate.name, live_7d)
+        equivalent = candidate_equivalent_7d(live, active_ttr)
+        if best is None or equivalent < best[2]:
+            best = (candidate.name, live.seven_day, equivalent)
 
     if best is None:
         print("No usable account with headroom")
         return EXIT_OK
-    if best[1] >= active_7d:
-        print(f"Staying on '{active}' (7d {active_7d:.0f}%) — nothing lower available")
+    if best[2] >= active_7d:
+        print(f"Staying on '{active}' (7d {active_7d:.0f}%) — nothing better available")
         return EXIT_OK
     _perform_auto_switch(active, best[0], "pick", now)
-    print(f"Switched to '{best[0]}' (7d {best[1]:.0f}%, was {active_7d:.0f}%)")
+    print(f"Switched to '{best[0]}' (7d {best[1]:.0f}%, worth {best[2]:.0f}% here; was {active_7d:.0f}%)")
     return EXIT_OK
 
 
@@ -1820,6 +2181,19 @@ def _pct(value: object) -> str:
     return f"{float(value):.0f}%" if isinstance(value, (int, float)) else "?"
 
 
+def _burn_cell(row: dict[str, Any], now: float) -> str:
+    """Required burn rate for the display, or `?` when the figures are unusable.
+
+    This is the number every decision now turns on, so it belongs beside the
+    percentages rather than only in the log.
+    """
+    seven = row.get("seven_day")
+    if not isinstance(seven, (int, float)) or isinstance(seven, bool):
+        return "?"
+    ttr = hours_until(parse_iso(row.get("resets_7d")), now)
+    return f"{weekly_pressure(float(seven), ttr):.2f}"
+
+
 def _reset_cell(row: dict[str, Any]) -> str:
     five = parse_iso(row.get("resets_5h"))
     seven = parse_iso(row.get("resets_7d"))
@@ -1852,8 +2226,9 @@ def cmd_usage(args: argparse.Namespace) -> int:
     logins = [_fmt_login_expiry(r["login_expires_at"], now) for r in rows]
     login_w = max(*(len(t) for t in logins), len("LOGIN UNTIL"))
     reset_w = max(*(len(_reset_cell(r)) for r in rows), len("RESETS 5h / 7d"))
+    burn_w = max(*(len(_burn_cell(r, now)) for r in rows), len("BURN"))
     header = (
-        f"  {'PROFILE':<{name_w}}  {'EMAIL':<{email_w}}  {'5h':>5}  {'7d':>5}  "
+        f"  {'PROFILE':<{name_w}}  {'EMAIL':<{email_w}}  {'5h':>5}  {'7d':>5}  {'BURN':>{burn_w}}  "
         f"{'RESETS 5h / 7d':<{reset_w}}  {'LOGIN UNTIL':<{login_w}}  STATUS"
     )
     print(header)
@@ -1862,9 +2237,10 @@ def cmd_usage(args: argparse.Namespace) -> int:
         stale = " (stored)" if row["stale"] else ""
         print(
             f"{marker} {row['profile']:<{name_w}}  {row['email']:<{email_w}}  "
-            f"{_pct(row['five_hour']):>5}  {_pct(row['seven_day']):>5}  "
+            f"{_pct(row['five_hour']):>5}  {_pct(row['seven_day']):>5}  {_burn_cell(row, now):>{burn_w}}  "
             f"{_reset_cell(row):<{reset_w}}  {login:<{login_w}}  {row['status']}{stale}"
         )
+    print(f"  BURN is percentage points per hour needed before the weekly window resets (urgency {URGENCY_ALPHA:g}).")
     return EXIT_OK
 
 

@@ -1132,6 +1132,357 @@ class AutoBaseTest(BaseTest):
         return self.log_file.read_text() if self.log_file.exists() else ""
 
 
+class TestHoursUntil(unittest.TestCase):
+    """Hours of weekly window left — the denominator of every decision."""
+
+    def test_a_known_future_reset(self) -> None:
+        self.assertAlmostEqual(cc.hours_until(NOW + 12 * HOUR, NOW), 12.0)
+
+    def test_an_absent_reset_gets_a_nominal_week(self) -> None:
+        """A window we know nothing about has not started: least urgent, and
+        the only answer that cannot invent urgency out of missing data."""
+        self.assertEqual(cc.hours_until(None, NOW), cc.WINDOW_HOURS)
+
+    def test_a_past_reset_gets_a_nominal_week(self) -> None:
+        self.assertEqual(cc.hours_until(NOW - HOUR, NOW), cc.WINDOW_HOURS)
+
+    def test_a_reset_exactly_now_gets_a_nominal_week(self) -> None:
+        self.assertEqual(cc.hours_until(NOW, NOW), cc.WINDOW_HOURS)
+
+    def test_an_imminent_reset_is_floored(self) -> None:
+        """Without the floor the required burn rate runs away to infinity."""
+        self.assertEqual(cc.hours_until(NOW + 60, NOW), cc.MIN_TTR_HOURS)
+
+    def test_a_far_future_reset_is_capped(self) -> None:
+        """A hand-edited date must not make an account look free forever."""
+        self.assertEqual(cc.hours_until(NOW + 400 * HOUR, NOW), cc.WINDOW_HOURS)
+
+    def test_a_non_finite_reset_gets_a_nominal_week(self) -> None:
+        self.assertEqual(cc.hours_until(float("inf"), NOW), cc.WINDOW_HOURS)
+
+
+class TestWeeklyPressure(unittest.TestCase):
+    def test_pp_per_hour_at_alpha_one(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertAlmostEqual(cc.weekly_pressure(75.0, 12.0), 25.0 / 12.0)
+
+    def test_alpha_zero_is_plain_headroom(self) -> None:
+        """The escape hatch: `ttr ** 0` is exactly 1.0 at any deadline."""
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            self.assertEqual(cc.weekly_pressure(75.0, 12.0), 25.0)
+            self.assertEqual(cc.weekly_pressure(75.0, 168.0), 25.0)
+
+    def test_the_neutral_baseline_is_a_full_fresh_week(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertAlmostEqual(cc.weekly_pressure(0.0, cc.WINDOW_HOURS), 100.0 / 168.0)
+
+    def test_an_earlier_deadline_outranks_more_headroom(self) -> None:
+        """The whole change: 25pp in twelve hours beats 80pp in six days."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertGreater(cc.weekly_pressure(75.0, 12.0), cc.weekly_pressure(20.0, 144.0))
+
+    def test_a_non_finite_utilization_is_no_headroom(self) -> None:
+        """`max(0.0, nan)` is 0.0, so a NaN reaching the gate writes a trigger
+        of zero — which the statusline satisfies on every render."""
+        self.assertEqual(cc.weekly_pressure(float("nan"), 12.0), 0.0)
+
+
+class TestScoreUsage(unittest.TestCase):
+    def test_it_carries_the_deadline_effective_usage_drops(self) -> None:
+        snap = cc.make_snapshot(30.0, 60.0, None, _iso(NOW + 12 * HOUR))
+        score = cc.score_usage(snap, NOW)
+        self.assertEqual((score.five_hour, score.seven_day), (30.0, 60.0))
+        self.assertAlmostEqual(score.ttr_hours, 12.0)
+
+    def test_a_rolled_over_weekly_window_is_a_fresh_week(self) -> None:
+        """Zeroed usage and a nominal week must arrive together, or a 0%
+        account would look like it had to burn 100pp in the last minute."""
+        snap = cc.make_snapshot(30.0, 96.0, None, _iso(NOW - 1))
+        score = cc.score_usage(snap, NOW)
+        self.assertEqual(score.seven_day, 0.0)
+        self.assertEqual(score.ttr_hours, cc.WINDOW_HOURS)
+
+    def test_no_snapshot_scores_as_a_free_week(self) -> None:
+        score = cc.score_usage(None, NOW)
+        self.assertEqual((score.five_hour, score.seven_day, score.ttr_hours), (0.0, 0.0, cc.WINDOW_HOURS))
+
+    def test_a_non_dict_weekly_window_does_not_raise(self) -> None:
+        """A hand-edited profile can hold a string here, and this runs inside
+        `recompute_gate` — raising would take down every tick."""
+        self.assertEqual(cc.effective_ttr_hours({"seven_day": "nonsense"}, NOW), cc.WINDOW_HOURS)
+
+    def test_a_nan_utilization_reads_as_zero(self) -> None:
+        """`json.loads` accepts a bare NaN literal and `usage_from_api` does
+        an unchecked `float()`."""
+        self.assertEqual(cc.effective_usage(cc.make_snapshot(1.0, float("nan"), None, None), NOW), (1.0, 0.0))
+
+    def test_an_infinite_utilization_reads_as_zero(self) -> None:
+        self.assertEqual(cc.effective_usage(cc.make_snapshot(float("inf"), 1.0, None, None), NOW), (0.0, 1.0))
+
+    def test_a_boolean_weekly_utilization_reads_as_zero(self) -> None:
+        """`bool` is an `int` in Python, so a hand-edited `true` used to reach
+        `float()` and read as 1% — a real percentage, and very nearly the most
+        attractive account on the board. It is not a measurement, so it reads
+        as unknown like every other unusable value here.
+        """
+        self.assertEqual(cc.effective_usage(cc.make_snapshot(1.0, True, None, None), NOW), (1.0, 0.0))
+
+    def test_a_boolean_five_hour_utilization_reads_as_zero(self) -> None:
+        """Both windows go through the same reader; both had the same hole."""
+        self.assertEqual(cc.effective_usage(cc.make_snapshot(True, 1.0, None, None), NOW), (0.0, 1.0))
+
+    def test_false_is_not_a_zero_percent_measurement_either(self) -> None:
+        """`False` already read as 0.0 by accident. It must keep doing so by
+        rule, so the two booleans cannot diverge."""
+        self.assertEqual(cc.effective_usage(cc.make_snapshot(1.0, False, None, None), NOW), (1.0, 0.0))
+
+    def test_a_string_utilization_reads_as_zero(self) -> None:
+        """The pre-existing shape in the same class: not a number at all."""
+        self.assertEqual(cc.effective_usage(cc.make_snapshot(1.0, "nonsense", None, None), NOW), (1.0, 0.0))
+
+    def test_a_boolean_utilization_scores_as_a_free_week(self) -> None:
+        """What the gate and the ranking actually read, end of the chain."""
+        score = cc.score_usage(cc.make_snapshot(True, True, None, None), NOW)
+        self.assertEqual((score.five_hour, score.seven_day), (0.0, 0.0))
+        self.assertAlmostEqual(score.pressure, cc.weekly_pressure(0.0, cc.WINDOW_HOURS))
+
+
+class TestUsefulBalanceTarget(unittest.TestCase):
+    """Whether an account is worth *rebalancing* onto — never whether it is
+    somewhere to escape a limit, where any account beats none."""
+
+    def _cand(self, seven: float, ttr: float) -> cc.Candidate:
+        return cc.Candidate("c", 0.0, seven, ttr, cc.weekly_pressure(seven, ttr))
+
+    def test_a_roomy_account_with_time_left_qualifies(self) -> None:
+        self.assertTrue(cc.useful_balance_target(self._cand(20.0, 144.0)))
+
+    def test_a_window_closing_within_the_hour_does_not(self) -> None:
+        """Its headroom cannot be spent before the window rolls over, and the
+        reset itself wakes a tick that reconsiders it holding a full week."""
+        self.assertFalse(cc.useful_balance_target(self._cand(20.0, cc.MIN_TTR_HOURS)))
+
+    def test_too_little_headroom_does_not(self) -> None:
+        """Not worth the refresh-token rotation a switch costs."""
+        self.assertFalse(cc.useful_balance_target(self._cand(100.0 - cc.MIN_HEADROOM_7D + 1, 144.0)))
+
+    def test_the_headroom_bar_is_inclusive(self) -> None:
+        self.assertTrue(cc.useful_balance_target(self._cand(100.0 - cc.MIN_HEADROOM_7D, 144.0)))
+
+    def test_the_deadline_bar_is_inclusive(self) -> None:
+        self.assertTrue(cc.useful_balance_target(self._cand(20.0, cc.MIN_USEFUL_TTR_HOURS)))
+
+    def test_the_deadline_bar_is_inert_at_alpha_zero(self) -> None:
+        """It withholds an urgency bonus that alpha 0 never grants."""
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            self.assertTrue(cc.useful_balance_target(self._cand(20.0, cc.MIN_TTR_HOURS)))
+
+    def test_the_headroom_bar_still_applies_at_alpha_zero(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            self.assertFalse(cc.useful_balance_target(self._cand(99.0, 144.0)))
+
+    def test_it_accepts_a_bare_score_too(self) -> None:
+        """`_try_candidates` passes a live Score, not a named Candidate."""
+        self.assertTrue(cc.useful_balance_target(cc.score_usage(cc.make_snapshot(0.0, 20.0, None, None), NOW)))
+
+
+class TestCandidateEquivalent7d(unittest.TestCase):
+    """A candidate's worth, restated in the active account's percentage points."""
+
+    def _cand(self, seven: float, ttr: float) -> cc.Candidate:
+        return cc.Candidate("c", 0.0, seven, ttr, cc.weekly_pressure(seven, ttr))
+
+    def test_alpha_zero_returns_the_real_percentage(self) -> None:
+        """The escape hatch: every caller then reproduces the old rule."""
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            self.assertEqual(cc.candidate_equivalent_7d(self._cand(34.0, 12.0), 168.0), 34.0)
+
+    def test_equal_windows_return_the_real_percentage(self) -> None:
+        """Why most of this suite is unaffected: null resets on both sides."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            cand = self._cand(34.0, cc.WINDOW_HOURS)
+            self.assertAlmostEqual(cc.candidate_equivalent_7d(cand, cc.WINDOW_HOURS), 34.0)
+
+    def test_a_roomy_candidate_looks_worse_against_an_urgent_active(self) -> None:
+        """75% resetting in twelve hours must not be abandoned for a safe 20%."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertGreater(cc.candidate_equivalent_7d(self._cand(20.0, 144.0), 12.0), 75.0)
+
+    def test_an_urgent_candidate_looks_better_against_a_roomy_active(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertLess(cc.candidate_equivalent_7d(self._cand(75.0, 12.0), 144.0), 20.0)
+
+    def test_a_candidate_about_to_reset_gets_no_urgency_credit(self) -> None:
+        """Its headroom cannot be spent before the window rolls over, and the
+        reset itself wakes a tick that reconsiders it holding a full week."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertEqual(cc.candidate_equivalent_7d(self._cand(90.0, cc.MIN_TTR_HOURS), 168.0), 90.0)
+
+    def test_a_nearly_spent_candidate_gets_no_urgency_credit(self) -> None:
+        """Too little left to be worth the refresh-token rotation a switch costs."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertEqual(cc.candidate_equivalent_7d(self._cand(95.0, 2.0), 168.0), 95.0)
+
+    def test_withholding_the_credit_still_lets_pick_escape(self) -> None:
+        """Ruling a candidate out entirely looked equivalent and was not:
+        `pick` compares against the active account with no limit branch, so
+        an unusable answer left it on 99% with 94% available."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertLess(cc.candidate_equivalent_7d(self._cand(94.0, 168.0), 168.0), 99.0)
+
+    def test_the_deadline_bar_is_inert_at_alpha_zero(self) -> None:
+        """It exists to withhold an urgency bonus that alpha 0 never grants."""
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            self.assertEqual(cc.candidate_equivalent_7d(self._cand(50.0, cc.MIN_TTR_HOURS), 168.0), 50.0)
+
+    def test_a_non_finite_result_is_never_a_reason(self) -> None:
+        self.assertEqual(cc.candidate_equivalent_7d(cc.Candidate("c", 0.0, 0.0, 168.0, float("nan")), 168.0), 100.0)
+
+
+class TestANonUnitExponent(AutoBaseTest):
+    """Alpha 1 hides a whole class of mistake: `ttr ** 1` is `ttr`, so every
+    place the exponent is applied looks identical to forgetting it. Alpha 2 is
+    a supported setting (the bound is 0..10) and separates the two.
+    """
+
+    def _cand(self, seven: float, ttr: float) -> cc.Candidate:
+        return cc.Candidate("c", 0.0, seven, ttr, cc.weekly_pressure(seven, ttr))
+
+    def test_pressure_squares_the_window(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 2.0):
+            self.assertAlmostEqual(cc.weekly_pressure(75.0, 12.0), 25.0 / 144.0)
+
+    def test_the_equivalent_squares_the_active_window(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 2.0):
+            # 40pp over 48h against an active account with 24h left.
+            expected = 100.0 - (40.0 / 48.0**2) * 24.0**2
+            self.assertAlmostEqual(cc.candidate_equivalent_7d(self._cand(60.0, 48.0), 24.0), expected)
+
+    def test_equal_windows_still_cancel_at_alpha_two(self) -> None:
+        """The identity that keeps BALANCE_GAP_7D meaning five points has to
+        hold at every exponent, not just the default."""
+        with patch.object(cc, "URGENCY_ALPHA", 2.0):
+            self.assertAlmostEqual(cc.candidate_equivalent_7d(self._cand(34.0, 90.0), 90.0), 34.0)
+
+    def test_the_exponent_changes_the_ranking(self) -> None:
+        """60% resetting in 48h loses to 15% in 96h at alpha 1 and wins at
+        alpha 2, where the deadline dominates."""
+        self._save_with_usage("sooner", _creds("a"), _account("a@x"), 0.0, 60.0, None, _iso(NOW + 48 * HOUR))
+        self._save_with_usage("later", _creds("b"), _account("b@x"), 0.0, 15.0, None, _iso(NOW + 96 * HOUR))
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertEqual([c.name for c in cc.rank_candidates(NOW, None)], ["later", "sooner"])
+        with patch.object(cc, "URGENCY_ALPHA", 2.0):
+            self.assertEqual([c.name for c in cc.rank_candidates(NOW, None)], ["sooner", "later"])
+
+    def test_the_gate_trigger_follows_the_exponent(self) -> None:
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 40.0, None, _iso(NOW + 24 * HOUR))
+        self._save_with_usage("other", _creds("a"), _account("a@x"), 0.0, 60.0, None, _iso(NOW + 48 * HOUR))
+        with patch.object(cc, "URGENCY_ALPHA", 2.0):
+            cc.recompute_gate("me", NOW)
+            expected = min(cc.EXIT_7D, max(0.0, (100.0 - (40.0 / 48.0**2) * 24.0**2) + cc.BALANCE_GAP_7D))
+        trigger = int(self.gate_file.read_text().split()[3])
+        self.assertEqual(trigger, cc._gate_tenths(expected))
+
+
+class TestBestBalanceEquivalent(unittest.TestCase):
+    def test_no_candidates_is_a_hundred(self) -> None:
+        """100 + the gap clamps to EXIT_7D and can never beat the active account."""
+        self.assertEqual(cc.best_balance_equivalent([], 168.0), 100.0)
+
+    def test_it_takes_the_minimum_not_the_head(self) -> None:
+        """The order demotes candidates that are not worth rebalancing onto,
+        so the head of the list is not always the most attractive one."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            doomed = cc.Candidate("doomed", 0.0, 90.0, cc.MIN_TTR_HOURS, cc.weekly_pressure(90.0, cc.MIN_TTR_HOURS))
+            real = cc.Candidate("real", 0.0, 10.0, 168.0, cc.weekly_pressure(10.0, 168.0))
+            self.assertAlmostEqual(cc.best_balance_equivalent([doomed, real], 168.0), 10.0)
+
+
+class TestBurnCell(unittest.TestCase):
+    """The number every decision turns on belongs beside the percentages."""
+
+    def test_it_reports_pp_per_hour(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            row = {"seven_day": 75.0, "resets_7d": _iso(NOW + 12 * HOUR)}
+            self.assertEqual(cc._burn_cell(row, NOW), "2.08")
+
+    def test_an_unknown_deadline_uses_the_nominal_week(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertEqual(cc._burn_cell({"seven_day": 0.0, "resets_7d": None}, NOW), "0.60")
+
+    def test_an_unusable_percentage_reads_as_unknown(self) -> None:
+        """One hand-edited profile must not stop `usage` reporting the others."""
+        self.assertEqual(cc._burn_cell({"seven_day": None, "resets_7d": None}, NOW), "?")
+
+    def test_a_bool_is_not_a_percentage(self) -> None:
+        self.assertEqual(cc._burn_cell({"seven_day": True, "resets_7d": None}, NOW), "?")
+
+
+class TestUrgencyKnobValidation(unittest.TestCase):
+    """The exponent is not a percentage, so `_env_float`'s bound is wrong."""
+
+    def _reject(self, value: str) -> tuple[int, str]:
+        err = io.StringIO()
+        with (
+            patch.dict(os.environ, {"CC_SWITCH_TEST_ALPHA": value}),
+            contextlib.redirect_stderr(err),
+            self.assertRaises(SystemExit) as caught,
+        ):
+            cc._env_alpha("CC_SWITCH_TEST_ALPHA", 1.0)
+        return int(caught.exception.code or 0), err.getvalue()
+
+    def test_nan_is_rejected(self) -> None:
+        code, message = self._reject("nan")
+        self.assertEqual(code, cc.EXIT_USER)
+        self.assertIn("finite", message)
+
+    def test_non_numeric_is_rejected(self) -> None:
+        code, message = self._reject("soon")
+        self.assertEqual(code, cc.EXIT_USER)
+        self.assertIn("expected a number", message)
+
+    def test_negative_is_rejected(self) -> None:
+        """A negative exponent would rank the *least* urgent account first."""
+        self.assertEqual(self._reject("-1")[0], cc.EXIT_USER)
+
+    def test_an_exponent_that_would_overflow_is_rejected(self) -> None:
+        code, message = self._reject("200")
+        self.assertEqual(code, cc.EXIT_USER)
+        self.assertIn("0 and 10", message)
+
+    def test_zero_is_allowed(self) -> None:
+        with patch.dict(os.environ, {"CC_SWITCH_TEST_ALPHA": "0"}):
+            self.assertEqual(cc._env_alpha("CC_SWITCH_TEST_ALPHA", 1.0), 0.0)
+
+    def test_the_upper_bound_is_inclusive(self) -> None:
+        with patch.dict(os.environ, {"CC_SWITCH_TEST_ALPHA": "10"}):
+            self.assertEqual(cc._env_alpha("CC_SWITCH_TEST_ALPHA", 1.0), 10.0)
+
+    def test_the_default_is_used_when_unset(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CC_SWITCH_TEST_ALPHA", None)
+            self.assertEqual(cc._env_alpha("CC_SWITCH_TEST_ALPHA", 1.0), 1.0)
+
+    def test_the_bound_keeps_the_arithmetic_finite(self) -> None:
+        """The binding term is the window raised to the exponent."""
+        self.assertTrue(math.isfinite(cc.WINDOW_HOURS**cc.MAX_URGENCY_ALPHA))
+        self.assertTrue(math.isfinite((cc.WINDOW_HOURS / cc.MIN_TTR_HOURS) ** cc.MAX_URGENCY_ALPHA))
+
+    def test_a_zero_poll_turns_polling_off(self) -> None:
+        """`_env_seconds` permits 0, and 0 here would mean a process per render."""
+        with patch.dict(os.environ, {"CC_SWITCH_TEST_POLL": "0"}):
+            self.assertEqual(cc._env_poll_seconds("CC_SWITCH_TEST_POLL", 900.0), 0.0)
+
+    def test_a_short_poll_is_floored(self) -> None:
+        """Faster than the settle window cannot change any answer."""
+        with patch.dict(os.environ, {"CC_SWITCH_TEST_POLL": "5"}):
+            self.assertEqual(cc._env_poll_seconds("CC_SWITCH_TEST_POLL", 900.0), cc.MIN_CROSSOVER_POLL_SECONDS)
+
+    def test_a_long_poll_is_kept(self) -> None:
+        with patch.dict(os.environ, {"CC_SWITCH_TEST_POLL": "1800"}):
+            self.assertEqual(cc._env_poll_seconds("CC_SWITCH_TEST_POLL", 900.0), 1800.0)
+
+
 class TestTimestampArgToIso(unittest.TestCase):
     """The two producers of a reset deadline disagree about its shape.
 
@@ -1347,20 +1698,82 @@ class TestRankCandidates(AutoBaseTest):
         self.assertEqual([c.name for c in cc.rank_candidates(NOW, "aaa")], ["zzz"])
 
 
+class TestRankingWeighsDeadlines(AutoBaseTest):
+    """The change itself: which account the ranking puts first."""
+
+    def _pair(self, a_seven: float, a_reset: float | None, b_seven: float, b_reset: float | None) -> list[str]:
+        self._save_with_usage("urgent", _creds("a"), _account("a@x"), 0.0, a_seven, None,
+                              _iso(a_reset) if a_reset else None)
+        self._save_with_usage("roomy", _creds("b"), _account("b@x"), 0.0, b_seven, None,
+                              _iso(b_reset) if b_reset else None)
+        return [c.name for c in cc.rank_candidates(NOW, None)]
+
+    def test_an_earlier_reset_outranks_lower_usage(self) -> None:
+        """25pp about to be destroyed beats 80pp that is safe for six days."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertEqual(self._pair(75.0, NOW + 12 * HOUR, 20.0, NOW + 6 * DAY), ["urgent", "roomy"])
+
+    def test_alpha_zero_restores_lowest_weekly_first(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            self.assertEqual(self._pair(75.0, NOW + 12 * HOUR, 20.0, NOW + 6 * DAY), ["roomy", "urgent"])
+
+    def test_equal_deadlines_fall_back_to_lowest_weekly(self) -> None:
+        """With one deadline on both sides the rule is what it always was."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertEqual(self._pair(75.0, NOW + 6 * DAY, 20.0, NOW + 6 * DAY), ["roomy", "urgent"])
+
+    def test_unknown_deadlines_fall_back_to_lowest_weekly(self) -> None:
+        """The shape most of this suite stores."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertEqual(self._pair(75.0, None, 20.0, None), ["roomy", "urgent"])
+
+    def test_equal_pressure_prefers_the_larger_budget(self) -> None:
+        """50pp over half a week and 100pp over a week burn at the same rate."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertEqual(self._pair(50.0, NOW + 84 * HOUR, 0.0, NOW + 168 * HOUR), ["roomy", "urgent"])
+
+    def test_the_candidate_carries_its_deadline(self) -> None:
+        self._save_with_usage("a", _creds("a"), _account("a@x"), 0.0, 40.0, None, _iso(NOW + 24 * HOUR))
+        self.assertAlmostEqual(cc.rank_candidates(NOW, None)[0].ttr_hours, 24.0)
+
+    def test_an_account_about_to_reset_is_demoted_not_dropped(self) -> None:
+        """It has the highest burn rate on the board and would head the list,
+        so a forced evacuation would take it and hit the exit threshold again
+        minutes later. Demoted, because an evacuation must still land."""
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            order = self._pair(93.0, NOW + 300, 20.0, NOW + 6 * DAY)
+        self.assertEqual(order, ["roomy", "urgent"])
+
+    def test_a_demoted_account_is_still_available_alone(self) -> None:
+        self._save_with_usage("doomed", _creds("a"), _account("a@x"), 0.0, 93.0, None, _iso(NOW + 300))
+        with patch.object(cc, "URGENCY_ALPHA", 1.0):
+            self.assertEqual([c.name for c in cc.rank_candidates(NOW, None)], ["doomed"])
+
+
 class TestCandidate(unittest.TestCase):
     """The ranking result is a named tuple — the field order is the contract."""
 
     def test_fields_are_named_and_ordered(self) -> None:
-        candidate = cc.Candidate("vlad", 12.0, 34.0)
+        candidate = cc.Candidate("vlad", 12.0, 34.0, 48.0, 1.375)
         self.assertEqual(candidate.name, "vlad")
         self.assertEqual(candidate.five_hour, 12.0)
         self.assertEqual(candidate.seven_day, 34.0)
-        self.assertEqual(tuple(candidate), ("vlad", 12.0, 34.0))
+        self.assertEqual(candidate.ttr_hours, 48.0)
+        self.assertEqual(candidate.pressure, 1.375)
+        self.assertEqual(tuple(candidate), ("vlad", 12.0, 34.0, 48.0, 1.375))
 
-    def test_sorts_by_weekly_then_five_hour(self) -> None:
-        low_week = cc.Candidate("a", 90.0, 10.0)
-        high_week = cc.Candidate("b", 1.0, 50.0)
-        self.assertLess(sorted([high_week, low_week], key=lambda c: (c.seven_day, c.five_hour))[0], high_week)
+    def test_score_fields_line_up_with_candidate_fields(self) -> None:
+        """`scored_candidate` copies them across positionally."""
+        self.assertEqual(cc.Candidate._fields[1:], cc.Score._fields)
+
+    def test_headroom_is_what_is_left_of_the_week(self) -> None:
+        self.assertEqual(cc.Candidate("a", 0.0, 34.0, 48.0, 1.375).headroom, 66.0)
+
+    def test_sorts_by_pressure_descending(self) -> None:
+        """25pp about to be destroyed outranks 80pp that is safe for six days."""
+        urgent = cc.Candidate("a", 90.0, 75.0, 12.0, 25.0 / 12.0)
+        roomy = cc.Candidate("b", 1.0, 20.0, 144.0, 80.0 / 144.0)
+        self.assertEqual(sorted([roomy, urgent], key=lambda c: -c.pressure)[0], urgent)
 
 
 class TestSwitchReason(unittest.TestCase):
@@ -1466,15 +1879,19 @@ class TestGate(AutoBaseTest):
         cc.recompute_gate("me", NOW)
         self.assertEqual(self._gate()[2:4], [int(cc.EXIT_5H * 10), int(cc.EXIT_7D * 10)])
 
-    def test_recheck_after_is_earliest_other_reset(self) -> None:
+    def test_recheck_after_is_earliest_reset(self) -> None:
+        """The poll is switched off here so this pins one thing: a reset is a
+        deadline the gate has to wake for. Its own tests are below."""
         self._save_with_usage("a", _creds("a"), _account("a@x"), 1.0, 1.0, _iso(NOW + 2 * HOUR), _iso(NOW + DAY))
         self._save_with_usage("b", _creds("b"), _account("b@x"), 1.0, 1.0, _iso(NOW + HOUR), _iso(NOW + DAY))
-        cc.recompute_gate("me", NOW)
+        with patch.object(cc, "CROSSOVER_POLL_SECONDS", 0.0):
+            cc.recompute_gate("me", NOW)
         self.assertEqual(self._gate()[1], int(NOW + HOUR))
 
     def test_recheck_ignores_past_resets(self) -> None:
         self._save_with_usage("a", _creds("a"), _account("a@x"), 1.0, 1.0, _iso(NOW - HOUR), _iso(NOW + DAY))
-        cc.recompute_gate("me", NOW)
+        with patch.object(cc, "CROSSOVER_POLL_SECONDS", 0.0):
+            cc.recompute_gate("me", NOW)
         self.assertEqual(self._gate()[1], int(NOW + DAY))
 
     def test_recheck_zero_when_no_reset_is_known(self) -> None:
@@ -1483,10 +1900,129 @@ class TestGate(AutoBaseTest):
         cc.recompute_gate("me", NOW)
         self.assertEqual(self._gate()[1], 0)
 
-    def test_recheck_skips_the_active_profile(self) -> None:
+    def test_recheck_includes_the_active_profile(self) -> None:
+        """Its own reset used to be irrelevant and now is not.
+
+        Under "lowest weekly usage wins" the active account's reset only
+        lowered its own figure, and low usage was never a reason to leave.
+        Under a burn rate it drops the account from "25pp in twelve hours" to
+        "100pp in a week", which can hand a candidate the lead — and nothing
+        else would wake a tick, because usage *falls* at a reset, so no
+        percentage trigger can fire.
+        """
         self._save_with_usage("me", _creds("a"), _account("a@x"), 1.0, 1.0, _iso(NOW + HOUR), _iso(NOW + HOUR))
         cc.recompute_gate("me", NOW)
-        self.assertEqual(self._gate()[1], 0)
+        self.assertEqual(self._gate()[1], int(NOW + HOUR))
+
+    def test_an_earlier_candidate_reset_arms_the_crossover_poll(self) -> None:
+        """Pressure grows as one over the hours left, so an account whose
+        window closes sooner gains it faster and overtakes with nothing else
+        moving. The reset boundary is days away and usage need not change, so
+        neither of the gate's other wake-ups can catch it."""
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 90.0, None, _iso(NOW + 6 * DAY))
+        self._save_with_usage("soon", _creds("a"), _account("a@x"), 0.0, 60.0, None, _iso(NOW + 3 * DAY))
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[1], int(NOW + cc.CROSSOVER_POLL_SECONDS))
+
+    def test_a_later_candidate_reset_does_not_arm_the_poll(self) -> None:
+        """Provably unnecessary: the trigger's drift has the sign of
+        (candidate ttr - active ttr), so here it drifts the safe way."""
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 90.0, None, _iso(NOW + 2 * DAY))
+        self._save_with_usage("later", _creds("a"), _account("a@x"), 0.0, 60.0, None, _iso(NOW + 6 * DAY))
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[1], int(NOW + 2 * DAY))
+
+    def test_alpha_zero_never_polls(self) -> None:
+        """Pressure does not depend on time there, so the hole does not exist
+        and closing it must cost nothing."""
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 90.0, None, _iso(NOW + 6 * DAY))
+        self._save_with_usage("soon", _creds("a"), _account("a@x"), 0.0, 60.0, None, _iso(NOW + 3 * DAY))
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[1], int(NOW + 3 * DAY))
+
+    def test_a_nearer_reset_wins_over_the_poll(self) -> None:
+        """The poll is a ceiling on lateness, not a replacement deadline."""
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 90.0, None, _iso(NOW + 6 * DAY))
+        self._save_with_usage("soon", _creds("a"), _account("a@x"), 0.0, 60.0, None, _iso(NOW + 300))
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[1], int(NOW + 300))
+
+    def test_the_poll_can_be_turned_off(self) -> None:
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 90.0, None, _iso(NOW + 6 * DAY))
+        self._save_with_usage("soon", _creds("a"), _account("a@x"), 0.0, 60.0, None, None)
+        with patch.object(cc, "CROSSOVER_POLL_SECONDS", 0.0):
+            cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[1], int(NOW + 6 * DAY))
+
+    def test_the_poll_is_armed_even_with_no_reset_known_anywhere(self) -> None:
+        """`earliest_future_reset` returns 0 for 'never'; the poll still needs
+        to be expressible on top of that."""
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 90.0, None, None)
+        self._save_with_usage("soon", _creds("a"), _account("a@x"), 0.0, 60.0, None, _iso(NOW + 3 * DAY))
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[1], int(NOW + cc.CROSSOVER_POLL_SECONDS))
+
+    def test_the_trigger_is_unchanged_when_both_windows_are_unknown(self) -> None:
+        """Null resets on both sides: the inversion has to be a no-op."""
+        self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 20.0)
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[3], int((20 + cc.BALANCE_GAP_7D) * 10))
+
+    def test_an_urgent_active_account_raises_the_trigger(self) -> None:
+        """75% resetting in twelve hours must not be abandoned for a safe 20%,
+        so the wake-up point has to sit above where we already are.
+
+        The candidate's 80pp over six days is worth 93.3% on this account's
+        twelve-hour scale, so the trigger lands at 98.3% — 23pp above the 75%
+        we are at, where the old rule would have woken a tick immediately.
+        """
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 75.0, None, _iso(NOW + 12 * HOUR))
+        self._save_with_usage("roomy", _creds("a"), _account("a@x"), 0.0, 20.0, None, _iso(NOW + 6 * DAY))
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[3], 984)
+        self.assertGreater(self._gate()[3], 750)
+
+    def test_an_urgent_candidate_lowers_the_trigger_to_zero(self) -> None:
+        """A candidate that beats us from any usage at all: wake immediately,
+        and do not write a negative number the shell cannot compare."""
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 10.0, None, _iso(NOW + 6 * DAY))
+        self._save_with_usage("urgent", _creds("a"), _account("a@x"), 0.0, 40.0, None, _iso(NOW + 2 * HOUR))
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[3], 0)
+
+    def test_alpha_zero_reproduces_the_old_trigger_exactly(self) -> None:
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 75.0, None, _iso(NOW + 12 * HOUR))
+        self._save_with_usage("roomy", _creds("a"), _account("a@x"), 0.0, 20.0, None, _iso(NOW + 6 * DAY))
+        with patch.object(cc, "URGENCY_ALPHA", 0.0):
+            cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[3], int((20 + cc.BALANCE_GAP_7D) * 10))
+
+    def test_a_candidate_about_to_reset_does_not_move_the_trigger(self) -> None:
+        """It gets no urgency credit, so it is worth its plain 40% here."""
+        self._save_with_usage("me", _creds("m"), _account("m@x"), 0.0, 10.0, None, None)
+        self._save_with_usage("doomed", _creds("a"), _account("a@x"), 0.0, 40.0, None, _iso(NOW + 300))
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(self._gate()[3], int((40 + cc.BALANCE_GAP_7D) * 10))
+
+    def test_a_nan_utilization_does_not_crash_the_gate(self) -> None:
+        """A NaN reaching `math.ceil` is a crashing tick on every render, and
+        `max(0.0, nan)` would otherwise write a trigger of zero — which the
+        statusline satisfies on every render, spawning one either way.
+
+        It reads as 0% instead, the same as any other unusable utilization has
+        always read here, so the trigger is an ordinary number and the live
+        fetch on the next tick replaces the damaged snapshot.
+        """
+        self._save_with_usage("other", _creds("a"), _account("a@x"), 10.0, 20.0)
+        path = self._profile_path("other")
+        data = json.loads(path.read_text())
+        data["usage"]["seven_day"]["utilization"] = float("nan")
+        path.write_text(json.dumps(data))
+        cc.recompute_gate("me", NOW)
+        self.assertEqual(len(self._gate()), 6)
+        self.assertEqual(self._gate()[3], int(cc.BALANCE_GAP_7D * 10))
+        self.assertGreater(self._gate()[3], 0)
 
     def test_not_before_is_max_of_settle_and_exhausted(self) -> None:
         cc.write_epoch_file(self.settle_file, NOW + 60)
@@ -1515,6 +2051,20 @@ class TestAutoCommand(AutoBaseTest):
             cc.cmd_auto(argparse.Namespace(action="off"))
         self.assertFalse(cc.auto_enabled())
         self.assertFalse(self.gate_file.exists())
+
+    def test_status_reports_the_urgency_exponent(self) -> None:
+        """Under a burn-rate rule the thresholds alone do not explain a switch."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cc.cmd_auto(argparse.Namespace(action="status"))
+        self.assertIn("urgency exponent", out.getvalue())
+        self.assertIn("headroom per hour", out.getvalue())
+
+    def test_status_names_the_old_rule_at_alpha_zero(self) -> None:
+        out = io.StringIO()
+        with patch.object(cc, "URGENCY_ALPHA", 0.0), contextlib.redirect_stdout(out):
+            cc.cmd_auto(argparse.Namespace(action="status"))
+        self.assertIn("lowest weekly usage", out.getvalue())
 
     def test_status_reports_disabled_by_default(self) -> None:
         out = io.StringIO()
@@ -1594,6 +2144,111 @@ class TickTestCase(AutoBaseTest):
 
     def _patch_usage(self, five: float, seven: float, r5: str | None = None, r7: str | None = None) -> object:
         return patch.object(cc, "fetch_usage", return_value=(200, _api_usage(five, seven, r5, r7)))
+
+
+class TestTickWeighsDeadlines(TickTestCase):
+    """The change, end to end through cmd_tick."""
+
+    def test_it_stays_on_an_urgent_account_a_roomy_one_would_have_won(self) -> None:
+        """The reported failure. Active 75% resetting in twelve hours against
+        a candidate at 20% resetting in six days: the old rule moved and
+        destroyed 25pp, this one stays and burns them."""
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"),
+                              0.0, 20.0, None, _iso(NOW + 6 * DAY))
+        with self._patch_usage(0.0, 20.0, None, _iso(NOW + 6 * DAY)):
+            cc.cmd_tick(self._tick_args(0.0, 75.0, None, str(int(NOW + 12 * HOUR))))
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_alpha_zero_still_moves_to_the_lower_account(self) -> None:
+        """The same inputs under the old rule, to show the difference is the
+        exponent and nothing else."""
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"),
+                              0.0, 20.0, None, _iso(NOW + 6 * DAY))
+        with patch.object(cc, "URGENCY_ALPHA", 0.0), self._patch_usage(0.0, 20.0, None, _iso(NOW + 6 * DAY)):
+            cc.cmd_tick(self._tick_args(0.0, 75.0, None, str(int(NOW + 12 * HOUR))))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_it_moves_to_an_urgent_account_from_a_roomy_one(self) -> None:
+        """The mirror image: the 25pp about to expire are the ones to spend."""
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"),
+                              0.0, 75.0, None, _iso(NOW + 12 * HOUR))
+        with self._patch_usage(0.0, 75.0, None, _iso(NOW + 12 * HOUR)):
+            cc.cmd_tick(self._tick_args(0.0, 20.0, None, str(int(NOW + 6 * DAY))))
+        self.assertEqual(cc.read_active(), "vlad")
+        self.assertIn("(balance)", self._log_text())
+
+    def test_equal_deadlines_behave_exactly_as_before(self) -> None:
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"),
+                              0.0, 20.0, None, _iso(NOW + 6 * DAY))
+        with self._patch_usage(0.0, 20.0, None, _iso(NOW + 6 * DAY)):
+            cc.cmd_tick(self._tick_args(0.0, 75.0, None, str(int(NOW + 6 * DAY))))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_an_account_about_to_reset_is_not_a_balance_reason(self) -> None:
+        """Two token rotations for headroom that cannot be spent."""
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"),
+                              0.0, 90.0, None, _iso(NOW + 300))
+        with self._patch_usage(0.0, 90.0, None, _iso(NOW + 300)):
+            cc.cmd_tick(self._tick_args(0.0, 20.0, None, str(int(NOW + 6 * DAY))))
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_an_account_about_to_reset_still_rescues_a_limit(self) -> None:
+        """Any account beats none, and it resets into a full week shortly."""
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"),
+                              0.0, 10.0, None, _iso(NOW + 300))
+        with self._patch_usage(0.0, 10.0, None, _iso(NOW + 300)):
+            cc.cmd_tick(self._tick_args(cc.EXIT_5H, 20.0, None, str(int(NOW + 6 * DAY))))
+        self.assertEqual(cc.read_active(), "vlad")
+
+    def test_the_live_recheck_uses_the_live_deadline(self) -> None:
+        """The stored snapshot says the candidate resets soon and is worth
+        moving to; the live fetch says its window rolled over into a fresh
+        week. Weighing the fresh percentage against the stale deadline would
+        switch on a reason that no longer exists."""
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"),
+                              0.0, 60.0, None, _iso(NOW + 2 * HOUR))
+        with self._patch_usage(0.0, 60.0, None, _iso(NOW + 6 * DAY)):
+            cc.cmd_tick(self._tick_args(0.0, 20.0, None, str(int(NOW + 6 * DAY))))
+        self.assertEqual(cc.read_active(), "me")
+        self.assertIn("no reason to move", self._log_text())
+
+    def test_an_unreachable_candidate_backs_off_on_a_balance_reason_too(self) -> None:
+        """Nothing was recorded, so the identical trigger is written back and
+        the next render fires again. The retry pause is the only bound, and it
+        used to be armed for limits alone — survivable while the balance
+        trigger sat a gap above zero, and not since it can be inverted to it.
+        """
+        with patch.object(cc, "fetch_usage", return_value=(0, {"error": {"message": "boom"}})):
+            cc.cmd_tick(self._tick_args(10.0, 40.0))
+        self.assertEqual(cc.read_active(), "me")
+        self.assertEqual(cc.read_epoch_file(self.settle_file), int(NOW + cc.RETRY_SECONDS))
+        self.assertFalse(self.exhausted_file.exists())
+
+    def test_a_reachable_candidate_that_declines_does_not_back_off(self) -> None:
+        """That path recorded a fresh snapshot, so the next gate is different
+        and it converges without a pause."""
+        with self._patch_usage(5.0, 39.0):
+            cc.cmd_tick(self._tick_args(10.0, 40.0))
+        self.assertEqual(cc.read_active(), "me")
+        self.assertFalse(self.settle_file.exists())
+
+
+class TestTickAtANonUnitExponent(TickTestCase):
+    """The exponent has to reach the live decision, not just the scorer."""
+
+    def test_alpha_two_moves_where_alpha_one_stays(self) -> None:
+        """Active 15% resetting in 96h, candidate 60% resetting in 48h. At
+        alpha 1 the active account is the more urgent of the two and we stay;
+        at alpha 2 the nearer deadline wins and we move."""
+        self._save_with_usage("vlad", _creds("token-vlad"), _account("vlad@example.com"),
+                              0.0, 60.0, None, _iso(NOW + 48 * HOUR))
+        args = self._tick_args(0.0, 15.0, None, str(int(NOW + 96 * HOUR)))
+        with patch.object(cc, "URGENCY_ALPHA", 1.0), self._patch_usage(0.0, 60.0, None, _iso(NOW + 48 * HOUR)):
+            cc.cmd_tick(args)
+        self.assertEqual(cc.read_active(), "me")
+        with patch.object(cc, "URGENCY_ALPHA", 2.0), self._patch_usage(0.0, 60.0, None, _iso(NOW + 48 * HOUR)):
+            cc.cmd_tick(self._tick_args(0.0, 15.0, None, str(int(NOW + 96 * HOUR))))
+        self.assertEqual(cc.read_active(), "vlad")
 
 
 class TestTick(TickTestCase):
@@ -1906,6 +2561,35 @@ class TestUsageCommand(AutoBaseTest):
         with patch.object(cc, "fetch_usage", return_value=(200, _api_usage(0.0, 0.0))), contextlib.redirect_stdout(out):
             cc.cmd_usage(argparse.Namespace(json=False))
         self.assertIn("refresh token expired", out.getvalue())
+
+    def test_the_table_carries_the_burn_column(self) -> None:
+        """The rate is what every decision now turns on, so `usage` has to
+        show it. `_burn_cell` passing in isolation proves nothing if the
+        column is never wired into the header or the rows."""
+        out = io.StringIO()
+        with (
+            patch.object(cc, "fetch_usage", return_value=(200, _api_usage(0.0, 75.0, None, _iso(NOW + 12 * HOUR)))),
+            patch.object(cc, "URGENCY_ALPHA", 1.0),
+            contextlib.redirect_stdout(out),
+        ):
+            cc.cmd_usage(argparse.Namespace(json=False))
+        text = out.getvalue()
+        self.assertIn("BURN", text.splitlines()[0])
+        # 25pp of headroom over twelve hours.
+        self.assertIn("2.08", text)
+        self.assertIn("percentage points per hour", text)
+
+    def test_the_burn_column_follows_the_exponent(self) -> None:
+        """At alpha 0 the rate is plain headroom, so the same board prints a
+        different number — the column reads the live knob, not a constant."""
+        out = io.StringIO()
+        with (
+            patch.object(cc, "fetch_usage", return_value=(200, _api_usage(0.0, 75.0, None, _iso(NOW + 12 * HOUR)))),
+            patch.object(cc, "URGENCY_ALPHA", 0.0),
+            contextlib.redirect_stdout(out),
+        ):
+            cc.cmd_usage(argparse.Namespace(json=False))
+        self.assertIn("25.00", out.getvalue())
 
     def test_json_output_is_machine_readable(self) -> None:
         out = io.StringIO()
@@ -3252,6 +3936,72 @@ class TestPickRescuesADeadLoginToo(AutoBaseTest):
         self.assertIn("No usable account with headroom", out.getvalue())
 
 
+class TestPickWeighsDeadlines(AutoBaseTest):
+    """`pick` and the tick must answer the same question the same way.
+
+    Two decision sites that disagree is the failure this shares a scorer to
+    avoid: auto moves to the urgent account and the next `pick` hands it
+    straight back.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 0.0, 75.0)
+        self._save_with_usage("urgent", _creds("token-urgent"), _account("u@x"), 0.0, 60.0)
+        self._save_with_usage("roomy", _creds("token-roomy"), _account("r@x"), 0.0, 20.0)
+        cc.write_active("me")
+
+    def _usage(self, me_r7: float, urgent_r7: float, roomy_r7: float) -> object:
+        table = {
+            "token-me": (200, _api_usage(0.0, 75.0, None, _iso(me_r7))),
+            "token-urgent": (200, _api_usage(0.0, 60.0, None, _iso(urgent_r7))),
+            "token-roomy": (200, _api_usage(0.0, 20.0, None, _iso(roomy_r7))),
+        }
+        return patch.object(cc, "fetch_usage", side_effect=lambda token: table[token])
+
+    def test_it_takes_the_most_urgent_not_the_lowest(self) -> None:
+        """60% resetting in six hours outranks 20% resetting in six days."""
+        with self._usage(NOW + 6 * DAY, NOW + 6 * HOUR, NOW + 6 * DAY), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(cc.read_active(), "urgent")
+
+    def test_alpha_zero_takes_the_lowest_weekly_account(self) -> None:
+        with patch.object(cc, "URGENCY_ALPHA", 0.0), self._usage(NOW + 6 * DAY, NOW + 6 * HOUR, NOW + 6 * DAY), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(cc.read_active(), "roomy")
+
+    def test_equal_deadlines_take_the_lowest_weekly_account(self) -> None:
+        with self._usage(NOW + 6 * DAY, NOW + 6 * DAY, NOW + 6 * DAY), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(cc.read_active(), "roomy")
+
+    def test_it_stays_on_a_more_urgent_active_account(self) -> None:
+        with self._usage(NOW + 6 * HOUR, NOW + 6 * DAY, NOW + 6 * DAY), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(cc.read_active(), "me")
+
+    def test_the_exponent_reaches_pick_too(self) -> None:
+        """`pick` shares the scorer, so it has to move with the knob."""
+        with patch.object(cc, "URGENCY_ALPHA", 2.0), self._usage(NOW + 6 * DAY, NOW + 6 * HOUR, NOW + 6 * DAY), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(cc.read_active(), "urgent")
+
+    def test_it_still_escapes_a_nearly_spent_active_account(self) -> None:
+        """The churn guard must not leak into the escape path: sitting on 99%
+        with 94% available and refusing to move is not a defensible answer.
+        """
+        table = {
+            "token-me": (200, _api_usage(10.0, 99.0)),
+            "token-urgent": (200, _api_usage(5.0, cc.ENTER_7D)),
+            "token-roomy": (200, _api_usage(5.0, cc.ENTER_7D)),
+        }
+        with patch.object(cc, "fetch_usage", side_effect=lambda t: table[t]), _silence():
+            cc.cmd_pick(argparse.Namespace())
+        self.assertEqual(cc.read_active(), "roomy")
+
+
 class TestPickTakesTheLowestAccount(AutoBaseTest):
     """Live numbers decide, and every candidate is checked before deciding."""
 
@@ -3310,7 +4060,7 @@ class TestPickTakesTheLowestAccount(AutoBaseTest):
         ):
             cc.cmd_pick(argparse.Namespace())
         self.assertEqual(cc.read_active(), "me")
-        self.assertIn("nothing lower available", out.getvalue())
+        self.assertIn("nothing better available", out.getvalue())
 
     def test_active_is_resolved_under_the_lock(self) -> None:
         """Resolving before the lock would let a completed switch mislead us."""

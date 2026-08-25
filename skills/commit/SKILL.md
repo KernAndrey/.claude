@@ -129,7 +129,9 @@ Review all changes and group them into logical commits. A logical commit is a co
   import subprocess
   from pathlib import Path
   from validators.manifest import validate
-  diff = subprocess.run(['git', 'diff', '--cached'], capture_output=True, text=True).stdout
+  # .strip() matters: scaffold_manifest.py and the hook both hash the stripped
+  # diff, so without it the validator reports a bogus stale_hash on a fresh manifest.
+  diff = subprocess.run(['git', 'diff', '--cached'], capture_output=True, text=True).stdout.strip()
   print(validate(Path('.review/manifest.yaml').read_text(), diff, Path.cwd()).to_text())
   "
   ```
@@ -137,7 +139,16 @@ Review all changes and group them into logical commits. A logical commit is a co
   Three failures recur:
   - `uncovered_file` — every file in the staged diff must be claimed by exactly one chunk.
   - `missing_related_file` — `default_related_files` must point at paths that exist; a task file moved between `tasks/N-*/` folders breaks it.
-  - `stale_hash` — re-staging changes the diff hash, so regenerate the manifest after any re-stage (`python3 ~/.claude/review/scripts/scaffold_manifest.py`).
+  - `stale_hash` — re-staging changes the diff hash, so regenerate the manifest after any re-stage (`python3 ~/.claude/review/scripts/scaffold_manifest.py`). To keep hand-written `chunks:` across a re-stage, patch the `diff_hash:` line alone rather than re-scaffolding:
+
+    ```bash
+    NEW=$(PYTHONPATH="$HOME/.claude/review" python3 -c "
+    import subprocess
+    from approvals import diff_hash
+    print(diff_hash(subprocess.run(['git','diff','--cached'],capture_output=True,text=True).stdout.strip()))
+    ")
+    sed -i "s/^diff_hash: .*/diff_hash: $NEW/" .review/manifest.yaml
+    ```
 - Valid standalone `test:` commits: test refactoring, adding coverage for previously untested existing code, migrating to a new test framework or fixtures.
 
 ## Phase 5: Lint Check

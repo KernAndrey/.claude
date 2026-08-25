@@ -31,8 +31,19 @@ MODEL=$(json_val "display_name" | sed 's/ ([^)]*context)//') # strip "(1M contex
 CTX=$(json_num "used_percentage")  # context window used %
 FIVE_H=$(json_nested "five_hour" "used_percentage")
 WEEK=$(json_nested "seven_day" "used_percentage")
+# `resets_at` is a *number* — Unix epoch seconds — in the statusline payload,
+# and an ISO string everywhere the OAuth usage API is the source. The string
+# extractor alone matched nothing on every single render, so the active
+# account's snapshot recorded a null weekly deadline for months while every
+# other account got a real one; nothing could tell a window closing in twelve
+# hours from one closing in six days. The numeric extractor alone is no good
+# either: its `sed 's/.*://'` is greedy and an ISO timestamp is full of
+# colons, so `"resets_at":"2026-08-27T13:59:59Z"` comes out as `59Z`. String
+# first, number second, and cc-switch parses whichever arrived.
 RESETS_5H=$(json_nested_str "five_hour" "resets_at")
+[ -z "$RESETS_5H" ] && RESETS_5H=$(json_nested "five_hour" "resets_at")
 RESETS_7D=$(json_nested_str "seven_day" "resets_at")
+[ -z "$RESETS_7D" ] && RESETS_7D=$(json_nested "seven_day" "resets_at")
 
 # `.live` holds the account cc-switch last resolved from the real credentials.
 # `.active` is only a fallback: it goes stale the moment Claude Code logs into

@@ -396,6 +396,46 @@ def parse_iso(ts: object) -> float | None:
         return None
 
 
+def timestamp_arg_to_iso(raw: str | None) -> str | None:
+    """Normalise a `--resets-*` argument to the ISO form the API produces.
+
+    Two producers disagree about the shape of a reset deadline. The OAuth
+    usage endpoint returns an ISO 8601 string; the Claude Code statusline
+    payload documents `resets_at` as a *number* — Unix epoch seconds — and
+    argparse hands every value over as text. Converting once, here at the
+    edge, keeps one shape on disk, so `parse_iso` and every reader below it
+    stay single-format and `usage --json` never emits two.
+
+    ISO is tried first on purpose: `float()` reads a hand-written
+    `"20260827"` as epoch 20260827 — August 1970 — which would silently
+    declare a live window rolled over. `fromisoformat` reads it as the date
+    it plainly is.
+
+    Every rejection matters, and the one range check makes all of them. The
+    shell forwards whatever it found rather than parsing, so a JSON `null`
+    arrives as the literal string and `float()` refuses it. NaN passes
+    `float()` and then loses every comparison, including this one, so the
+    chain is False and it falls out; infinity and a finite but absurd value
+    (1e300, which clears every other numeric check and then raises inside
+    `datetime.fromtimestamp`) both fail the ceiling. Zero is how every other
+    epoch field in this file spells "no deadline", so the bound is exclusive
+    at the bottom. An explicit `math.isfinite` in front of this read as the
+    thing keeping NaN out and was doing nothing — no mutation of it could
+    change an answer.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    if parse_iso(raw) is not None:
+        return raw
+    try:
+        epoch = float(raw)
+    except ValueError:
+        return None
+    if not 0 < epoch <= MAX_EPOCH:
+        return None
+    return _dt.datetime.fromtimestamp(epoch, _dt.UTC).isoformat()
+
+
 def read_epoch_file(path: Path) -> float:
     """Read a deadline written as plain text; 0.0 when missing or unreadable.
 
@@ -1621,7 +1661,10 @@ def _tick_locked(args: argparse.Namespace, now: float) -> int:
         return EXIT_OK
     five = min(max(five, 0.0), 100.0)
     seven = min(max(seven, 0.0), 100.0)
-    record_usage_snapshot(active, make_snapshot(five, seven, args.resets_5h or None, args.resets_7d or None))
+    record_usage_snapshot(
+        active,
+        make_snapshot(five, seven, timestamp_arg_to_iso(args.resets_5h), timestamp_arg_to_iso(args.resets_7d)),
+    )
     ranked = rank_candidates(now, active)
     reason = switch_reason(five, seven, ranked[0].seven_day if ranked else 100.0)
     if reason is None:
@@ -1860,8 +1903,14 @@ def build_parser() -> argparse.ArgumentParser:
     t = sub.add_parser("tick", help="internal: one auto-switch evaluation (called by the statusline)")
     t.add_argument("--5h", dest="five_hour", type=float, required=True, help="active account 5h utilization")
     t.add_argument("--7d", dest="seven_day", type=float, required=True, help="active account 7d utilization")
-    t.add_argument("--resets-5h", dest="resets_5h", default=None, help="ISO timestamp, may be empty")
-    t.add_argument("--resets-7d", dest="resets_7d", default=None, help="ISO timestamp, may be empty")
+    t.add_argument(
+        "--resets-5h", dest="resets_5h", default=None,
+        help="epoch seconds (statusline) or ISO timestamp (API), may be empty",
+    )
+    t.add_argument(
+        "--resets-7d", dest="resets_7d", default=None,
+        help="epoch seconds (statusline) or ISO timestamp (API), may be empty",
+    )
     t.set_defaults(func=cmd_tick)
 
     pk = sub.add_parser("pick", help="switch to the account with the lowest weekly usage")

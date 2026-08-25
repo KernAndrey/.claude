@@ -1132,6 +1132,62 @@ class AutoBaseTest(BaseTest):
         return self.log_file.read_text() if self.log_file.exists() else ""
 
 
+class TestTimestampArgToIso(unittest.TestCase):
+    """The two producers of a reset deadline disagree about its shape.
+
+    The OAuth usage endpoint returns an ISO 8601 string. The Claude Code
+    statusline payload documents `resets_at` as a *number* — Unix epoch
+    seconds — and argparse hands every value over as text. Converting once
+    here keeps one shape on disk, so every reader below stays single-format.
+    """
+
+    def test_epoch_seconds_become_iso(self) -> None:
+        self.assertEqual(cc.parse_iso(cc.timestamp_arg_to_iso("1787803200")), 1787803200.0)
+
+    def test_a_fractional_epoch_is_accepted(self) -> None:
+        """The payload says number, not integer."""
+        self.assertEqual(cc.parse_iso(cc.timestamp_arg_to_iso("1787803200.5")), 1787803200.5)
+
+    def test_an_iso_string_passes_through_unchanged(self) -> None:
+        self.assertEqual(cc.timestamp_arg_to_iso("2026-08-27T04:00:00Z"), "2026-08-27T04:00:00Z")
+
+    def test_a_date_is_read_as_a_date_not_an_epoch(self) -> None:
+        """`float("20260827")` is August 1970 and would zero a live window."""
+        self.assertGreater(cc.parse_iso(cc.timestamp_arg_to_iso("20260827")), 1_600_000_000.0)
+
+    def test_the_literal_null_is_rejected(self) -> None:
+        """New input shape: the shell forwards `null` rather than an empty
+        string now that it reads unquoted values too."""
+        self.assertIsNone(cc.timestamp_arg_to_iso("null"))
+
+    def test_none_is_rejected(self) -> None:
+        self.assertIsNone(cc.timestamp_arg_to_iso(None))
+
+    def test_an_empty_string_is_rejected(self) -> None:
+        self.assertIsNone(cc.timestamp_arg_to_iso(""))
+
+    def test_garbage_is_rejected(self) -> None:
+        self.assertIsNone(cc.timestamp_arg_to_iso("not-a-date"))
+
+    def test_nan_is_rejected(self) -> None:
+        """`float()` accepts it and every later comparison would be false."""
+        self.assertIsNone(cc.timestamp_arg_to_iso("nan"))
+
+    def test_infinity_is_rejected(self) -> None:
+        self.assertIsNone(cc.timestamp_arg_to_iso("inf"))
+
+    def test_an_absurd_epoch_is_rejected(self) -> None:
+        """1e300 passes every numeric check and then raises in fromtimestamp."""
+        self.assertIsNone(cc.timestamp_arg_to_iso("1e300"))
+
+    def test_a_negative_epoch_is_rejected(self) -> None:
+        self.assertIsNone(cc.timestamp_arg_to_iso("-1"))
+
+    def test_zero_is_rejected(self) -> None:
+        """0 is how every other epoch field in this file spells 'no deadline'."""
+        self.assertIsNone(cc.timestamp_arg_to_iso("0"))
+
+
 class TestEffectiveUsage(unittest.TestCase):
     def test_no_snapshot_is_zero(self) -> None:
         self.assertEqual(cc.effective_usage(None, NOW), (0.0, 0.0))
@@ -1473,6 +1529,55 @@ class TestAutoCommand(AutoBaseTest):
         with contextlib.redirect_stdout(out):
             cc.cmd_auto(argparse.Namespace(action="status"))
         self.assertIn("exhausted", out.getvalue())
+
+
+class TestTickStoresTheActiveDeadline(AutoBaseTest):
+    """The active account's own weekly deadline, end to end through cmd_tick.
+
+    The statusline sends epoch seconds and the extractor only matched quoted
+    strings, so this field was null on every snapshot the tick ever wrote —
+    for the one account whose numbers actually drive a decision. Every other
+    profile got a real deadline from the API, so nothing looked wrong.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._write_creds(_creds("token-me"))
+        self._write_main(_account("me@example.com"))
+        self._save_with_usage("me", _creds("token-me"), _account("me@example.com"), 0.0, 0.0)
+        cc.write_active("me")
+        self._enable_auto()
+
+    def test_epoch_seconds_are_stored_as_a_real_deadline(self) -> None:
+        cc.cmd_tick(self._tick_args(1.0, 2.0, str(int(NOW + HOUR)), str(int(NOW + DAY))))
+        stored = self._stored_usage("me")
+        self.assertEqual(cc.parse_iso(stored["seven_day"]["resets_at"]), NOW + DAY)
+        self.assertEqual(cc.parse_iso(stored["five_hour"]["resets_at"]), NOW + HOUR)
+
+    def test_an_iso_deadline_is_stored_too(self) -> None:
+        """The API's shape must keep working through the same path."""
+        cc.cmd_tick(self._tick_args(1.0, 2.0, None, _iso(NOW + DAY)))
+        self.assertEqual(cc.parse_iso(self._stored_usage("me")["seven_day"]["resets_at"]), NOW + DAY)
+
+    def test_a_null_deadline_stores_nothing(self) -> None:
+        """The shell forwards the literal `null` now that it reads numbers."""
+        cc.cmd_tick(self._tick_args(1.0, 2.0, "null", "null"))
+        self.assertIsNone(self._stored_usage("me")["seven_day"]["resets_at"])
+
+    def test_the_stored_deadline_reaches_the_exhaustion_check(self) -> None:
+        """`.exhausted` scans every profile, the active one included, and
+        could never see its windows while this field was null."""
+        cc.cmd_tick(self._tick_args(1.0, 2.0, None, str(int(NOW + DAY))))
+        self.assertEqual(cc.earliest_future_reset(["me"], NOW), NOW + DAY)
+
+    def test_a_rolled_over_weekly_window_now_zeroes_itself(self) -> None:
+        """`_window_value` zeroes a window past its reset. With the deadline
+        missing it never could, so a stale weekly figure kept the active
+        account looking spent long after its window had rolled over."""
+        cc.cmd_tick(self._tick_args(1.0, 90.0, None, str(int(NOW + HOUR))))
+        stored = self._stored_usage("me")
+        self.assertEqual(cc.effective_usage(stored, NOW)[1], 90.0)
+        self.assertEqual(cc.effective_usage(stored, NOW + 2 * HOUR)[1], 0.0)
 
 
 class TickTestCase(AutoBaseTest):

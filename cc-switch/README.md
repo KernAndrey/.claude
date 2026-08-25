@@ -67,6 +67,19 @@ lowest one — stored snapshots only order the checks. It follows the same
 dead-login rule as the automatic path: with no live credentials it considers
 every profile, the one `.active` names included.
 
+The reset deadlines the statusline forwards arrive as *numbers* — Unix epoch
+seconds — while the same field from the OAuth usage API is an ISO string.
+Both are read, string form first: the numeric extractor's `sed` is greedy and
+an ISO timestamp is full of colons, so it would reduce one to `59Z`. For
+months only the string form was tried, which matched nothing on every render,
+so the active account — the one whose numbers actually drive a decision —
+stored a null weekly deadline while every other account got a real one from
+the API. `cc-switch` parses whichever shape arrived and stores one.
+
+The two window keys are absent whenever the API stops reporting them, so a
+payload without them is ordinary rather than broken; the tick is skipped
+entirely, exactly as it is when no percentages arrive.
+
 The statusline's own check is a trigger, not a parser. It reads the
 credentials file as text with every space, tab and newline removed — JSON
 allows any amount of either around a colon, and matching the spellings one

@@ -26,12 +26,18 @@ if str(_ROOT) not in sys.path:
 
 SCRIPT = _ROOT.parent / "statusline-command.sh"
 
+#: `resets_at` is a NUMBER — Unix epoch seconds — not a quoted string. The
+#: fixture claimed a string for months and hid a total extraction failure:
+#: every render told the tick the active account had no weekly deadline.
+FIVE_RESET = 1787857200
+SEVEN_RESET = 1787803200
+
 PAYLOAD = {
     "model": {"display_name": "Opus 5"},
     "context_window": {"used_percentage": 8},
     "rate_limits": {
-        "five_hour": {"used_percentage": 26, "resets_at": "2026-08-21T19:00:00Z"},
-        "seven_day": {"used_percentage": 48, "resets_at": "2026-08-27T04:00:00Z"},
+        "five_hour": {"used_percentage": 26, "resets_at": FIVE_RESET},
+        "seven_day": {"used_percentage": 48, "resets_at": SEVEN_RESET},
     },
 }
 
@@ -142,6 +148,67 @@ class TestItRunsCleanly:
 
     def test_no_error_with_auto_off(self, harness: Harness) -> None:
         assert harness.run().stderr == ""
+
+
+class TestTheResetsReachTheTick:
+    """The deadline is half the decision, and nothing asserted on it before.
+
+    The payload documents `resets_at` as a number — Unix epoch seconds — and
+    the extractor here matched only a quoted string, so every tick was told
+    the active account had no weekly window. Its snapshot recorded a null
+    deadline for months while every other account got a real one from the
+    API. Nothing in this file looked at the value, which is exactly why it
+    survived.
+    """
+
+    def test_the_weekly_reset_reaches_the_tick(self, harness: Harness) -> None:
+        harness.enable_auto()
+        harness.write_gate(0, 0, 95, 47, int(time.time()) + 86400)
+        harness.run()
+        assert f"--resets-7d {SEVEN_RESET}" in harness.ticks()[0]
+
+    def test_the_five_hour_reset_reaches_the_tick(self, harness: Harness) -> None:
+        harness.enable_auto()
+        harness.write_gate(0, 0, 95, 47, int(time.time()) + 86400)
+        harness.run()
+        assert f"--resets-5h {FIVE_RESET}" in harness.ticks()[0]
+
+    def test_an_iso_reset_survives_intact(self, harness: Harness) -> None:
+        """The numeric extractor alone is not enough.
+
+        Its `sed 's/.*://'` is greedy and an ISO timestamp is full of colons,
+        so `"resets_at":"2026-08-27T13:59:59Z"` comes out as `59Z` — a value
+        that parses as nothing and silently discards the deadline. The string
+        extractor runs first for exactly this reason.
+        """
+        payload = json.loads(json.dumps(PAYLOAD))
+        payload["rate_limits"]["seven_day"]["resets_at"] = "2026-08-27T13:59:59+00:00"
+        harness.enable_auto()
+        harness.write_gate(0, 0, 95, 47, int(time.time()) + 86400)
+        harness.run(payload)
+        assert "--resets-7d 2026-08-27T13:59:59+00:00" in harness.ticks()[0]
+
+    def test_a_null_reset_is_passed_through_for_python_to_reject(self, harness: Harness) -> None:
+        """The API returns null for a window with no usage at all.
+
+        The shell is a trigger, not a parser: it forwards what it found and
+        lets cc-switch decide. `null` must not become a timestamp.
+        """
+        payload = json.loads(json.dumps(PAYLOAD))
+        payload["rate_limits"]["seven_day"]["resets_at"] = None
+        harness.enable_auto()
+        harness.write_gate(0, 0, 95, 47, int(time.time()) + 86400)
+        harness.run(payload)
+        assert "--resets-7d null" in harness.ticks()[0]
+
+    def test_an_absent_reset_still_ticks(self, harness: Harness) -> None:
+        """The window keys are documented optional; an empty value is normal."""
+        payload = json.loads(json.dumps(PAYLOAD))
+        del payload["rate_limits"]["seven_day"]["resets_at"]
+        harness.enable_auto()
+        harness.write_gate(0, 0, 95, 47, int(time.time()) + 86400)
+        harness.run(payload)
+        assert "--resets-5h" in harness.ticks()[0]
 
 
 class TestThePercentageGate:

@@ -19,7 +19,7 @@ Never invent a default to close an ambiguity. When you do not know a value, a st
 - **User's Phase 1 answers** — the clarifying answers Lead gathered before spawning you.
 - **Lead's codebase observations** — what Lead learned exploring the project (conventions, existing patterns, constraints).
 - **Spec template path** — `~/.claude/templates/sdd/spec.md` (or a project-local override). Read it to see the full section layout and inline instructions.
-- **Spec output path** — the exact path the Lead gives you (`{dir}/2-spec/{ID}-{slug}.md`, where `{dir}` is the board of the applicable `.tasks.toml`; a repo may carry several SDD roots). Create the file from the template.
+- **Spec output path** — the exact absolute path the Lead gives you. Create the file from the template there. Write it exactly as given: the board may sit in a different checkout from the working directory you research in, and a repo may carry several SDD roots — the Lead already resolved which.
 - **Project `CLAUDE.md` path** — read it for stack, conventions, and known gotchas.
 
 ## Tasks
@@ -186,7 +186,7 @@ All communication with Lead uses SendMessage. Put the signal on its own line, fi
 
 ```
 SPEC ANALYST DONE.
-Spec path: {dir}/2-spec/{ID}-{slug}.md
+Spec path: {the spec output path you were given}
 Sections populated: Objective, Key Constraints, Glossary, Scope, Assumptions, Behavior, Acceptance Criteria, Examples, Edge Cases & Risks, Affected Areas, Testing Strategy, Definition of Done, Dependencies
 Sentinel: present (one [SENTINEL] marker in Behavior)
 Blockers raised during authoring: 0

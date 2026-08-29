@@ -2,10 +2,12 @@ Generate a specification from a draft task using addressable background agents. 
 
 ## 0. Setup
 
-1. Read `.tasks.toml` for `id_prefix` and `dir`. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory. None found → tell user to run `/task-init` and stop.
+1. Read `~/.claude/templates/sdd/board-root.md` and follow it to resolve `{main_root}`, discover the SDD configs, and define `{board}`. The board lives in the main worktree — the draft and the spec are read and written there even when you are standing in a linked worktree. Select the root whose `id_prefix` matches the task ID.
+
+   `{board}` covers the board file only. `{project root}` and `Working directory` in every agent prompt below stay the **current** checkout: agents research the code where you are standing, and only the spec file lives elsewhere.
 2. Locate the target by `$ARGUMENTS` (ID, slug, or full path):
-   - Match in `{dir}/1-draft/` → `RUN_MODE = new`.
-   - Match in `{dir}/2-spec/` → `RUN_MODE = resume` (the spec already exists; you are re-entering it to resolve open blockers or apply late findings).
+   - Match in `{board}/1-draft/` → `RUN_MODE = new`.
+   - Match in `{board}/2-spec/` → `RUN_MODE = resume` (the spec already exists; you are re-entering it to resolve open blockers or apply late findings).
    - Not found → error and stop.
 3. Read the draft file content (new) or the existing spec file (resume).
 4. Read the project `CLAUDE.md` for stack and conventions.
@@ -175,7 +177,7 @@ Shared context to pass in every agent prompt:
 **New runs:** Spawn `Agent(subagent_type: "Spec-Analyst", name: "spec-analyst", run_in_background: true, prompt: "...")` and record its `agentId`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-analyst.md`
-> Spec output path: `{dir}/2-spec/{ID}-{slug}.md`
+> Spec output path: `{board}/2-spec/{ID}-{slug}.md`
 > Spec template: `~/.claude/templates/sdd/spec.md`
 > Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts). Every numbered decision MUST be reflected in the spec. Codebase observations inform your writing but don't need 1:1 mapping.**
 > User Phase 1 answers: {inline all answers — supplementary context}
@@ -203,7 +205,7 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 **New runs:** Spawn `Agent(subagent_type: "Spec-Architect", name: "spec-architect", run_in_background: true, prompt: "...")` and record its `agentId`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-architect.md`
-> Spec path: `{dir}/2-spec/{ID}-{slug}.md` (business sections already populated)
+> Spec path: `{board}/2-spec/{ID}-{slug}.md` (business sections already populated)
 > Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts — API signatures, model fields, file paths, patterns, gotchas). Every numbered decision MUST be reflected in the architecture. Codebase observations are your primary reference for integration points.**
 > User Phase 1 answers: {inline — supplementary context}
 > Project root: `{working directory}`
@@ -251,7 +253,7 @@ The four fixed critics read the spec as a document. What they cannot do is cover
 Spawn `Agent(subagent_type: "Spec-Critic-Arch", name: "spec-critic-arch", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-arch.md`
-> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
+> Spec path: `{board}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and verify EVERY numbered decision is correctly reflected in the spec. Any mismatch = CRITICAL finding. Also read `## Codebase Observations` — verify spec's integration points and API claims match the recorded observations.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -264,7 +266,7 @@ Spawn `Agent(subagent_type: "Spec-Critic-Arch", name: "spec-critic-arch", run_in
 Spawn `Agent(subagent_type: "Spec-Critic-Business", name: "spec-critic-business", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-business.md`
-> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
+> Spec path: `{board}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and verify EVERY numbered decision is correctly reflected in the spec's business sections. Any mismatch = CRITICAL finding.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -277,7 +279,7 @@ Spawn `Agent(subagent_type: "Spec-Critic-Business", name: "spec-critic-business"
 Spawn `Agent(subagent_type: "Spec-Critic-Premise", name: "spec-critic-premise", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-premise.md`
-> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
+> Spec path: `{board}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and `## Codebase Observations`. Unlike the other agents, you do NOT treat Decisions as authoritative — they are exactly what you scrutinize. Treat every claim, including every recorded user decision, as a hypothesis to disprove.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -290,7 +292,7 @@ Spawn `Agent(subagent_type: "Spec-Critic-Premise", name: "spec-critic-premise", 
 Spawn `Agent(subagent_type: "Spec-Critic-Testing", name: "spec-critic-testing", run_in_background: true, prompt: "...")`. The prompt:
 
 > Read your instructions: `~/.claude/agents/spec-critic-testing.md`
-> Spec path: `{dir}/2-spec/{ID}-{slug}.md`
+> Spec path: `{board}/2-spec/{ID}-{slug}.md`
 > Draft path: `{draft path}` — **read `## Decisions` and `## Codebase Observations`. A decision that changes behavior changes what must be tested: verify `## Testing Strategy` covers the behavior every numbered decision introduces.**
 > Working directory: `{project root}`
 > Phase 1 context: {inline user answers and Lead observations}
@@ -312,7 +314,7 @@ LENS_ID: {lens-id}
 LENS_ANGLE: {angle}
 LENS_JUSTIFICATION: {why this spec needs it}
 LENS_HUNT: {failure classes to surface}
-Spec path: {dir}/2-spec/{ID}-{slug}.md
+Spec path: {board}/2-spec/{ID}-{slug}.md
 Draft path: {draft path} — read `## Decisions` and `## Codebase Observations` for the verified ground.
 Working directory: {project root}
 Phase 1 context: {inline user answers and Lead observations}
@@ -395,22 +397,27 @@ Create a new `### b-N` entry in `## Blockers` following the same format. Continu
 
 A `/spec` run produces exactly **two** commits: the finished draft, then the finished spec. Every intermediate state — each answer, each agent round, each fix round — lives in the working tree, where `Edit` already persisted it to disk. Two commits per task keep the history readable; a commit per answer or per agent buries real changes under a dozen work-in-progress entries.
 
+Both run in `{main_root}` against absolute board paths, and both follow the two-step `add -- … && commit -- …` form from `board-root.md` §6: the commit records those paths only, so anything else staged in that checkout — which may be a checkout the user is working in right now — stays staged and uncommitted.
+
 **Commit 1 — end of Phase 1.** The draft holds every decision in `## Decisions` and every finding in `## Codebase Observations`; the question queue is empty.
 
 ```
-git add "{dir}/1-draft/{ID}-{slug}.md"
-git commit -m "spec({ID}): draft with decisions and codebase observations"
+git -C "{main_root}" add -- "{board}/1-draft/{ID}-{slug}.md"
+git -C "{main_root}" commit -m "spec({ID}): draft with decisions and codebase observations" \
+  -- "{board}/1-draft/{ID}-{slug}.md"
 ```
 
-**Commit 2 — finalization.** The spec is verified and the draft has moved to the archive (§4, step 10).
+**Commit 2 — finalization.** The spec is verified and the draft has moved to the archive (§4, step 10). On a **new** run the path list carries all three paths, which records the draft's move as a rename so the archived draft lands together with the spec:
 
 ```
-git add -A -- "{dir}/2-spec/{ID}-{slug}.md" "{dir}/archive/drafts/{ID}-{slug}.md"
-git add -A -- "{dir}/1-draft/{ID}-{slug}.md" 2>/dev/null || true
-git commit -m "spec({ID}): specification"
+PATHS=("{board}/2-spec/{ID}-{slug}.md" "{board}/archive/drafts/{ID}-{slug}.md" "{board}/1-draft/{ID}-{slug}.md")
+git -C "{main_root}" add -- "${PATHS[@]}"
+git -C "{main_root}" commit -m "spec({ID}): specification" -- "${PATHS[@]}"
 ```
 
-`-A` stages the draft's move as a rename (deletion + addition), so the archived draft lands together with the spec. The second `git add` is separate and error-tolerant on purpose: git aborts with exit 128 on a pathspec matching nothing, and the old draft path is absent on a resume run (the earlier run archived it) — a single combined command would kill the final commit of a 20-minute pipeline. A resume run produces commit 2 only, since Phase 1 is skipped and there is no draft to commit.
+On a **resume** run, drop `{board}/1-draft/{ID}-{slug}.md` from the list — an earlier run already archived it, so the path exists neither on disk nor in the index and `git add` would abort with `fatal: pathspec … did not match any files`, killing the final commit of a 20-minute pipeline. A resume run produces commit 2 only, since Phase 1 is skipped and there is no draft to commit.
+
+When `{main_root}` differs from the current directory, apply the guards in `board-root.md` §6 before each commit: commit only while `{main_root}` is on `dev` with no merge or rebase in progress; otherwise leave the change on disk uncommitted and report the reason. The spec file is still complete either way.
 
 Run both commits with `run_in_background: true` — the pre-commit review hook can take up to 20 minutes.
 
@@ -431,12 +438,12 @@ Run both commits with `run_in_background: true` — the pre-commit review hook c
 7. Verify `## Key Constraints` has 3-7 items, each tracing to Behavior or AC.
 8. Verify `## Assumptions` is populated (not just the template placeholder).
 9. Verify exactly one `[SENTINEL]` marker exists in the Behavior section.
-10. Move the draft to `{dir}/archive/drafts/` — it is consumed either way, blockers or not.
+10. Move the draft to `{board}/archive/drafts/` — it is consumed either way, blockers or not.
 11. Commit the spec and the archived draft together, as commit 2 of `## Commits`. This is the run's last action; the branches below only produce output.
 
 ### If open blockers > 0
 
-The spec stays in `{dir}/2-spec/` with `status: awaiting-approval` unchanged. Output:
+The spec stays in `{board}/2-spec/` with `status: awaiting-approval` unchanged. Output:
 
   ```
   Spec {ID} saved with {N} open blockers in ## Blockers section.

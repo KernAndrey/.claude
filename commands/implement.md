@@ -40,14 +40,24 @@ Thoroughness over speed. This task may run for hours — that is expected and ac
 
 ## Setup
 
+This command does **not** use `~/.claude/templates/sdd/board-root.md`, and `{dir}` stays repo-relative throughout. The board rule inverts here: once a worktree exists, the task file travels with the code inside it, because its move into `4-in-progress` and `5-review` must be captured by the commit.
+
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory.
 2. Find the spec by `$ARGUMENTS` (ID or slug) in `{dir}/3-ready/`. `$ARGUMENTS` is just the task identifier.
 3. Read the full specification.
 4. Branch and worktree setup:
-   - If `auto_branch = true`: fetch latest `dev` branch (`git fetch origin dev`), then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All agents work inside the worktree directory.
+   - **Preflight, before creating anything** (`auto_branch = true` only): `git fetch origin dev`, then confirm the spec is on the base branch:
+
+     ```
+     git cat-file -e origin/dev:{dir}/3-ready/{ID}-{slug}.md
+     ```
+
+     This ref takes the **repo-relative** `{dir}`. A non-zero exit means the board change never reached `origin/dev`, so the worktree would be cut without the spec in it. Report `Spec {ID} is not on origin/dev — commit and push the board first, then re-run /implement {ID}.` and stop. Checking here, rather than after `wt create`, leaves no worktree to tear down.
+   - If `auto_branch = true`: `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path returned by `wt create`. All agents work inside the worktree directory.
    - If `auto_branch = false`: stay on the current branch. Set `{worktree_path}` to the current project root directory.
+   - From here on every board path is `{worktree_path}/{dir}/…`, resolved inside the worktree — including the moves in step 6 and Phase 4.
 5. **Review prompt setup:** if the project has `.claude/review_prompt.md`, reviewers will apply it as project-specific rules (severity overrides, design decisions to treat as intentional). Note its path to pass to reviewers.
-6. Move spec to `{dir}/4-in-progress/`. Update `status: in-progress`.
+6. Move spec to `{worktree_path}/{dir}/4-in-progress/`. Update `status: in-progress`.
 7. Note the **base branch** for diffs: `dev` if `auto_branch = true`, otherwise the current branch. Reviewers will need it.
 8. Initialize an empty agent registry (`name | agentId | role | files_owned`). You append a row per spawn.
 

@@ -4,7 +4,6 @@ import subprocess
 from unittest.mock import patch
 
 import pytest
-
 from hooks.conftest import StdinSetter
 from hooks.lint import main
 
@@ -55,6 +54,22 @@ def test_main_runs_full_pipeline_in_order(stdin_payload: StdinSetter) -> None:
         ["ruff", "format", "a.py"],
         ["ruff", "check", "a.py"],
         ["ruff", "check", "--select", "ANN", "a.py"],
+    ]
+
+
+def test_main_skips_ann_for_odoo_custom_addons(stdin_payload: StdinSetter) -> None:
+    """Odoo custom addons forbid type hints by project convention, so the ANN
+    pass there is permanent false noise. The other three steps still run."""
+    path = "/home/kern/projects/odoo/custom-addons/payroll_management/models/payroll_slip.py"
+    stdin_payload({"tool_input": {"file_path": path}, "cwd": "/w"})
+    with patch("hooks.lint.subprocess.run", return_value=_completed()) as mock_run:
+        main()
+
+    commands = [call.args[0] for call in mock_run.call_args_list]
+    assert commands == [
+        ["ruff", "check", "--fix", path],
+        ["ruff", "format", path],
+        ["ruff", "check", path],
     ]
 
 

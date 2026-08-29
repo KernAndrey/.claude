@@ -14,12 +14,16 @@ This workflow runs to completion with NO human in the loop. It never pauses to a
 
 Only the lead may run git here — the workflow script itself has no shell. Do this setup before launching.
 
+This command does **not** use `~/.claude/templates/sdd/board-root.md`, and `{dir}` stays repo-relative throughout. The board rule inverts here: once a worktree exists, the task file travels with the code inside it, because its move into `4-in-progress` and `5-review` must be captured by the commit.
+
 1. Read `.tasks.toml`, `CLAUDE.md`, and the project structure. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory.
 2. Find the spec for `$ARGUMENTS` in `{dir}/3-ready/`. Read it in full.
 3. Branch and worktree:
-   - `auto_branch = true`: `git fetch origin dev`, then `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path it returns. Note `{branch} = task/{ID}-{slug}`, `{base} = dev`.
+   - **Preflight, before creating anything** (`auto_branch = true` only): `git fetch origin dev`, then `git cat-file -e origin/dev:{dir}/3-ready/{ID}-{slug}.md` — this ref takes the **repo-relative** `{dir}`. A non-zero exit means the board change never reached `origin/dev` and the worktree would be cut without the spec in it. Report `Spec {ID} is not on origin/dev — commit and push the board first, then re-run /implement-wf {ID}.` and stop, leaving no worktree to tear down.
+   - `auto_branch = true`: `wt create task/{ID}-{slug} --base origin/dev`. Set `{worktree_path}` to the path it returns. Note `{branch} = task/{ID}-{slug}`, `{base} = dev`.
    - `auto_branch = false`: stay on the current branch. `{worktree_path}` = project root, `{base}` = current branch, `{branch}` = current branch.
-4. Move the spec to `{dir}/4-in-progress/` and set frontmatter `status: in-progress`. (The workflow moves it onward to `5-review` at the end.)
+   - From here on every board path is `{worktree_path}/{dir}/…`, resolved inside the worktree.
+4. Move the spec to `{worktree_path}/{dir}/4-in-progress/` and set frontmatter `status: in-progress`. (The workflow moves it onward to `5-review` at the end.)
 5. Note the review-rules path: `{review_prompt} = .claude/review_prompt.md` if it exists, else null.
 
 ## Phase 2: Build the Coder list (lead, ~30 seconds)

@@ -16,6 +16,7 @@ Global configuration for Claude Code sessions across all projects.
   - `guides/` — SDD review runner guides
 - `templates/` — SDD spec and draft templates
 - `skills/` — On-demand instruction sets
+- `cc-switch/` — OAuth account switcher (`cc_switch.py`) and its test suite
 
 ## Code Standards
 
@@ -42,3 +43,11 @@ All Python files are checked with `ruff` on every edit (PostToolUse hook). Pre-c
 
 1. Project-local linters (if configured)
 2. AI-powered code review via `review/hook.py`
+
+## Account switching (`cc-switch`)
+
+`cc-switch/` holds the account switcher and its suite — see
+[cc-switch/README.md](cc-switch/README.md). `cc_switch.py` is symlinked as
+`~/bin/cc-switch`; `statusline-command.sh` stays here because it is Claude
+Code's status line, which `settings.json` points at, and cc-switch is only one
+block inside it.

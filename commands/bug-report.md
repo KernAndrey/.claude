@@ -6,8 +6,8 @@ You are helping a QA engineer file a bug report. Your goal is to produce a clear
 
 ### Phase 1 — Initial Context
 
-1. Locate the SDD config and read `dir` (default: `tasks`) from it. Look for `.tasks.toml` at the project root and one or two levels deep (`*/.tasks.toml`, `*/*/.tasks.toml`), skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories — a repo may carry several SDD roots, e.g. one per client. With several configs, pick the one whose directory contains the code the bug lives in, or the one a project rule names. `dir` resolves relative to that config's own directory. No `.tasks.toml` anywhere → tell the user to run `/task-init` first and stop.
-2. Read the bug counter from `{dir}/bugs/.counter`. If the file does not exist, create `{dir}/bugs/` directory and `{dir}/bugs/.counter` with `0`.
+1. Read `~/.claude/templates/sdd/board-root.md` and follow it to resolve `{main_root}`, discover the SDD configs, and define `{board}`. The board lives in the main worktree — this command allocates a bug ID from it and writes there even when you are standing in a linked worktree. With several configs, pick the one whose directory contains the code the bug lives in, or the one a project rule names.
+2. Read the bug counter from `{board}/bugs/.counter`. If the file does not exist, create the `{board}/bugs/` directory and `{board}/bugs/.counter` with `0`.
 3. The user's initial description is below in `$ARGUMENTS`. If empty, ask the user to describe what happened.
 
 ### Phase 2 — Codebase Exploration
@@ -47,8 +47,8 @@ You are helping a QA engineer file a bug report. Your goal is to produce a clear
 
 ### Phase 4 — Generate Report
 
-7. Increment the bug counter and save it back.
-8. Generate ID: `BUG-{counter:03d}`.
+7. Increment the bug counter and save it back to `{board}/bugs/.counter`.
+8. Generate ID: `BUG-{counter:03d}`, then run the free-ID check from `board-root.md` §5 against `{board}/bugs/` before using it.
 9. Generate a slug from the bug title (kebab-case, max 5 words, ASCII only).
 10. Copy template from `~/.claude/templates/sdd/bug-report.md`. If `.claude/templates/bug-report.md` exists in the project, use that instead (project override).
 11. Fill all placeholders:
@@ -66,8 +66,9 @@ You are helping a QA engineer file a bug report. Your goal is to produce a clear
     - `{{COMPONENTS}}` — list of affected files/modules you found during codebase exploration, with brief explanation of why each is relevant
     - `{{ADDITIONAL}}` — any extra context, error messages, logs, or notes
 12. Remove any sections that have no content (don't leave empty sections with just a heading).
-13. Save to `{dir}/bugs/{ID}-{slug}.md`.
-14. Output: bug ID, file path, severity, priority, brief summary.
+13. Save to `{board}/bugs/{ID}-{slug}.md`.
+14. Commit the board change per `board-root.md` §6, message `chore(sdd): add {ID} bug report`.
+15. Output: bug ID, absolute file path, severity, priority, brief summary, plus the `board-root.md` §7 report when `{main_root}` differs from the current directory.
 
 ### Formatting Rules
 

@@ -2,6 +2,8 @@ Initialize Spec-Driven Development for the current project.
 
 ## Instructions
 
+Run this from the main worktree. When `git worktree list --porcelain | awk 'NR==1{sub(/^worktree /,""); print}'` prints a path other than the current directory, you are in a linked worktree: report that path and ask the user to re-run `/task-init` there. A board initialized inside a worktree is invisible to every other checkout and dies with `wt remove`.
+
 `{root}` = where this SDD root lives. Default: the project root. When `$ARGUMENTS` names a subdirectory (e.g. `clients/acme`), initialize there instead — a repo may carry several SDD roots, one per client or sub-product, each with its own board, prefix and counter. Every path below is relative to `{root}`, and a second root needs a prefix distinct from the existing ones (`TMS` vs `TMSBD`). Counters stay independent by design — never sync one root's counter to another's. When you create a second root, note it in the repo's `CLAUDE.md` (or a rule file) with the rule for choosing between them: by task-ID prefix first, else by the code being changed.
 
 1. Read `{root}`. Determine the project type (Odoo, Django, Node.js, etc.) and a suitable short prefix (e.g. TMS, ALT, WEB — uppercase, 2-4 chars based on project name or domain).

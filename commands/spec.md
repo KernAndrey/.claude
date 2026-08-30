@@ -1,5 +1,19 @@
 Generate a specification from a draft task using addressable background agents. This command is orchestration-only — the Analyst, Architect, and Critic bodies live in `~/.claude/agents/spec-{analyst,architect,critic}.md`.
 
+## Research has no budget
+
+A mistake in the spec is the most expensive mistake in the pipeline. A wrong premise here becomes a numbered Decision, then an architecture, then code and tests built on it — and surfaces only during `/implement` or in production, when every layer above it has to be redone. Most spec mistakes trace back to research that stopped one pass too early.
+
+- Research as much as it takes: tool calls, files read, researchers spawned, follow-up passes — none of these is capped. The watchdogs are liveness timers, not deadlines; a healthy researcher that is still reading is doing its job.
+- At every transition — before merging observations, before each question, before spawning the Analyst, before each Phase 3 question — ask yourself two things: **"Do I have enough context to be right about this?"** and **"Would one more pass change the answer?"** A "no" or "not sure" on either means research more, not proceed.
+- A minute of extra research is cheaper than any question it makes unnecessary, and far cheaper than any Decision it prevents from being wrong.
+
+<bad_pattern>
+❌ BAD THOUGHT: "Three reports are in and the picture is mostly clear — time to move to questions."
+✅ REALITY: "Mostly clear" is where the wrong premise lives. The unclear part is exactly what the user will be asked about, and they will answer it as posed.
+⚠️ DETECTION: Moving to the next phase while you can name a part of the draft you have not seen the code for? → spawn a follow-up researcher or read it yourself first.
+</bad_pattern>
+
 ## 0. Setup
 
 1. Read `~/.claude/templates/sdd/board-root.md` and follow it to resolve `{main_root}`, discover the SDD configs, and define `{board}`. The board lives in the main worktree — the draft and the spec are read and written there even when you are standing in a linked worktree. Select the root whose `id_prefix` matches the task ID.
@@ -36,11 +50,11 @@ This phase is **mandatory** for new runs and cannot be skipped.
    > Project CLAUDE.md: `{path}`
    > Signal `SPEC RESEARCH REPORT [{angle}]` when done.
 
-   **Research yourself while they run** — do not wait idle. Delegating every angle leaves you judging questions from other agents' summaries, and a summary is exactly where an unverified premise slips through unnoticed.
+   **Research yourself while they run** — do not wait idle. Delegating every angle leaves you judging questions from other agents' summaries, and a summary is exactly where an unverified premise slips through unnoticed. Keep going after the reports arrive when anything is still unclear — the reports are a floor for your own reading, not a ceiling.
 
    Reject any report missing its DEPTH block, or carrying observations without `path:line`, and re-request a deeper pass — the same rule the critics get.
 
-3. **Merge into `## Codebase Observations`.** Fold every researcher report and your own findings into the draft's `## Codebase Observations` section via `Edit` — one line per fact, **each carrying `path:line`**. Copy `CONTRADICTIONS` across verbatim: a draft assumption the code disproves outranks anything you were about to ask the user. Then run a **gap check** — name the parts of the draft nobody covered, and spawn one follow-up researcher on any material dark area before moving to questions.
+3. **Merge into `## Codebase Observations`.** Fold every researcher report and your own findings into the draft's `## Codebase Observations` section via `Edit` — one line per fact, **each carrying `path:line`**. Copy `CONTRADICTIONS` across verbatim: a draft assumption the code disproves outranks anything you were about to ask the user. Then run a **gap check** — name the parts of the draft nobody covered, and spawn one follow-up researcher on any material dark area before moving to questions. Run the two self-check questions from *Research has no budget* here — a second follow-up pass is normal, not a failure of the first.
 
 4. Compile a list of clarifying questions. Topics to cover:
    - **Цель**: Какая бизнес-задача решается? Кому и как это поможет?
@@ -60,13 +74,20 @@ This phase is **mandatory** for new runs and cannot be skipped.
 - Architectural questions only when the codebase doesn't give a clear answer; if there's an obvious convention, note it as context for the Architect, don't ask.
 - Include what you learned from exploring the codebase as context ("Я вижу, что сейчас система делает X — Y должен заменить это или работать параллельно?").
 - One question at a time.
+- Every question is preceded by the step-0 self-check of the gate — a question you could not defend with citations is one you have not finished researching.
 
 ## Before any question — the gate
 
-Run these five steps on **each** candidate question before it reaches the user. Phase 1 research tells you what the codebase contains; the gate confirms that *this specific question* is worth asking and correctly posed.
+Run these six steps on **each** candidate question before it reaches the user. Phase 1 research tells you what the codebase contains; the gate confirms that *this specific question* is worth asking and correctly posed.
 
-1. **Locate.** Grep for where the answer would live — models, call-sites, existing conventions.
-2. **Verify the premise.** Confirm that everything the question presupposes actually exists. "Should X replace Y?" is void when `Y` does not exist. Cite what you found.
+0. **Check yourself before checking the question.** Answer these three honestly for every candidate question:
+   - **"Do I have enough context to ask this?"** — can I describe the area the question touches from code I have opened, not from file names or another agent's summary?
+   - **"Is this question built on facts or on my guesses?"** — for each thing the question presupposes, name the `path:line` that establishes it. A presupposition with no citation is a guess.
+   - **"Would more research remove the question?"** — often the code answers it, and a resolved fact in `## Codebase Observations` is worth more than a question.
+
+   A guess anywhere means the question is not ready: go back to the code and keep reading until every presupposition is a cited fact or an explicit "the codebase does not cover this — greped X, Y, Z". Only then run steps 1–5.
+1. **Locate.** Grep for where the answer would live — models, call-sites, existing conventions. Stay on this step as long as the answer might still be in the code — research here has no budget.
+2. **Verify the premise.** Take the presuppositions you listed in step 0 and confirm that each actually exists. "Should X replace Y?" is void when `Y` does not exist. Cite what you found.
 3. **Verify your understanding.** State in one line what the code does today, with `path:line`. Being unable to state it means you are not ready to ask — go back to step 1.
 4. **Re-judge the question.** Three outcomes:
    - The code answers it → resolve it yourself, record it in `## Codebase Observations` as context, and drop the question.
@@ -166,6 +187,8 @@ Record the `agentId` from every spawn into a small registry (`name | agentId | r
 **Liveness:** a dead agent sends no completion notification and nothing else wakes you. Follow `~/.claude/templates/liveness-protocol.md`: arm a dead-man timer per phase (`Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_ANALYST")` — likewise `WATCHDOG_RESEARCH`, `WATCHDOG_ARCHITECT`, `WATCHDOG_CRITICS`, and `WATCHDOG_ADAPTIVE`), audit on every wake-up, recover via ping-by-`agentId` first, respawn as escalation.
 
 The Phase 1 researchers are background agents too: the registry, the addressing rules, and the liveness protocol above cover them under `WATCHDOG_RESEARCH`.
+
+Spawn the Analyst only after the self-check passes: if you can still name an unexplored part of the draft, Phase 1 is not finished.
 
 Shared context to pass in every agent prompt:
 - Draft path (or existing spec path on resume) — **instruct agents to read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified facts about the codebase) from the draft file. These two sections are the persistent source of truth — inline prompt context is supplementary.**
@@ -377,7 +400,7 @@ Tag each question as **user-required** or **auto-resolvable**:
 
 ### Ask
 
-Every question passes **the gate** (§ *Before any question*) first — including the ones that arrived from a critic. These need it most: they come from another agent's summary rather than from code you read yourself, so their premises are the least verified in the run. Verify the premise against the codebase before putting a critic's question to the user.
+Every question passes **the gate** (§ *Before any question*) first — including the ones that arrived from a critic. These need it most: they come from another agent's summary rather than from code you read yourself, so their premises are the least verified in the run. Verify the premise against the codebase before putting a critic's question to the user. The self-check applies here with full force: research the critic's premise until you can either confirm it with `path:line` or drop the question.
 
 Use the defer-aware prompt format, one question at a time. Each question carries the full context: what was found in the code, what the spec says, why this question matters.
 

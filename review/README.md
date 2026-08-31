@@ -240,10 +240,16 @@ are no longer read.
 
 ## Parallel pre-review fast-path
 
-For the autonomous SDD workflow (`/implement-wf` → `workflows/implement.js`),
-landing many commits sequentially is slow: each `git commit` runs the LLM gate
-(~minutes) one at a time. The fast-path lets the workflow review every planned
+Landing many commits sequentially is slow: each `git commit` runs the LLM gate
+(~minutes) one at a time. The fast-path lets a caller review every planned
 commit **in parallel up front**, then skip the redundant per-commit LLM review.
+
+> **No caller today.** This machinery was built for the autonomous
+> `/implement-wf` workflow, removed on 2026-08-31 as unused. The code and its
+> suite are kept because the fast-path is caller-agnostic — anything that plans
+> a batch of commits can drive it — and because `hook._maybe_fastpath` is a
+> live branch of the commit hook. Nothing sets `SDD_REVIEW_FASTPATH` now, so
+> every commit takes the ordinary full-review path.
 
 - **`approvals.py`** — the canonical **content key** `content_hash` (`sha256` of
   each changed path's final blob sha, parsed identically on every side by
@@ -273,13 +279,14 @@ they never compute a content key and take the unchanged path. gitleaks/semgrep
 (pre-commit wrapper) and the coverage/assert preflight (`run_gate`) always run
 regardless.
 
-**Integrity (no signing — the Workflow JS sandbox has no `crypto`).** The
-workflow builds its trusted approved-set from the reviewer agent's return, the
+**Integrity (no signing — the Workflow JS sandbox that drove this had no
+`crypto`).** The caller builds its trusted approved-set from the reviewer agent's return, the
 committer is never told the marker format, and a **separate** verifier agent
 (`--verify-range`) re-derives every landed commit's content key from git so the
 committed set is cross-checked against the approved set. Any unapproved landed
 commit is force-reviewed and surfaced as a Known Concern. Defense-in-depth: a
-`hooks/guard.py` rule blocks shell writes to `.review/approvals/`.
+`hooks/guard.py` rule blocks shell writes to `.review/approvals/` — that rule is
+live regardless of whether any fast-path caller exists.
 
 ## Tests
 

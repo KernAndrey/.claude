@@ -430,8 +430,8 @@ def test_review_big_group_real_pipeline_clean_writes_marker(tmp_path: Path) -> N
 
     Exercises the success path the mocked tests skip: validate against the private
     index → spawn the real chunk + whole-diff jobs → arbiter skipped (no findings)
-    → _review_big_group writes the marker. This is the path a real /implement-wf
-    run depends on, proven here without LLM calls."""
+    → _review_big_group writes the marker. This is the path any batch pre-review
+    caller depends on, proven here without LLM calls."""
     repo = tmp_path / "r"
     _init_repo(repo)
     _write(repo, "big.py", _big_body(n=500))

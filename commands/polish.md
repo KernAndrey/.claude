@@ -35,6 +35,19 @@ Everything *else* is cut for speed:
 1. Note the working directory — the worktree `/implement` left behind, or the current checkout. Every fix lands here.
 2. Find the task file in `{dir}/5-review/` if one matches `$ARGUMENTS` or the branch name. It gives Behavior and AC to check a complaint against. **Optional context — the user's report is what drives the loop, and a missing task file never blocks a fix.**
 3. Note the base branch for the eventual diff: `dev` when standing in a worktree, otherwise the current branch.
+4. **Establish how the user sees a change.** They verify every fix in the running app, so settle this before the first one — mid-loop is too late.
+
+   ```bash
+   ss -tlnp | grep -E ':(3000|5000|8000|8069|8080|8100|8888)\b'
+   ```
+
+   Then ask them, in one line, only what the check cannot tell you: *"Сервер на :8100 — твой или мне его перезапускать после фиксов?"* Record three things and keep them for the session:
+
+   - **owner** — you or the user. A server they started in their own terminal is theirs; you tell them when to restart, you never kill it.
+   - **restart command and port** — from the project `CLAUDE.md`, or from how it is already running (`ps -eo pid,args | grep -- --http-port=`).
+   - **what reloads by itself** — a JS/CSS dev server with HMR needs nothing; Python, templates, XML views and config generally need a restart.
+
+   No server running and the change is backend-only → nothing to arrange, note that and move on.
 4. Open the **fix ledger** — one row per landed fix. It is what Phase 2's Tester and commit split are built from:
 
    ```
@@ -115,9 +128,26 @@ This shortcut covers **ambiguity**, never **premise**. "Which button did you mea
 
 Watchdog: while any fix agent is running, keep one armed per `~/.claude/templates/liveness-protocol.md` (`Bash(run_in_background: true, command: "sleep 600; echo WATCHDOG_POLISH")`) — 600s, because these are small changes and a fix agent quiet for ten minutes is stuck, not thorough.
 
-### 5. Report and go back to waiting
+### 5. Make the fix visible
 
-One or two lines: what changed, in which file — or what the code actually does, when the premise did not hold. Add a ledger row for a fix; a rejected premise gets no row, because nothing changed.
+A fix the user cannot see is not delivered. Before reporting, put the change in front of them:
+
+- **Reloads by itself** (HMR, a watcher) → say nothing about restarting; a redundant restart costs them their app state.
+- **Needs a restart, server is yours** → restart it and confirm it came back before you report. Kill it **by PID** (`ps -eo pid,args | grep -- --http-port={port}`), never by a `-f` pattern built from a database or project name — such a pattern also matches a concurrent test run and takes it down silently.
+
+  ```bash
+  timeout 60 bash -c 'until curl -s http://localhost:{port} >/dev/null 2>&1; do sleep 1; done' && echo UP
+  ```
+
+  No `UP` → say the restart failed and paste the error. A fix reported against a server that never came back reads as "your fix does not work".
+- **Needs a restart, server is theirs** → do not touch it. End the report with what to do: *"перезапусти сервер и глянь"*.
+- **Batch of parallel fixes** → one restart after the last agent finishes, not one per fix.
+
+When a fix needs specific steps to see — a particular record, a particular page — name them in one line. The user is checking, not hunting.
+
+### 6. Report and go back to waiting
+
+One or two lines: what changed, in which file — or what the code actually does, when the premise did not hold. Say whether it is live already or waiting on a restart. Add a ledger row for a fix; a rejected premise gets no row, because nothing changed.
 
 On `POLISH PREMISE WRONG`, pass the agent's finding to the user as-is with its `path:line` and wait for their call. Do not talk them into the fix, and do not quietly fix it anyway.
 
@@ -161,6 +191,8 @@ Arm `WATCHDOG_POLISH_TEST` (`sleep 900`) while it runs.
 
 On `PRODUCTION BUG FOUND`: route the fix as in Phase 1 step 4, then have the Tester re-run. On a failing test: the fix is what changes, not the assertion.
 
+When you started a server in Phase 1, stop it before the test run — a dev server holding the port or the database makes tests fail for a reason that has nothing to do with the fixes.
+
 ### 2. Commit
 
 Use the `commit` skill — it owns the security scan, the coverage preflight, the hooks, and the AI review.
@@ -176,8 +208,9 @@ The ledger is the split — you recorded which files each complaint touched, so 
 - Any complaint that ended in `POLISH PREMISE WRONG` and was left alone — the user should see the list of what was deliberately not changed
 - Anything a fix left open
 
-## The three rules that matter most
+## The four rules that matter most
 
 1. **Check the premise before every edit.** The user reports symptoms accurately and causes approximately; "it's missing" is the least reliable thing they can say, and one grep separates the two.
 2. **Route for speed.** One-liners you fix yourself; everything else goes to a subagent, and independent complaints go in parallel.
-3. **Phase 2 starts on the user's word, and nothing else.**
+3. **Every fix ends where the user can see it** — restarted and confirmed up when the server is yours, or a clear "перезапусти и глянь" when it is theirs.
+4. **Phase 2 starts on the user's word, and nothing else.**

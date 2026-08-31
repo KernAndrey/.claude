@@ -19,12 +19,13 @@ A mistake in the spec is the most expensive mistake in the pipeline. A wrong pre
 1. Read `~/.claude/templates/sdd/board-root.md` and follow it to resolve `{main_root}`, discover the SDD configs, and define `{board}`. The board lives in the main worktree — the draft and the spec are read and written there even when you are standing in a linked worktree. Select the root whose `id_prefix` matches the task ID.
 
    `{board}` covers the board file only. `{project root}` and `Working directory` in every agent prompt below stay the **current** checkout: agents research the code where you are standing, and only the spec file lives elsewhere.
-2. Locate the target by `$ARGUMENTS` (ID, slug, or full path):
+2. **Pick the reviewer backend.** Read `~/.claude/templates/codex-reviewer.md` and follow its §1 to resolve `REVIEW_BACKEND` and `REVIEW_MODEL` — from a `--reviewers=` / `--reviewer-model=` pre-answer in `$ARGUMENTS`, otherwise from one `AskUserQuestion`. Resolve it here, before anything else consumes `$ARGUMENTS`: §1 strips those flags, and what remains is the task identifier. On `codex`, run §2 (companion path, model check), §3 (sandbox probe) and §4's `CODEX_DIR` now too — a failed probe flips the run back to `claude` while no agent has been spawned yet, instead of after the critic batch is already in flight.
+3. Locate the target by the remaining `$ARGUMENTS` (ID, slug, or full path):
    - Match in `{board}/1-draft/` → `RUN_MODE = new`.
    - Match in `{board}/2-spec/` → `RUN_MODE = resume` (the spec already exists; you are re-entering it to resolve open blockers or apply late findings).
    - Not found → error and stop.
-3. Read the draft file content (new) or the existing spec file (resume).
-4. Read the project `CLAUDE.md` for stack and conventions.
+4. Read the draft file content (new) or the existing spec file (resume).
+5. Read the project `CLAUDE.md` for stack and conventions.
 
 ## 1. Phase 1 — Discovery (new runs only)
 
@@ -184,6 +185,8 @@ Record the `agentId` from every spawn into a small registry (`name | agentId | r
 
 **Addressing:** running agent → `SendMessage(to: "spec-analyst")`; completed agent → `SendMessage(to: "{agentId}")`. The completion notification is your done signal — do not poll for it.
 
+This applies to every agent spawned with the `Agent` tool. On `REVIEW_BACKEND = codex` the §2c critics are background Bash jobs instead: they have no `name` and no `agentId`, their registry row carries a report path, and `codex-reviewer.md` §5–§7 covers how to address them.
+
 **Liveness:** a dead agent sends no completion notification and nothing else wakes you. Follow `~/.claude/templates/liveness-protocol.md`: arm a dead-man timer per phase (`Bash(run_in_background: true, command: "sleep 900; echo WATCHDOG_ANALYST")` — likewise `WATCHDOG_RESEARCH`, `WATCHDOG_ARCHITECT`, `WATCHDOG_CRITICS`, and `WATCHDOG_ADAPTIVE`), audit on every wake-up, recover via ping-by-`agentId` first, respawn as escalation.
 
 The Phase 1 researchers are background agents too: the registry, the addressing rules, and the liveness protocol above cover them under `WATCHDOG_RESEARCH`.
@@ -245,6 +248,8 @@ Loop until `SPEC ANALYST DONE.` or `SPEC ANALYST FIX ROUND DONE.`:
 Four fixed critics read every spec. On top of them, you design **3–5 adaptive lenses** for this specific spec (2c-0) and spawn one critic per lens.
 
 Spawn everything — fixed critics and adaptive lenses — as background agents in **one batch** (all `Agent` calls in a single response). They run in parallel; there are no dependencies. Record every `agentId`.
+
+**Backend.** This section is where `REVIEW_BACKEND` from Setup step 2 takes effect. On `claude`, spawn the `Agent` calls exactly as written in 2c-i…2c-v. On `codex`, every critic here — the four fixed ones and every adaptive lens — becomes a codex run instead: the prompt bodies below are unchanged, and `~/.claude/templates/codex-reviewer.md` supplies the launch form (§4), the registry row (§5), the collection rules (§6) and the "put escalations in the final report" line every codex prompt carries (§8). The Analyst and Architect stay native either way — they `Edit` the spec, and the codex sandbox is read-only. Arm the two watchdogs below on a codex batch as well: an exiting codex job wakes you on its own, but a hung one never exits and nothing else would. On a WATCHDOG wake-up, audit codex rows by report file rather than by `agentId` (`codex-reviewer.md` §6).
 
 Arm two watchdogs: `Bash(run_in_background: true, command: "sleep 1200; echo WATCHDOG_CRITICS")` for the four fixed critics — the testing critic walks every AC, edge case, and example into a matrix, so it runs longer than the other three — and `Bash(run_in_background: true, command: "sleep 1500; echo WATCHDOG_ADAPTIVE")` for the adaptive ones. The adaptive rows can push the batch past the concurrency cap, so later spawns queue for slots — a single 900s timer over the whole batch fires on healthy-but-queued agents, and the respawns it triggers make the contention worse.
 
@@ -361,7 +366,7 @@ The premise critic is different in kind: it challenges decisions, not implementa
 
 The adaptive lenses also get **no re-check** pass. Their findings route to Analyst and Architect normally and land inside the existing 2-fix-round cap; re-checking each lens as well would multiply the rounds without adding coverage.
 
-The Analyst, Architect, and the three consistency Critics (arch, business, testing) have completed by now — resume each **by its `agentId`** (not by name). Their preserved context means they remember their prior work.
+The Analyst, Architect, and the three consistency Critics (arch, business, testing) have completed by now. Resume each Claude agent **by its `agentId`** (not by name) — its preserved context means it remembers its prior work. A critic whose registry row says `backend: codex` has no `agentId` and no preserved context: re-check it with a fresh codex run carrying its previous findings verbatim (`codex-reviewer.md` §7). The Analyst and Architect are always native, so their fix rounds are unaffected by the backend.
 
 A testing critic report without its full COVERAGE MATRIX is rejected and re-requested, same as a missing DEPTH block — the matrix is what shows every AC was walked rather than sampled.
 
@@ -374,6 +379,7 @@ After reports are collected:
   - Business findings: `SendMessage(to: "{business-critic agentId}", "RE-CHECK OF: [f-1, f-3]")` → wait for `SPEC BUSINESS CRITIC RE-CHECK DONE.`
   - Architecture findings: `SendMessage(to: "{arch-critic agentId}", "RE-CHECK OF: [f-2, f-4]")` → wait for `SPEC ARCH CRITIC RE-CHECK DONE.`
   - Testing findings: `SendMessage(to: "{testing-critic agentId}", "RE-CHECK OF: [f-5, f-6]")` → wait for `SPEC TESTING CRITIC RE-CHECK DONE.` Re-check this one whenever any AC changed during the fix round — a new or reworded AC arrives with no test plan behind it.
+  - On `REVIEW_BACKEND = codex`: launch a fresh codex run per re-checked critic with the findings pasted into the prompt (`codex-reviewer.md` §7). `SendMessage` reaches no codex job, and a summary of the findings gives the fresh run nothing to verify against.
 - **Maximum 2 fix rounds per agent.** After two rounds, unresolved business concerns stay in `Edge Cases & Risks`, unresolved architectural concerns stay in `Open architectural questions`, and unresolved testing findings become an `Uncovered:` line at the end of `## Testing Strategy`, one per gap, naming the AC and the missing case. That line is what carries the gap into `/implement` — the Tester writes what it can and Test-Reviewer reports the rest, instead of the gap vanishing at the cap. Phase 3 picks up anything that needs user input.
 - **Tiny edits** (typo, missing bullet): Lead may Edit the spec file directly instead of round-tripping through an agent.
 - **`EMERGENT QUESTIONS FOR USER`**: deferred to Phase 3, do not resolve here.

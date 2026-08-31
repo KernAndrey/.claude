@@ -1,6 +1,6 @@
 Implement an approved specification using addressable background agents.
 
-All agents in this workflow are spawned via the `Agent` tool with `run_in_background: true` and a `name`. You are the lead — you coordinate, you don't code or review.
+All agents in this workflow are spawned via the `Agent` tool with `run_in_background: true` and a `name` — except the Phase 2 reviewers when the run chose the codex backend (Setup step 2), which run as background Bash jobs instead and are addressed by report path rather than by `agentId`. You are the lead — you coordinate, you don't code or review.
 
 Begin by saying to the user: **"I will spawn background agents to implement this spec. I am the lead — I coordinate, I don't code or review."**
 
@@ -21,14 +21,14 @@ Record the `agentId` (format `a...-...`) returned by every `Agent` spawn into yo
 Maintain a small table in your working context, one row per spawn:
 
 ```
-name              | agentId      | role                  | files_owned
-coder-1           | a1b2-...     | Coder                 | models/order.py, ...
-tester            | a3c4-...     | Tester                | tests/
-code-reviewer     | a5d6-...     | Code-Reviewer         | —
-adaptive-rollback | a7e8-...     | Adaptive-Reviewer     | —
+name              | backend | agentId / report path                   | role              | files_owned
+coder-1           | claude  | a1b2-...                                | Coder             | models/order.py, ...
+tester            | claude  | a3c4-...                                | Tester            | tests/
+code-reviewer     | codex   | {CODEX_DIR}/code-reviewer.report.md     | Code-Reviewer     | —
+adaptive-rollback | codex   | {CODEX_DIR}/adaptive-rollback.report.md | Adaptive-Reviewer | —
 ```
 
-Append a row immediately after each spawn. This table is how you reach completed agents in later phases. In Phase 2 each fixed dimension gets one row, plus one row per adaptive lens.
+Append a row immediately after each spawn. This table is how you reach completed agents in later phases — by `agentId` for a `claude` row, by relaunch-with-findings for a `codex` row. On `REVIEW_BACKEND = claude` every row says `claude` and the column is noise you can drop. In Phase 2 each fixed dimension gets one row, plus one row per adaptive lens.
 
 ### Liveness protocol
 
@@ -43,7 +43,7 @@ Thoroughness over speed. This task may run for hours — that is expected and ac
 This command does **not** use `~/.claude/templates/sdd/board-root.md`, and `{dir}` stays repo-relative throughout. The board rule inverts here: once a worktree exists, the task file travels with the code inside it, because its move into `4-in-progress` and `5-review` must be captured by the commit.
 
 1. Read `.tasks.toml`, `CLAUDE.md`, and project structure. Several `.tasks.toml` in the repo (root plus `*/.tasks.toml`, `*/*/.tasks.toml`, skipping `node_modules/`, `.git/`, `vendor/` and plugin/cache directories) means several SDD roots — use the one whose `id_prefix` matches the task ID. `{dir}` below is that config's `dir`, resolved relative to the config's own directory.
-2. Find the spec by `$ARGUMENTS` (ID or slug) in `{dir}/3-ready/`. `$ARGUMENTS` is just the task identifier.
+2. **Pick the reviewer backend, then find the spec.** Read `~/.claude/templates/codex-reviewer.md` and follow its §1 to resolve `REVIEW_BACKEND` and `REVIEW_MODEL` — from a `--reviewers=` / `--reviewer-model=` pre-answer in `$ARGUMENTS`, otherwise from one `AskUserQuestion`. Ask it here, at the very start: everything after this point runs unattended for hours, and a question asked in Phase 2 stalls the run until the user comes back. On `codex`, also run §2 (companion path, model check), §3 (sandbox probe) and §4's `CODEX_DIR` now, so a failed probe flips the run back to `claude` before a single agent exists. §1 strips those flags; what remains is the task identifier — find the spec by it (ID or slug) in `{dir}/3-ready/`.
 3. Read the full specification.
 4. Branch and worktree setup:
    - **Preflight, before creating anything** (`auto_branch = true` only): `git fetch origin dev`, then confirm the spec is on the base branch:
@@ -191,6 +191,8 @@ The five dimensions below are what every change gets. What they cannot cover is 
 
 Spawn **every reviewer in one batch** (multiple `Agent` calls in a single response). Record each `agentId`.
 
+**Backend.** This is where `REVIEW_BACKEND` from Setup step 2 takes effect. On `claude`, spawn the `Agent` calls exactly as written below. On `codex`, each reviewer becomes a codex run carrying the same prompt body, launched per `~/.claude/templates/codex-reviewer.md` §4, registered per §5, collected per §6, and ending with the "no mid-flight messages" line from §8. Two roles stay native on every run: the **UI-Reviewer**, because it starts a dev server and drives a browser and the codex sandbox is read-only, and the Coders and Tester from Phase 1, because they write. A mixed batch — codex reviewers alongside a native UI-Reviewer — is the normal shape of a frontend task.
+
 Each **fixed dimension** spawn uses:
 
 ```
@@ -227,7 +229,7 @@ Report in the format from your agent file."
 )
 ```
 
-Arm the phase watchdog: `Bash(run_in_background: true, command: "sleep 1500; echo WATCHDOG_REVIEW")`. The adaptive rows push this batch past the concurrency cap, so later spawns queue for slots — a 900s timer over the whole batch fires on healthy-but-queued agents, and the respawns it triggers make the contention worse.
+Arm the phase watchdog: `Bash(run_in_background: true, command: "sleep 1500; echo WATCHDOG_REVIEW")`. The adaptive rows push this batch past the concurrency cap, so later spawns queue for slots — a 900s timer over the whole batch fires on healthy-but-queued agents, and the respawns it triggers make the contention worse. Keep it armed over a codex batch too: an exiting codex job wakes you with its exit status, but a hung one never exits and this phase runs unattended for hours. On a WATCHDOG wake-up, audit codex rows by report file rather than by `agentId` (`codex-reviewer.md` §6).
 
 Do not cancel a reviewer for being slow — a queued agent is healthy; the watchdog covers genuine stalls.
 
@@ -251,7 +253,7 @@ FINDINGS: ...
 SUMMARY: X findings (Y MUST FIX, Z NIT/CONCERN)
 ```
 
-**Reject reports without a DEPTH block** — this applies to fixed reviewers and adaptive lenses alike. The DEPTH counts are how you detect shallow reviews. If a reviewer reports `VERDICT` and `FINDINGS` but omits `DEPTH`, re-run that reviewer. Same rule if counts look implausibly low for the diff (e.g. "Methods audited: 2" on a 20-method diff). To re-run, resume the reviewer by `agentId` and ask for the missing DEPTH block, or spawn a fresh instance.
+**Reject reports without a DEPTH block** — this applies to fixed reviewers and adaptive lenses alike. The DEPTH counts are how you detect shallow reviews. If a reviewer reports `VERDICT` and `FINDINGS` but omits `DEPTH`, re-run that reviewer. Same rule if counts look implausibly low for the diff (e.g. "Methods audited: 2" on a 20-method diff). To re-run, resume the reviewer by `agentId` and ask for the missing DEPTH block, or spawn a fresh instance. A codex reviewer is re-run rather than resumed (`codex-reviewer.md` §6) — and a codex report is only as good as the sandbox probe from §3, which is why that probe runs before the batch rather than after a suspicious report arrives.
 
 Test-Reviewer carries one extra requirement: its report includes the **AC coverage matrix**, one row per AC in the spec, with the success, failure, and boundary tests named. A report with no matrix, or a matrix covering fewer ACs than the spec has, is rejected the same way a missing DEPTH block is.
 
@@ -309,7 +311,9 @@ Fix rounds await agent messages like any phase — arm `Bash(run_in_background: 
 
 #### Step 3: Verification (re-review)
 
-Resume — by `agentId` — every reviewer **and every adaptive lens** that had `MUST FIX` or `CRITICAL` findings (a resumed reviewer remembers its findings via preserved context). An adaptive lens verifies its own findings — nobody else holds that angle:
+Resume — by `agentId` — every Claude reviewer **and every adaptive lens** that had `MUST FIX` or `CRITICAL` findings (a resumed reviewer remembers its findings via preserved context). An adaptive lens verifies its own findings — nobody else holds that angle.
+
+A reviewer whose registry row says `backend: codex` is re-reviewed instead by a fresh codex run whose prompt carries its previous findings **verbatim** — `codex-reviewer.md` §7 has the exact form. It has no `agentId` and no memory of the first pass, so a summary of its own findings leaves it nothing to verify against. The re-review prompt is otherwise the same:
 
 > This is a **re-review** after fixes.
 >
@@ -318,7 +322,7 @@ Resume — by `agentId` — every reviewer **and every adaptive lens** that had 
 >
 > Report `PASS` only if BOTH the primary items are resolved AND the secondary pass finds nothing new. Otherwise list all outstanding issues.
 
-The lead spot-checks fixes directly (Read/Grep affected lines) before re-review. Skip re-review for trivially confirmed fixes. If a reviewer's `agentId` is unresponsive after one status check — spawn a fresh instance with the same instructions (primary verification + full secondary audit).
+The lead spot-checks fixes directly (Read/Grep affected lines) before re-review. Skip re-review for trivially confirmed fixes. If a reviewer's `agentId` is unresponsive after one status check — spawn a fresh instance with the same instructions (primary verification + full secondary audit); on the codex backend the equivalent is relaunching the run, per `codex-reviewer.md` §6.
 
 #### Step 4: Fix loop and escalation
 

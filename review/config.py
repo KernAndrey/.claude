@@ -112,7 +112,7 @@ ARBITER: RunnerConfig = RunnerConfig(
 #   N >= MAX_PROD_LINES, manifest    → chunked path (chunked.py). Fan-out lives
 #                                        here as the whole-diff lens layer.
 #   N >= MAX_PROD_LINES, no manifest → exit 1, ask writer to generate manifest.
-MAX_PROD_LINES = 400  # also used as per-chunk line cap (single source of truth)
+MAX_PROD_LINES = 500  # also used as per-chunk line cap (single source of truth)
 MIN_LINES_TO_REVIEW = 1  # commits smaller than this (total) skip review
 
 # Fan-out is now scoped to chunked path only. Setting the threshold equal to
@@ -123,7 +123,7 @@ MIN_LINES_TO_REVIEW = 1  # commits smaller than this (total) skip review
 FANOUT_THRESHOLD = MAX_PROD_LINES
 
 # Chunked-review limits.
-MAX_CHUNKS = 6  # validator rejects manifests with more chunks. Effective
+MAX_CHUNKS = 8  # validator rejects manifests with more chunks. Effective
 # upper bound on a chunked commit ≈ MAX_CHUNKS * MAX_PROD_LINES.
 
 # Pre-review chunk-reviews several BIG commit groups in parallel, and each

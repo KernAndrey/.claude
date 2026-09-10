@@ -1,0 +1,12 @@
+# Repositories that must never be pushed to from this machine.
+# One entry per line; matched as a case-insensitive substring of the remote URL
+# after lowercasing and stripping a trailing ".git".
+#
+# Recommended form is "org/repo" — it matches SSH, SSH-alias and HTTPS URLs alike.
+#
+# Example:
+#   some-org/read-only-repo
+
+# Sentinel for `git remote set-url --push <remote> DO-NOT-PUSH`, so that layer
+# produces a clear message instead of a confusing transport error.
+DO-NOT-PUSH

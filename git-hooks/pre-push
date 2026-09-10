@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Global pre-push hook. Two independent jobs:
+#
+#   1. Refuse a push initiated by Claude Code, as far as origin is detectable.
+#      Not "whatever its spelling" -- that claim was wrong. Both detectors
+#      below read state the caller controls, so a process that scrubs its
+#      environment and reparents away from `claude` before invoking git
+#      presents as an ordinary user shell and is allowed through. That is a
+#      demonstrated bypass, not a theoretical one. What makes it costly is
+#      that arranging it needs a spelling the tool-boundary rule in
+#      hooks/guard.py refuses, so both layers have to fall in one move.
+#   2. Refuse a push to any repository listed in no-push.list (applies to
+#      everyone, the user included).
+#
+# Job 1 is enforced here, at the git level, rather than by matching the text of
+# a shell command. A text matcher loses to `g=push; git $g`, to `eval`, to a
+# script file, to a `codex` subprocess, and to subprocess.run() inside the
+# Jupyter kernel behind mcp__ide__executeCode. Every one of those converges on
+# this hook, because git itself runs it.
+#
+# core.hooksPath points at this directory (from ~/.gitconfig, and re-injected
+# by the harness as GIT_CONFIG_KEY_0), so this is the pre-push git runs in
+# every repository and every clone on this machine.
+#
+# It is NOT unconditional, and nothing here can make it so. `core.hooksPath`
+# is ordinary configuration, and command-line scope outranks every file:
+#
+#     git -c core.hooksPath=<empty dir> <verb>     # this hook never runs
+#
+# That is not hypothetical -- review/test_pre_review.py:41 does exactly this
+# to keep the inherited global hook out of its scratch commits. So both jobs
+# below are defeated by a caller who sets that flag, and a text rule in
+# hooks/guard.py is what catches that spelling at the tool boundary. Two
+# partial layers, not one wall: a bypass has to defeat both at once.
+#
+# The only boundaries that do not depend on a caller's cooperation are
+# server-side (read-only access on the remote) and credential separation
+# (a unix user whose $HOME holds no usable key). Treat this hook as the
+# thing that stops accidents and casual attempts, not as containment.
+#
+# The user is NOT affected, and the reason is the ancestry test, not the
+# environment. An earlier version claimed a human shell carries no CLAUDE*
+# variable; that was wrong. The VS Code extension exports CLAUDE_CODE_SSE_PORT
+# into every integrated terminal -- it advertises a reachable IDE, it does not
+# identify the caller -- and the user's own push was refused because of it.
+#
+# git invokes this as: pre-push <remote-name> <remote-url>; the refs arrive on
+# stdin and we never read them, because we reject the push as a whole.
+#
+# To lift the restriction: sudo chattr -i on this file, then edit it.
+
+set -uo pipefail
+
+HOOK_PATH="$0"
+BLOCKLIST="$(dirname "$0")/no-push.list"
+
+deny() {
+    echo "[claude-hook] PUSH DENIED" >&2
+    echo "[claude-hook]   $1" >&2
+    echo "[claude-hook]   $2" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------- job 1 ----
+
+# A controlling terminal is the difference between a human at a prompt and a
+# process something spawned. It is inherited from the session, so a hook run
+# from an interactive shell has one and a hook run from a tool does not, and
+# no environment variable can change that. Field 7 of /proc/self/stat is the
+# controlling tty; 0 means none.
+has_controlling_terminal() {
+    local tty_nr
+    tty_nr="$(awk '{print $7}' /proc/self/stat 2>/dev/null)" || return 1
+    [ -n "$tty_nr" ] && [ "$tty_nr" != "0" ]
+}
+
+# Secondary, and deliberately narrow. These variables reach a Claude-spawned
+# process, but some of them also reach the user's integrated terminal, so this
+# test alone cannot tell the two apart -- which is exactly the bug it caused.
+# It runs only when there is no controlling terminal, where the caller cannot
+# be a person at a prompt, and it exists to catch a process that detached from
+# the `claude` ancestry without scrubbing its environment.
+claude_env_marker() {
+    local name
+    while IFS='=' read -r name _; do
+        case "$name" in
+            CLAUDE*|AI_AGENT) printf '%s' "$name"; return 0 ;;
+        esac
+    done < <(env)
+    return 1
+}
+
+# Survives `env -u CLAUDECODE ...`: a process cannot rewrite its own ancestry.
+# Walks /proc up to PID 1, depth-bounded so a malformed chain cannot loop.
+claude_process_ancestor() {
+    local pid="$$" depth=0 comm argv0
+    while [ "$depth" -lt 40 ]; do
+        case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+        [ "$pid" -gt 1 ] || return 1
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null)"
+        argv0="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | head -n 1)"
+        if [ "$comm" = "claude" ] || [ "${argv0##*/}" = "claude" ]; then
+            printf 'pid %s (%s)' "$pid" "${argv0:-$comm}"
+            return 0
+        fi
+        pid="$(awk '/^PPid:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)"
+        depth=$((depth + 1))
+    done
+    return 1
+}
+
+# Ancestry first: it is the test that is right in both directions.
+if origin="$(claude_process_ancestor)"; then
+    deny "This push was initiated by Claude Code (ancestry: $origin)." \
+         "Claude may commit locally but never publish. Ask Claude to hand the push to you."
+fi
+
+# Environment second, and only where a person cannot be sitting.
+if ! has_controlling_terminal && marker="$(claude_env_marker)"; then
+    deny "This push came from a detached process carrying Claude's environment (marker: $marker)." \
+         "If this was you, run it from a terminal, or use the standard hook-skip flag on git push."
+fi
+
+# ---------------------------------------------------------------- job 2 ----
+
+[ -f "$BLOCKLIST" ] || exit 0
+
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+# Normalize both sides — lowercase, drop a trailing .git — so one entry
+# `org/repo` matches every URL shape: git@github.com:Org/Repo.git,
+# git@gh-alias:Org/Repo.git, https://github.com/Org/Repo.git.
+normalize() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/\.git$//'; }
+
+url_norm="$(normalize "$remote_url")"
+
+while IFS= read -r entry || [ -n "$entry" ]; do
+    entry="${entry%%#*}"
+    entry="$(printf '%s' "$entry" | xargs 2>/dev/null)"
+    [ -n "$entry" ] || continue
+
+    entry_norm="$(normalize "$entry")"
+    case "$url_norm" in
+        *"$entry_norm"*)
+            deny "Repository is marked read-only on this machine: $remote_name -> $remote_url" \
+                 "Matched no-push.list entry '$entry'. Remove it from $BLOCKLIST to unprotect."
+            ;;
+    esac
+done < "$BLOCKLIST"
+
+exit 0

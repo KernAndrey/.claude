@@ -430,8 +430,8 @@ def test_review_big_group_real_pipeline_clean_writes_marker(tmp_path: Path) -> N
 
     Exercises the success path the mocked tests skip: validate against the private
     index → spawn the real chunk + whole-diff jobs → arbiter skipped (no findings)
-    → _review_big_group writes the marker. This is the path a real /implement-wf
-    run depends on, proven here without LLM calls."""
+    → _review_big_group writes the marker. This is the path any batch pre-review
+    caller depends on, proven here without LLM calls."""
     repo = tmp_path / "r"
     _init_repo(repo)
     _write(repo, "big.py", _big_body(n=500))
@@ -549,8 +549,8 @@ def test_chunked_validation_uses_injected_runner_for_private_index(tmp_path: Pat
     _init_repo(repo)
     _write(repo, "big.py", _big_body(n=500))
     diff, _names, _ck = pre_review.build_group(repo, ["big.py"])
-    # Split the 500-line file into two <=400-prod-line chunks so the manifest is
-    # genuinely valid (one whole-file chunk would be oversized).
+    # Split the 500-line file into two chunks well under MAX_PROD_LINES so the
+    # manifest stays valid regardless of how the cap is retuned.
     manifest = (
         f"version: 1\ndiff_hash: {approvals.diff_hash(diff)}\n"
         "default_related_files: []\ncross_chunk_invariants: []\nchunks:\n"

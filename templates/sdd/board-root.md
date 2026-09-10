@@ -12,8 +12,8 @@ and both allocate the same number — colliding task IDs. A draft written inside
 is also committed to the task branch and destroyed by `wt remove` if the branch never
 merges.
 
-**Exception — the implementation family.** `/implement`, `/implement-wf` and
-`/fast-implement` do not use this file. Once a worktree exists, the task file travels with
+**Exception — the implementation family.** `/implement` and `/fast-implement`
+do not use this file. Once a worktree exists, the task file travels with
 the code inside it, because its move into `4-in-progress` / `5-review` must be captured by
 the commit.
 

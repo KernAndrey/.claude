@@ -41,6 +41,17 @@ from transport import (
 URL = "https://odoo.test"
 
 
+@pytest.fixture(autouse=True)
+def _no_global(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the real ~/.config/odoo-rpc out of every test in this file.
+
+    Without it a profile the developer happens to have configured joins the
+    results and the assertion fails for a reason that has nothing to do with the
+    code under test.
+    """
+    monkeypatch.setattr(config, "GLOBAL_CONFIG_PATH", tmp_path / "absent.toml")
+
+
 class RecordingTransport:
     """Captures the kwargs a client builds, without a server."""
 

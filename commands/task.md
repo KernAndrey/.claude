@@ -18,10 +18,15 @@ Create a task draft from the description below.
 6. Copy template from `~/.claude/templates/sdd/draft.md`. If `.claude/templates/draft.md`
    exists in the project, use that instead (project override).
 7. Fill placeholders: `{{ID}}`, `{{TITLE}}`, `{{DATE}}`, `{{DESCRIPTION}}`.
-8. Save to `{board}/1-draft/{ID}-{slug}.md`.
-9. Commit the board change per `board-root.md` §6, message
-   `chore(sdd): add {ID} draft`.
-10. Output: ID, absolute file path, brief summary, plus the `board-root.md` §7 report when
+8. **Fill `## Original BA Specification` when the task came with a business-analyst
+   document** — a file, an attachment, or text the user pasted. Copy it verbatim and name
+   the source on the first line. Summarising it defeats the purpose: the whole spec is a
+   restatement, and the `ba-spec-compliance` review lens exists to check that restatement
+   against the original. When there is no such document, leave the section empty.
+9. Save to `{board}/1-draft/{ID}-{slug}.md`.
+10. Commit the board change per `board-root.md` §6, message
+    `chore(sdd): add {ID} draft`.
+11. Output: ID, absolute file path, brief summary, plus the `board-root.md` §7 report when
     `{main_root}` differs from the current directory.
 
 ## Description

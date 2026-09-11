@@ -18,6 +18,8 @@ a Coder (for Architecture Decisions). Every ambiguity must be resolved
 before /task-approve — unresolved questions live in ## Blockers.
 
 Section ownership:
+  BA        → Original BA Specification (verbatim source document; copied,
+              never edited — the ba-spec-compliance review lens reads it)
   Analyst   → Objective, Key Constraints, Glossary, Scope, Assumptions,
               Behavior, Acceptance Criteria, Examples, Edge Cases & Risks,
               Affected Areas, Testing Strategy, Definition of Done, Dependencies
@@ -25,6 +27,22 @@ Section ownership:
               subsections), plus depends_on / blocks in frontmatter
   Lead      → Blockers (adds entries when the user defers questions)
   Template  → Change Control (static text, never edited)
+-->
+
+## Original BA Specification
+
+<!--
+The business analyst's document, copied verbatim. Leave this section empty when
+the task has no BA document.
+
+Copy, do not summarise: every section below is a restatement, and a restatement
+cannot be checked against the source once the source is gone. When the document
+is a file or a link rather than text, paste the requirements and name the source
+on the first line.
+
+Owned by the BA. The Analyst carries it forward unedited; a disagreement between
+this section and the Acceptance Criteria is a finding for the ba-spec-compliance
+lens, not something to reconcile by editing here.
 -->
 
 ## Objective

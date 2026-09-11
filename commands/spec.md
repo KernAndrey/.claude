@@ -208,7 +208,7 @@ Shared context to pass in every agent prompt:
 > Draft path: `{draft path}` — **read `## Decisions` (authoritative user decisions) and `## Codebase Observations` (verified codebase facts). Every numbered decision MUST be reflected in the spec. Codebase observations inform your writing but don't need 1:1 mapping.**
 > User Phase 1 answers: {inline all answers — supplementary context}
 > Project CLAUDE.md: `{path}`
-> Write the business sections (including Key Constraints, Assumptions, and one `[SENTINEL]` marker in Behavior). Signal `SPEC ANALYST DONE.` when ready. Escalate ambiguities with `SPEC ANALYST QUESTION FOR USER` and wait for my reply.
+> Write the business sections (including Key Constraints, Assumptions, and one `[SENTINEL]` marker in Behavior). Copy the draft's `## Original BA Specification` section into the spec **verbatim** — it is the source document the business sections restate, and the `ba-spec-compliance` review lens checks the implementation against it during `/implement`. Leave it empty when the draft's is empty. Signal `SPEC ANALYST DONE.` when ready. Escalate ambiguities with `SPEC ANALYST QUESTION FOR USER` and wait for my reply.
 
 **Resume runs, business blockers resolved:** Resume the Analyst by its `agentId` (context preserved):
 

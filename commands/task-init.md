@@ -18,10 +18,11 @@ Run this from the main worktree. When `git worktree list --porcelain | awk 'NR==
      6-done/
      7-blocked/
      bugs/
+     context/
      archive/
        drafts/
    ```
-   Add `.gitkeep` to each empty directory.
+   Add `.gitkeep` to each empty directory. `context/` holds one folder per task ID for the documents a task arrives with — the BA document as `context/{ID}/*.md`, a meeting transcript under `context/{ID}/meet/` — which `/gl-spec` reads.
 3. Create `tasks/.counter` with content `0`. Create `tasks/bugs/.counter` with content `0`.
 4. Create `.tasks.toml` in `{root}` (its `dir` and `counter_file` resolve relative to that same directory, so the values below are identical for a root-level and a per-client config):
    ```toml
@@ -53,6 +54,7 @@ Run this from the main worktree. When `git worktree list --porcelain | awk 'NR==
    |---------|-------------|-------------|
    | `/task <description>` | Create draft from description | No |
    | `/spec <ID>` | Generate spec from draft | Yes (Analyst + Critic) |
+   | `/gl-spec <ID> [--ba=<path>]` | Generate spec that follows a BA document in `tasks/context/<ID>/`; creates the draft when missing | Yes (Analyst + Critic) |
    | `/task-approve <ID>` | Approve spec → ready | No |
    | `/implement <ID>` | Implement approved spec | Yes (Coder, Tester, 4 Reviewers) |
    | `/task-done <ID>` | Mark task as done | No |

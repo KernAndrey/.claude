@@ -44,7 +44,8 @@ implementation.
    - **Narrowed** — an AC states less than the BA asked for
    - **Reinterpreted** — an AC states something different
    - **Dropped** — no AC carries it, and `## Out of Scope` does not name it
-   - **Deferred** — `## Out of Scope` or `## Blockers` names it deliberately
+   - **Deferred** — `## Out of Scope` or `## Blockers` names it deliberately, or the
+     spec's deviation ledger records it (see *Not a finding*)
 4. Get the diff. For every requirement marked Covered, confirm the code actually
    does what the **BA wording** says, not merely what the AC says. An AC that
    paraphrases loosely can pass while the client's requirement fails.
@@ -67,6 +68,11 @@ the design; leave it out.
   those as `Deferred` rows in the matrix, with no severity.
 - A better design you would have chosen. The BA document sets the target.
 - Wording differences that carry the same meaning.
+- A departure recorded in the spec's `## BA Traceability → ### Deviations from the BA spec`
+  (written by `/gl-spec`) as a `clarification` or a `contradiction`, or as a `judgment`
+  whose `→ b-N` blocker was resolved in its favour. Report it as `Deferred`, quoting the
+  ledger line. A `judgment` its blocker rejected, or a departure the ledger does not
+  name, is not deferred — the usual severity applies.
 
 ## Severity
 

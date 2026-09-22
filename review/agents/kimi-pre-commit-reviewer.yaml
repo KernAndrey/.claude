@@ -1,0 +1,83 @@
+# Restricted agent definition for the pre-commit reviewer.
+# Loaded by review/backends.py:KimiBackend via `kimi --agent-file`.
+#
+# Live smoke (2026-05-01) showed kimi 1.40 silently ignores `exclude_tools`
+# at the top-level `agent:` block — Shell ran 11 times during a review that
+# was supposed to be read-only. Tool restrictions only take effect when:
+#   (a) the parent's `tools:` allowlist is narrowed (kimi DOES honor that),
+#   (b) each subagent the parent dispatches to is itself locked down.
+#
+# Containment layout:
+#   1. Parent `tools:` is narrowed to read-only + dispatch primitives, so
+#      direct tool calls from the parent cannot reach Shell / WriteFile /
+#      StrReplaceFile / SearchWeb / FetchURL.
+#   2. Top-level `exclude_tools:` is kept as future-proofing — kimi 1.40
+#      ignores it but a future version may honor it (it can only tighten,
+#      never loosen, since the listed tools are already absent from the
+#      allowlist).
+#   3. The three built-in subagent slots (coder / explore / plan) all point
+#      to ONE shared file: kimi-readonly-subagent.yaml. That sub-agent
+#      defines its own tool list inline (also read-only), so however the
+#      parent decides to dispatch reviewer work, the dispatched sub-agent
+#      cannot mutate state or reach the network either.
+#
+# Tool-name format: kimi exports tool classes at the package level
+# (kimi_cli.tools.file:WriteFile), NOT at the defining submodule level
+# (kimi_cli.tools.file.write:WriteFile); the submodule path silently
+# fails to match and the tool stays reachable. Names confirmed against
+# /home/kern/.local/share/uv/tools/kimi-cli/lib/python3.13/site-packages/kimi_cli/agents/default/{agent,coder,explore,plan}.yaml.
+#
+# Sibling files:
+#   kimi-pre-commit-system.md         — the parent's system prompt (replaces
+#                                        the default kimi system.md, which
+#                                        contains "you MUST use WriteFile/Shell"
+#                                        directives that conflict with our
+#                                        read-only tool set and triggered a
+#                                        SetTodoList loop in the 2026-05-01
+#                                        smoke).
+#   kimi-readonly-subagent.yaml       — the locked-down sub-agent definition.
+#   kimi-readonly-system.md           — its system prompt.
+#
+# Mirrors the safety story behind `opencode --agent pre-commit-reviewer`
+# and `claude --tools Read,Grep,Glob`. Pairs with the write-tree/read-tree
+# backstop in ~/.claude/git-hooks/pre-commit.
+version: 1
+agent:
+  extend: default
+  system_prompt_path: ./kimi-pre-commit-system.md
+  system_prompt_args:
+    ROLE_ADDITIONAL: ""
+  tools:
+    - kimi_cli.tools.agent:Agent
+    - kimi_cli.tools.ask_user:AskUserQuestion
+    - kimi_cli.tools.todo:SetTodoList
+    - kimi_cli.tools.background:TaskList
+    - kimi_cli.tools.background:TaskOutput
+    - kimi_cli.tools.background:TaskStop
+    - kimi_cli.tools.file:ReadFile
+    - kimi_cli.tools.file:ReadMediaFile
+    - kimi_cli.tools.file:Glob
+    - kimi_cli.tools.file:Grep
+  exclude_tools:
+    - kimi_cli.tools.shell:Shell
+    - kimi_cli.tools.file:WriteFile
+    - kimi_cli.tools.file:StrReplaceFile
+    - kimi_cli.tools.web:SearchWeb
+    - kimi_cli.tools.web:FetchURL
+  subagents:
+    coder:
+      path: ./kimi-readonly-subagent.yaml
+      description: |
+        Read-only investigator. Despite the slot name, this is NOT a code
+        editor — it can only Read/Glob/Grep. Use to inspect files in
+        support of forming the review verdict.
+    explore:
+      path: ./kimi-readonly-subagent.yaml
+      description: |
+        Read-only codebase exploration. Fast file pattern matching and
+        content searches via Glob/Grep, then ReadFile for confirmed hits.
+    plan:
+      path: ./kimi-readonly-subagent.yaml
+      description: |
+        Read-only architectural inspection. Use to trace call chains and
+        understand structure before forming a review verdict.

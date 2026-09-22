@@ -1,0 +1,145 @@
+Decompose a big idea into multiple draft tasks.
+
+## Instructions
+
+1. Read `~/.claude/templates/sdd/board-root.md` and follow it to resolve `{main_root}`, discover the SDD configs, and define `{board}` and `{counter_file}`. The board lives in the main worktree — this command allocates IDs from it and writes there even when you are standing in a linked worktree. Select the root: one config → use it; several → a project rule naming the choice wins, otherwise match the big idea to a root by the directory it names (a client, an addon, a module). `/decompose` mints new IDs, so there is no `id_prefix` to match on — when two roots stay plausible after reading the idea, ask the user which board before allocating IDs.
+2. Parse `$ARGUMENTS`:
+   - If it looks like a file path (ends with `.md`, or starts with `/`, `./`, or `..`), read the file and use its content as the big idea description.
+   - Otherwise, treat the entire `$ARGUMENTS` as a free-text description.
+3. Read `CLAUDE.md` for project context.
+
+## Phase 1: Context Loading
+
+1. Explore the project codebase: domain structure, modules, existing conventions.
+2. Scan all existing tasks in `{board}/` (all statuses except `archive`) — read their frontmatter (id, title, status, group) to understand what already exists. This avoids creating duplicate or overlapping tasks.
+3. If tasks with a `group` field exist, note the active groups.
+
+## Phase 2: Clarification (Light Q&A)
+
+This phase is **mandatory** and cannot be skipped.
+
+### Before any question — the gate
+
+1. Dig the code first. Find the answer where it lives — models, call-sites, existing conventions — before forming a question.
+2. Resolve it yourself when you can. A purely technical point the code answers, or an obvious yes (e.g. "should I do the task at all?"), needs no question — decide and record it as context.
+3. Ask only genuine decisions — ones with downstream consequences where a wrong guess causes rework. When unsure which kind it is, ask: a 30-second question beats a silent wrong default.
+4. Ask as many as genuinely matter — never pad to a count.
+
+**Language.** Run the QA session in Russian — questions, options, and the +/− trade-offs the user reads and answers. Everything that persists is English — spec sections, plan, code, commit messages, and recorded Decisions/Blockers (translate the gist of the user's Russian answer).
+
+1. Based on the big idea and codebase exploration, compile the clarifying questions that genuinely matter (no padding to a count). Focus areas:
+   - **Границы**: Что явно НЕ входит в эту идею? Есть ли смежные вещи, которые трогать не нужно?
+   - **Гранулярность**: Насколько мелко бить? Одна фича = одна задача, или крупнее?
+   - **Порядок**: Есть ли жёсткие зависимости между частями, или всё можно делать параллельно?
+   - **Приоритет**: Что самое важное? Что можно отложить?
+   - **Пересечения**: Если есть существующие задачи в том же домене — спросить, как новая работа соотносится с ними.
+
+2. **Ask questions ONE AT A TIME.** Follow the same format as `/spec`:
+
+   ```
+   **Вопрос N/M**: {контекст для человека ВНЕ задачи: о чём вопрос, что ты нашёл в коде, почему выбор важен и чем грозит ошибка}
+
+   {Сам вопрос}
+
+   Варианты:
+   1. {вариант А} — + {плюс}; − {минус}
+   2. {вариант Б} — + {плюс}; − {минус}
+   3. {вариант В — если нужен} — + {плюс}; − {минус}
+   4. Другое (напиши свой вариант)
+   ```
+
+3. Wait for the user's answer before asking the next question.
+4. If an answer reveals new ambiguities — add follow-up questions.
+
+**Rules for this phase:**
+- Ask when something is unclear.
+- This phase is mandatory.
+- Focus on decomposition concerns (what are the pieces, how they relate), not implementation details (each task will get its own `/spec` Q&A later).
+- One question at a time.
+
+## Phase 3: Decomposition Proposal
+
+After the user has answered all questions:
+
+1. Propose a task breakdown. For each task:
+   - **Title** (short, actionable, domain language)
+   - **Summary** (2-3 sentences — what this task covers)
+   - **Priority** (critical / high / medium / low)
+   - **Dependencies** (which other proposed tasks must come first, by number)
+   - **Complexity** (small / medium / large — to help gauge granularity)
+
+2. Present the proposal as a numbered list:
+
+```
+## Предложение по декомпозиции: {название группы}
+
+Задач: N | Зависимости: {краткое описание цепочки}
+
+1. **{Title}** [priority] [complexity]
+   {Summary}
+   Зависит от: — (или: #2, #3)
+
+2. **{Title}** [priority] [complexity]
+   {Summary}
+   Зависит от: #1
+
+...
+```
+
+3. Ask: **"Подтверди декомпозицию, или скажи что изменить (добавить / убрать / разбить / объединить / переприоритизировать)."**
+
+4. If the user requests changes — adjust the proposal and present again. Iterate until confirmed.
+
+**Rules:**
+- Propose 2-7 tasks. If the idea naturally requires more — ask the user if they want to split into two groups.
+- Each task must be independently spec-able via `/spec`.
+- Do not include implementation details — keep it at the business/domain level.
+- Propose names in the domain language of the project.
+
+## Phase 4: Batch Draft Creation
+
+After user confirms the proposal:
+
+1. Read the counter from `{counter_file}`. Calculate the range: `current + 1` through `current + N`.
+2. Generate a **group slug** from the big idea (kebab-case, max 4 words, ASCII only). Example: `invoice-pipeline`, `test-isolation`.
+3. For each confirmed task (in dependency order):
+   a. Increment counter, generate ID: `{id_prefix}-{counter:03d}`, then run the free-ID check from `board-root.md` §5 before using it.
+   b. Generate task slug from the title (kebab-case, max 5 words, ASCII only).
+   c. Copy template from `~/.claude/templates/sdd/draft.md`. If `.claude/templates/draft.md` exists in the project, use that instead (project override).
+   d. Fill placeholders: `{{ID}}`, `{{TITLE}}`, `{{DATE}}`.
+   e. Add extra frontmatter fields after `priority`:
+      - `group: "{group-slug}"`
+      - `depends_on: ["{ID-1}", "{ID-2}"]` (array of task IDs, empty `[]` if none)
+   f. Fill `## Idea` with the task summary from the confirmed proposal.
+   g. Fill `## Context` with:
+      ```
+      Decomposed from: "{big idea title}"
+      Group: {group-slug}
+      Sibling tasks: {ID-1} ({title-1}), {ID-2} ({title-2}), ...
+      ```
+   h. Save to `{board}/1-draft/{ID}-{slug}.md`.
+
+4. Write the counter back to `{counter_file}` (to `current + N`).
+5. Commit the board change per `board-root.md` §6 — one commit for the whole batch,
+   message `chore(sdd): add {N} drafts for {group-slug}`.
+
+## Output
+
+Display a summary table and next steps, plus the `board-root.md` §7 report when `{main_root}` differs from the current directory:
+
+```
+## Создано {N} задач (группа: {group-slug})
+
+| #  | ID       | Название                      | Приоритет | Зависит от |
+|----|----------|-------------------------------|-----------|------------|
+| 1  | PROJ-008  | {title}                       | high      | —          |
+| 2  | PROJ-009  | {title}                       | high      | PROJ-008    |
+| 3  | PROJ-010  | {title}                       | medium    | PROJ-008    |
+
+Следующий шаг: `/spec {first-ID}`
+Рекомендуемый порядок: PROJ-008 → PROJ-009 → PROJ-010
+```
+
+## Description
+
+$ARGUMENTS

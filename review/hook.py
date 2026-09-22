@@ -1,0 +1,1934 @@
+#!/usr/bin/env python3
+"""
+Git pre-commit code review gate.
+
+Called by ~/.claude/git-hooks/pre-commit. Modes:
+
+- Small diff (added lines < FANOUT_THRESHOLD): single-call reviewer
+  reading prompts/combined.md.
+- Large diff (added lines >= FANOUT_THRESHOLD): 3 parallel lens calls
+  (bugs / architecture / tests), aggregated, then passed through a
+  Claude Sonnet arbiter that UPHOLDs or OVERTURNs each [CRITICAL]
+  finding — only when CRITICALs are present.
+
+The router (LENS_APPLICABILITY) skips lenses that have nothing to
+examine in the diff. If no lens applies at all (docs-only), the
+review is skipped entirely — no LLM requests.
+
+Exit codes:
+    0 — commit allowed (review passed or skipped)
+    1 — commit BLOCKED (critical issues upheld)
+
+Skip with: git commit --no-verify
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import os
+import re
+import subprocess
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+
+# review-note: script-style absolute imports (`from backends import ...`)
+# are deliberate, not a packaging oversight. The pre-commit hook invokes
+# `python3 -B ~/.claude/review/hook.py` directly, which puts
+# ~/.claude/review/ on sys.path[0]; `from review.backends import ...`
+# would ModuleNotFoundError in that invocation context.
+from backends import BACKENDS
+from config import (
+    ARBITER,
+    CHUNKED_BACKENDS,
+    COVERAGE_GATE,
+    FALLBACK,
+    FANOUT_THRESHOLD,
+    MAX_CHUNKS,
+    MAX_PROD_LINES,
+    MIN_LINES_TO_REVIEW,
+    PRIMARIES,
+    RunnerConfig,
+)
+import approvals
+from scripts.preflight_gate import run_gate
+
+# --- Path configuration (derived/fixed locations, not user-tunable) ---
+REVIEW_ROOT = Path.home() / ".claude" / "review"
+PROMPTS_DIR = REVIEW_ROOT / "prompts"
+GLOBAL_PROMPT = PROMPTS_DIR / "combined.md"
+PROJECT_PROMPT = Path(".claude") / "review_prompt.md"
+LENS_DIR = PROMPTS_DIR
+ARBITER_PROMPT_PATH = LENS_DIR / "arbiter.md"
+LOG_DIR = REVIEW_ROOT / "logs"
+
+# Extensions that carry executable logic. Used by the lens router to skip
+# lenses that have nothing to examine on a docs/config/spec-only diff.
+CODE_EXTS: frozenset[str] = frozenset(
+    {
+        # Python
+        ".py",
+        # JS/TS family (comprehensive)
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".vue",
+        ".svelte",
+        # Other typed / compiled languages
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".swift",
+        ".rb",
+        ".php",
+        ".cs",
+        # Shell
+        ".sh",
+        ".bash",
+    }
+)
+
+# Config / infra files with runtime effect. Only the `bugs` lens cares
+# about these (for config-surprise detection). Docs / pure data files
+# are not included and trigger a full review skip when they are the
+# only changes.
+CONFIG_EXTS: frozenset[str] = frozenset(
+    {
+        ".yml",
+        ".yaml",
+        ".toml",
+        ".ini",
+        ".env",
+        ".conf",
+        ".cfg",
+        ".tf",
+        ".tfvars",
+        ".json",  # package.json, tsconfig, etc
+    }
+)
+CONFIG_FILENAMES: frozenset[str] = frozenset(
+    {
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "docker-compose.dev.yml",
+        "docker-compose.prod.yml",
+        "Makefile",
+        "Procfile",
+    }
+)
+
+
+def warn(msg: str) -> None:
+    print(f"\033[33m⚠️  [code-review] {msg}\033[0m", file=sys.stderr)
+
+
+def error(msg: str) -> None:
+    print(f"\033[31m❌ [code-review] {msg}\033[0m", file=sys.stderr)
+
+
+def info(msg: str) -> None:
+    print(f"\033[36mℹ️  [code-review] {msg}\033[0m", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Fallback visibility
+# ---------------------------------------------------------------------------
+# When a primary reviewer errors (rc!=0 / empty / timeout / unreachable) the
+# hook transparently falls back to FALLBACK (config.py). That fail-open is
+# correct — a broken reviewer must never block a commit — but it is DANGEROUS
+# when silent: the kimi backend was dead for three weeks (stale kimi-cli CLI
+# flags after the kimi-code migration) and every commit quietly ran on Sonnet
+# instead, unnoticed. These helpers make any fallback LOUD and put it in the
+# review report body (stdout + saved log), not just a scroll-by stderr line.
+_FALLBACK_LOCK = threading.Lock()
+_FALLBACK_EVENTS: list[str] = []  # "primary → fallback: reason", one per fired fallback
+
+
+def record_fallback(primary: str, fallback: str, reason: str) -> None:
+    """Thread-safe: called from every path (small / chunked fan-out worker)."""
+    with _FALLBACK_LOCK:
+        _FALLBACK_EVENTS.append(f"{primary} → {fallback}: {reason}")
+
+
+def fallback_banner() -> str | None:
+    """A loud, plain-text banner if any primary reviewer failed over, else None.
+
+    Prepended to the review report so it appears in both the commit output and
+    the saved log/*.md — impossible to miss and durable for later inspection.
+    """
+    with _FALLBACK_LOCK:
+        events = list(_FALLBACK_EVENTS)
+    if not events:
+        return None
+    counts: dict[str, int] = {}
+    for ev in events:
+        counts[ev] = counts.get(ev, 0) + 1
+    bar = "=" * 66
+    lines = [
+        bar,
+        "⚠️  PRIMARY REVIEWER FAILED — the configured reviewer did not run.",
+        "-" * 66,
+        "This commit was reviewed by the FALLBACK backend (or not at all, if that",
+        "also failed — see messages above). Findings below are NOT from your",
+        "intended primary reviewer. Fix it — a silent fallback hides the breakage",
+        "(see review/config.py).",
+    ]
+    for ev, n in counts.items():
+        lines.append(f"  • {ev}" + (f"  (×{n})" if n > 1 else ""))
+    lines.append(bar)
+    return "\n".join(lines)
+
+
+def emit_fallback_stderr() -> None:
+    """Print the fallback banner to stderr in red, if any. Call once, last."""
+    banner = fallback_banner()
+    if banner:
+        print(f"\033[31m{banner}\033[0m", file=sys.stderr)
+
+
+def read_file(path: Path | str) -> str:
+    """Read file contents, return empty string if not found."""
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, PermissionError):
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Git helpers
+# ---------------------------------------------------------------------------
+
+
+def get_staged_diff() -> tuple[str, str]:
+    """Get the staged diff. Returns (diff_text, error_msg)."""
+    result = subprocess.run(
+        ["git", "diff", "--cached"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return "", f"git diff --cached failed (rc={result.returncode}): {result.stderr.strip()}"
+    return result.stdout.strip(), ""
+
+
+def get_staged_files() -> str:
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
+def get_staged_content_key() -> str:
+    """Content key of the staged change set — the fast-path match side.
+
+    Runs the identical ``git diff --raw --full-index -z --no-renames --cached``
+    that ``pre_review`` uses on its private index and hashes through
+    ``approvals.content_hash_from_raw``, so a marker written at pre-review time
+    is found here whenever the staged final bytes match — regardless of base
+    drift or how the change was reconstructed. Returns "" if git fails (→ no
+    match → full review, fail-safe).
+    """
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--raw", "--full-index", "-z", "--no-renames"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+    return approvals.content_hash_from_raw(result.stdout)
+
+
+def get_git_status() -> str:
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "(git status failed)"
+
+
+def count_changed_lines(diff: str) -> int:
+    """Count lines added or removed in the diff (excluding file headers)."""
+    return sum(
+        1
+        for line in diff.split("\n")
+        if (line.startswith("+") and not line.startswith("+++"))
+        or (line.startswith("-") and not line.startswith("---"))
+    )
+
+
+_DIFF_GIT_HEADER_RE = re.compile(r"^diff --git ")
+_PLUS_FILE_HEADER_RE = re.compile(r"^\+\+\+ (?:b/)?(.+)$")
+
+
+def count_added_production_lines(diff: str) -> int:
+    """Count added ('+') lines that live in production-code files.
+
+    Walks the unified-diff text and tracks the current file via the
+    ``+++ b/<path>`` header. A ``diff --git`` line resets state so
+    binary-file blocks (no ``+++`` header) don't leak classification
+    from the previous file. Lines starting with ``+++`` are headers
+    and never counted.
+
+    Production-code classification matches :func:`is_production_code` —
+    code extensions from ``CODE_EXTS``, excluding test files. Tests,
+    docs, config, and data changes do not drive the fan-out routing
+    decision because they don't benefit from 3-lens review.
+    """
+    count = 0
+    current_is_prod = False
+    for line in diff.split("\n"):
+        if _DIFF_GIT_HEADER_RE.match(line):
+            current_is_prod = False
+            continue
+        m = _PLUS_FILE_HEADER_RE.match(line)
+        if m:
+            path = m.group(1).strip()
+            current_is_prod = path != "/dev/null" and is_production_code(path)
+            continue
+        if line.startswith("+") and current_is_prod:
+            count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Diff processing
+# ---------------------------------------------------------------------------
+
+
+def check_diff_size(diff: str) -> str | None:
+    """Return an error message if added prod lines exceed MAX_PROD_LINES, else None.
+
+    Counts only added (`+`) lines in production-code files
+    (CODE_EXTS minus test files). Tests, docs, configs, removals, and
+    context lines are intentionally exempt — reviewer recall scales
+    with prod-code complexity, not with total text volume.
+
+    When the diff exceeds the limit, the writer must generate
+    ``.review/manifest.yaml`` so the chunked-review pipeline can fan
+    the commit out. The hint is part of the error so a developer seeing
+    this for the first time has a discoverable next step.
+    """
+    prod = count_added_production_lines(diff)
+    if prod <= MAX_PROD_LINES:
+        return None
+    return (
+        f"Diff has {prod} added production-code lines (limit {MAX_PROD_LINES}).\n"
+        "Write `.review/manifest.yaml` to split the commit into reviewable\n"
+        "chunks. Scaffold the file with:\n"
+        "    python3 ~/.claude/review/scripts/scaffold_manifest.py\n"
+        "Then edit it — you decide how to group files. The chunked-review\n"
+        "pipeline runs reviewers per chunk in parallel.\n"
+        "Test, doc, config, and lock-file changes do not count toward the limit."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompt building — single-call path
+# ---------------------------------------------------------------------------
+
+
+def append_project_rules(prompt: str, repo_root: Path | None = None) -> str:
+    """Append the project's own review rules (`.claude/review_prompt.md`) to a
+    reviewer system prompt.
+
+    Every reviewer prompt goes through here — single-call, fan-out lens,
+    chunked per-chunk and chunked whole-diff — so a project's rules reach a
+    large commit as well as a small one. ``repo_root`` defaults to the cwd,
+    which is the repo root when git runs the hook. An empty prompt stays
+    empty: callers read "" as a missing global prompt.
+    """
+    if not prompt:
+        return ""
+    project_rules = read_file((repo_root or Path.cwd()) / PROJECT_PROMPT)
+    if not project_rules:
+        return prompt
+    return f"{prompt}\n\n---\n\n## Project-specific review rules:\n{project_rules}"
+
+
+def build_system_prompt() -> str:
+    """Assemble system prompt: global combined.md + optional project-local rules."""
+    return append_project_rules(read_file(GLOBAL_PROMPT))
+
+
+def build_user_prompt(diff: str, files: str, is_merge: bool) -> str:
+    """Build the user prompt with diff, file list, and optional commit
+    message draft (from CLAUDE_COMMIT_MSG env var — set by the git
+    wrapper from .git/COMMIT_EDITMSG when freshly written)."""
+    parts = []
+
+    if is_merge:
+        parts.append(
+            "**MERGE CONFLICT RESOLUTION**: This is a merge commit. "
+            "The individual commits were already reviewed in the feature branch. "
+            "Focus ONLY on how conflicts were resolved — look for incorrect "
+            "resolution, lost changes, or logic errors introduced during merge."
+        )
+
+    commit_msg = os.environ.get("CLAUDE_COMMIT_MSG", "").strip()
+    if commit_msg:
+        parts.append(
+            "## Developer's commit message draft:\n"
+            f"{commit_msg}\n\n"
+            "Use this to understand the intent of the change. Do NOT assume "
+            "the message is accurate — verify claims against the diff. If the "
+            "message contradicts what the code does, that divergence is itself "
+            "a [CRITICAL] finding (bugs lens)."
+        )
+
+    parts.append(f"## Changed files:\n{files}")
+    parts.append(f"## Diff to review:\n```diff\n{diff}\n```")
+    parts.append(
+        "## Your task:\n"
+        "Produce the three-section inventory exactly as described in the "
+        "system prompt (file audit + tool-use log, findings grouped by "
+        "lens, summary line).\n\n"
+        "Do NOT output `OK` or `BLOCK`. The calling hook reads `[CRITICAL]` "
+        "tags from your findings and decides the verdict mechanically — "
+        "your job is the complete inventory, not the decision.\n\n"
+        "Use your tools: `Read` changed files for full context, `Grep` for "
+        "duplicates and call sites, `Glob` for test files."
+    )
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Prompt building — fan-out path
+# ---------------------------------------------------------------------------
+
+
+def build_lens_system_prompt(lens_name: str) -> str:
+    """Assemble lens prompt = common preamble + lens-specific body + optional project-local rules."""
+    common = read_file(LENS_DIR / "common.md")
+    specific = read_file(LENS_DIR / f"{lens_name}.md")
+    if not common or not specific:
+        return ""
+    return append_project_rules(f"{common}\n\n---\n\n{specific}")
+
+
+# ---------------------------------------------------------------------------
+# Review runners
+# ---------------------------------------------------------------------------
+
+
+def _verify_runner_configs() -> None:
+    """Pre-flight check for every PRIMARIES entry + FALLBACK + ARBITER.
+
+    Without this, a misconfigured backend (e.g. typo in config.py) only
+    surfaces when ``run_reviewer()`` is finally called and raises
+    ``ValueError`` — which then bubbles up to ``main()``'s fail-open
+    ``except Exception`` and silently skips the entire review gate.
+    Calling this from ``main()`` first means the misconfig is caught
+    early and named in the warn log before fail-open kicks in.
+
+    Also rejects an empty PRIMARIES list (no reviewer = nothing to do)
+    and duplicate ``(backend, model)`` pairs in PRIMARIES (running
+    the same backend twice with the same model is always a copy-paste
+    mistake, never intentional).
+    """
+    valid = sorted(BACKENDS)
+
+    if not PRIMARIES:
+        raise ValueError("PRIMARIES is empty; configure at least one reviewer in review/config.py")
+
+    seen_pairs: set[tuple[str, str]] = set()
+    for idx, cfg in enumerate(PRIMARIES, start=1):
+        label = f"PRIMARIES[{idx - 1}]"
+        if cfg.backend not in BACKENDS:
+            raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {valid}")
+        pair = (cfg.backend, cfg.model)
+        if pair in seen_pairs:
+            raise ValueError(
+                f"{label} duplicates an earlier PRIMARIES entry "
+                f"({cfg.backend!r}, {cfg.model!r}); each (backend, model) pair must be unique"
+            )
+        seen_pairs.add(pair)
+
+    for label, cfg in (("FALLBACK", FALLBACK), ("ARBITER", ARBITER)):
+        if cfg is None:
+            continue
+        if cfg.backend not in BACKENDS:
+            raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {valid}")
+
+    for idx, cfg in enumerate(CHUNKED_BACKENDS, start=1):
+        label = f"CHUNKED_BACKENDS[{idx - 1}]"
+        if cfg.backend not in BACKENDS:
+            raise ValueError(f"{label} has invalid backend {cfg.backend!r}; must be one of {valid}")
+
+
+def _warn_on_unhealthy_backends() -> None:
+    """Warn early when a configured backend cannot produce a trustworthy review.
+
+    ``_verify_runner_configs`` validates config *shape* — that every backend
+    name resolves. This checks the *environment* each configured backend needs,
+    via ``Backend.selfcheck``. Only codex implements one today: its sandbox can
+    fail in a way that leaves the reviewer blind while still returning rc=0 and
+    a plausible review, which no return-value check can catch.
+
+    Warn, never raise. ``CodexBackend.run`` independently fails such a run so
+    ``run_with_fallback`` fires and the commit still gets a real review from
+    FALLBACK; raising here would instead skip the review entirely. This is the
+    early, named heads-up so the cause is visible before any LLM work starts.
+    Each backend caches its own verdict, so probing the same backend from
+    several config slots costs one probe.
+    """
+    seen: set[str] = set()
+    for cfg in (*PRIMARIES, FALLBACK, ARBITER, *CHUNKED_BACKENDS):
+        if cfg is None or cfg.backend in seen:
+            continue
+        seen.add(cfg.backend)
+        backend = BACKENDS.get(cfg.backend)
+        if backend is None:
+            continue  # already reported by _verify_runner_configs
+        reason = backend.selfcheck()
+        if reason:
+            warn(f"{cfg.backend} backend unhealthy: {reason}")
+
+
+def run_reviewer(
+    cfg: RunnerConfig,
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str, str, int]:
+    """Dispatch to the configured backend. Returns (review, stderr, rc).
+
+    Assumes backends have been pre-validated via ``_verify_runner_configs``
+    at ``main()`` startup, so an unknown backend here means either a
+    programmer error (a RunnerConfig built outside config.py with a
+    typo) or a backend that is named in config but not registered in
+    ``backends.BACKENDS``.
+    """
+    backend = BACKENDS.get(cfg.backend)
+    if backend is None:
+        raise ValueError(f"unknown backend: {cfg.backend!r}")
+    return backend.run(system_prompt, user_prompt, cfg.model, cfg.timeout)
+
+
+def run_with_fallback(
+    primary: RunnerConfig,
+    fallback: RunnerConfig | None,
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str, str, int, str]:
+    """Try primary; fall back on timeout/error/empty output.
+
+    Returns (review, stderr, rc, used_backend_name) where
+    ``used_backend_name`` is one of ``"opencode"``, ``"claude"`` (the
+    backend that produced the returned tuple — useful for log labels).
+
+    Raises ``subprocess.TimeoutExpired`` only if the fallback also
+    times out, or if there is no fallback configured. Raises
+    ``FileNotFoundError``/``OSError`` only when both runners are
+    unreachable (or there is no fallback).
+    """
+    review = ""
+    stderr = ""
+    rc = -1
+    primary_failed_reason: str | None = None
+
+    try:
+        review, stderr, rc = run_reviewer(primary, system_prompt, user_prompt)
+    except subprocess.TimeoutExpired:
+        if fallback is None:
+            raise
+        primary_failed_reason = f"{primary.backend} timeout"
+    except (FileNotFoundError, OSError) as exc:
+        if fallback is None:
+            raise
+        primary_failed_reason = f"{primary.backend} unreachable: {exc}"
+
+    if primary_failed_reason is None and rc == 0 and review and review.strip():
+        return review, stderr, rc, primary.backend
+
+    if fallback is None:
+        return review, stderr, rc, primary.backend
+
+    if primary_failed_reason is not None:
+        reason = primary_failed_reason
+    else:
+        reason = f"{primary.backend} exited rc={rc} with error/empty output"
+    warn(f"{reason} — falling back to {fallback.backend}")
+    record_fallback(primary.backend, fallback.backend, reason)
+
+    review, stderr, rc = run_reviewer(fallback, system_prompt, user_prompt)
+    return review, stderr, rc, fallback.backend
+
+
+# ---------------------------------------------------------------------------
+# Parsing — reviewer output
+# ---------------------------------------------------------------------------
+
+# Optional finding ID: bare `[F1]` (single-backend mode) or
+# backend-prefixed `[opencode-F1]` / `[claude-F2]` (multi-backend mode,
+# emitted by orchestrator._run_review_for_backend with prefix=cfg.backend).
+# Backend names match `[a-z][a-z0-9_-]*` — opencode, claude, future
+# additions like codex/kimi/gpt_5_4. Keep narrow on purpose to avoid
+# matching arbitrary `[anything-F1]` brackets in reviewer prose.
+_FINDING_ID_PATTERN = r"(?:[a-z][a-z0-9_-]*-)?F\d+"
+
+_CRITICAL_LINE_RE = re.compile(
+    rf"^[ \t]*[-*•]?[ \t]*(?:\[{_FINDING_ID_PATTERN}\]\s*)?\[CRITICAL\]",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Anchored to line start with optional bullet + optional `[Fn]` id — mirrors
+# `_CRITICAL_LINE_RE` so prose or quoted diff lines that merely mention the
+# `[WARNING]` tag are ignored. Single source of truth for every warning
+# count / gate / surface path in this module.
+_WARNING_LINE_RE = re.compile(
+    rf"^[ \t]*[-*•]?[ \t]*(?:\[{_FINDING_ID_PATTERN}\]\s*)?\[WARNING\][^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def extract_warning_lines(review: str) -> list[str]:
+    """Return every finding-shaped `[WARNING]` line, stripped.
+
+    Matches only at the start of a line (optional bullet + optional
+    `[Fn]` id + `[WARNING]` tag), so reviewer prose or quoted diff
+    text containing the tag is not surfaced. Mirrors the anchoring of
+    `_CRITICAL_LINE_RE`.
+
+    Continuation lines in multi-line warnings are not captured — the
+    tagged line alone is returned. A multi-line capture would need to
+    be coordinated across reviewer output formats.
+    """
+    return [m.group(0).strip() for m in _WARNING_LINE_RE.finditer(review)]
+
+
+_SUMMARY_LINE_RE = re.compile(r"^[ \t]*Summary:\s", re.IGNORECASE)
+_SECTION_1_MARKER = re.compile(r"(?im)^#{1,6}\s*Section\s*1\b")
+_SECTION_2_MARKER = re.compile(r"(?im)^#{1,6}\s*Section\s*2\b")
+
+
+def count_criticals(review: str) -> int:
+    """Count [CRITICAL] finding lines in reviewer output.
+
+    Matches only at line start (optional bullet + optional `[Fn]` id
+    tag). Mid-line mentions in prose or diff quotes do not count.
+    """
+    if not review:
+        return 0
+    return len(_CRITICAL_LINE_RE.findall(review))
+
+
+def is_well_formed(review: str) -> bool:
+    """True if a single-call review ran to completion in the documented format.
+
+    The contract (prompts/combined.md) requires Section 1, Section 2, and
+    the ``Summary:`` terminator as the final non-empty line. This
+    check is used ONLY for the single-call path — the fan-out path
+    synthesises its own aggregate summary.
+    """
+    if not review:
+        return False
+    if not _SECTION_1_MARKER.search(review):
+        return False
+    if not _SECTION_2_MARKER.search(review):
+        return False
+    lines = [line for line in review.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return _SUMMARY_LINE_RE.match(lines[-1]) is not None
+
+
+def parse_verdict(review: str) -> str:
+    """Single-call verdict: empty/malformed -> BLOCK; any [CRITICAL] -> BLOCK."""
+    if not review or not review.strip():
+        return "BLOCK"
+    if not is_well_formed(review):
+        return "BLOCK"
+    return "BLOCK" if count_criticals(review) > 0 else "OK"
+
+
+# ---------------------------------------------------------------------------
+# Fan-out — lens router
+# ---------------------------------------------------------------------------
+
+
+def _iter_files(files: str) -> list[str]:
+    """Split the staged-files string into non-empty path entries."""
+    return [f.strip() for f in files.split("\n") if f.strip()]
+
+
+def _any_file_matches(files: str, exts: frozenset[str]) -> bool:
+    """True if any changed file has an extension in ``exts``."""
+    for f in _iter_files(files):
+        for ext in exts:
+            if f.endswith(ext):
+                return True
+    return False
+
+
+def _any_filename_matches(files: str, names: frozenset[str]) -> bool:
+    """True if any changed file's basename matches ``names`` exactly."""
+    for f in _iter_files(files):
+        if Path(f).name in names:
+            return True
+    return False
+
+
+def _has_code(files: str) -> bool:
+    return _any_file_matches(files, CODE_EXTS)
+
+
+def _has_code_or_config(files: str) -> bool:
+    return (
+        _any_file_matches(files, CODE_EXTS)
+        or _any_file_matches(files, CONFIG_EXTS)
+        or _any_filename_matches(files, CONFIG_FILENAMES)
+    )
+
+
+# Test-file heuristics — path shapes that carry test code, not production logic.
+_TEST_BASENAME_RE = re.compile(
+    r"""
+    ^test_.+\.(py|rb)$                                   # Python/Ruby: test_foo.py
+    | .+_test\.(py|go|rb)$                                # Go/Python/Ruby: foo_test.go
+    | .+\.(test|spec)\.(ts|tsx|js|jsx|mjs|cjs|vue|svelte)$ # JS/TS: foo.test.ts, foo.spec.tsx
+    | ^.+Test\.(java|kt|cs|swift)$                        # JVM/CLR/Swift: FooTest.java
+    | ^.+Tests\.(cs|swift)$                               # .NET/Swift: FooTests.cs
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+_TEST_PATH_SEGMENTS: frozenset[str] = frozenset({"tests", "test", "__tests__", "spec", "specs", "testing"})
+
+
+def is_test_file(path: str) -> bool:
+    """True if the path looks like a test file by basename or directory."""
+    p = Path(path)
+    if _TEST_BASENAME_RE.match(p.name):
+        return True
+    return any(seg in _TEST_PATH_SEGMENTS for seg in p.parts[:-1])
+
+
+def is_production_code(path: str) -> bool:
+    """True if the path is executable code and NOT a test file.
+
+    Scope: fan-out SIZING only — used by
+    ``count_added_production_lines`` to gate ``FANOUT_THRESHOLD``.
+    Not reused by ``_has_code`` / ``applicable_lenses`` by design:
+    those answer "should the tests/architecture lens run at all?",
+    and a tests-only commit must still trigger the tests lens.
+    Sizing and lens applicability are different questions.
+    """
+    if is_test_file(path):
+        return False
+    return any(path.endswith(ext) for ext in CODE_EXTS)
+
+
+# Map lens → predicate that answers "is there anything in this diff this
+# lens could plausibly flag?".
+#
+# - bugs: runs on code OR config/infra files (config-surprise scope).
+# - architecture, tests: require executable code.
+#
+# If no lens is applicable (docs-only diff), run_review skips the entire
+# review without any LLM calls.
+LENS_APPLICABILITY: dict[str, callable] = {
+    "bugs": _has_code_or_config,
+    "architecture": _has_code,
+    "tests": _has_code,
+}
+
+# Single source of truth for lens names — derived from the registry so
+# the two cannot drift. Order follows LENS_APPLICABILITY (insertion-ordered
+# dict on Python 3.7+).
+LENS_NAMES: tuple[str, ...] = tuple(LENS_APPLICABILITY)
+
+
+def applicable_lenses(files: str) -> list[str]:
+    """Return lenses worth running for this file set, in LENS_NAMES order."""
+    return [name for name in LENS_NAMES if LENS_APPLICABILITY[name](files)]
+
+
+# ---------------------------------------------------------------------------
+# Fan-out
+# ---------------------------------------------------------------------------
+
+
+def run_single_lens(
+    lens_name: str,
+    diff: str,
+    files: str,
+    is_merge: bool,
+) -> dict:
+    """Run one lens. Returns dict with name/status/review/error/reviewer."""
+    system_prompt = build_lens_system_prompt(lens_name)
+    if not system_prompt:
+        return {
+            "name": lens_name,
+            "status": "error",
+            "review": "",
+            "error": f"prompts/{lens_name}.md or prompts/common.md missing",
+            "reviewer": None,
+        }
+
+    user_prompt = build_user_prompt(diff, files, is_merge)
+
+    try:
+        review, stderr, rc, used = run_with_fallback(PRIMARIES[0], FALLBACK, system_prompt, user_prompt)
+    except subprocess.TimeoutExpired:
+        # Only fired if the fallback (or sole runner) timed out.
+        timed_out = FALLBACK.backend if FALLBACK is not None else PRIMARIES[0].backend
+        return {
+            "name": lens_name,
+            "status": "timeout",
+            "review": "",
+            "error": f"{timed_out} timeout",
+            "reviewer": timed_out,
+        }
+    except (FileNotFoundError, OSError) as exc:
+        return {
+            "name": lens_name,
+            "status": "error",
+            "review": "",
+            "error": f"both runners unavailable: {exc}",
+            "reviewer": None,
+        }
+
+    if rc != 0 or not review or not review.strip():
+        return {
+            "name": lens_name,
+            "status": "error",
+            "review": review,
+            "error": f"rc={rc} stderr={stderr}",
+            "reviewer": used,
+        }
+
+    return {"name": lens_name, "status": "ok", "review": review, "error": "", "reviewer": used}
+
+
+def _aggregate_lens_outputs(per_lens: list[dict]) -> str:
+    """Concatenate lens outputs. Appends a global Summary line."""
+    parts: list[str] = []
+    for d in per_lens:
+        header = f"## Lens: {d['name']}"
+        if d["status"] == "ok":
+            parts.append(f"{header}\n\n{d['review']}")
+        elif d["status"] == "skipped_by_router":
+            parts.append(f"{header}\n\n_Skipped by router: {d['error']}_")
+        else:
+            parts.append(f"{header}\n\n_Lens unavailable: {d['error']}_")
+    total_c = sum(count_criticals(d.get("review", "")) for d in per_lens if d["status"] == "ok")
+    total_w = sum(len(extract_warning_lines(d.get("review", ""))) for d in per_lens if d["status"] == "ok")
+    parts.append(f"Summary: {total_c} CRITICAL, {total_w} WARNING across {len(per_lens)} lenses.")
+    return "\n\n".join(parts)
+
+
+def run_fanout(diff: str, files: str, is_merge: bool) -> tuple[str, list[dict]]:
+    """Run applicable lenses in parallel. Returns (aggregated_text, per_lens).
+
+    The lens router (``LENS_APPLICABILITY``) skips lenses that have
+    nothing in the diff to look at (e.g. Types for non-Python diffs).
+    Skipped lenses are recorded in ``per_lens`` with status
+    ``skipped_by_router`` so the log shows exactly which lenses ran and
+    which were pruned.
+    """
+    applicable = applicable_lenses(files)
+    skipped = [n for n in LENS_NAMES if n not in applicable]
+
+    per_lens: list[dict] = [
+        {
+            "name": name,
+            "status": "skipped_by_router",
+            "review": "",
+            "reviewer": None,
+            "error": "no applicable files for this lens",
+        }
+        for name in skipped
+    ]
+
+    if skipped:
+        info(f"Fan-out: skipping {len(skipped)} lens(es) ({', '.join(skipped)}) — no applicable files.")
+    info(f"Fan-out: launching {len(applicable)} lens review(s) in parallel...")
+
+    if applicable:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(applicable)) as ex:
+            futures = {ex.submit(run_single_lens, name, diff, files, is_merge): name for name in applicable}
+            for fut in concurrent.futures.as_completed(futures):
+                name = futures[fut]
+                try:
+                    per_lens.append(fut.result())
+                except Exception as exc:
+                    per_lens.append(
+                        {
+                            "name": name,
+                            "status": "error",
+                            "review": "",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "reviewer": None,
+                        }
+                    )
+
+    per_lens.sort(key=lambda d: LENS_NAMES.index(d["name"]))
+    ok_count = sum(1 for d in per_lens if d["status"] == "ok")
+    info(
+        f"Fan-out complete: {ok_count}/{len(applicable)} lens(es) returned findings ({len(skipped)} skipped by router)."
+    )
+
+    aggregated = _aggregate_lens_outputs(per_lens)
+    return aggregated, per_lens
+
+
+# ---------------------------------------------------------------------------
+# Arbiter
+# ---------------------------------------------------------------------------
+
+_ARBITER_VERDICT_RE = re.compile(
+    r"^\s*\[(UPHELD|OVERTURN)\]\s*(F\d+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+_ARBITER_SUMMARY_RE = re.compile(
+    r"^\s*Summary:\s*\d+\s+UPHELD",
+    re.MULTILINE | re.IGNORECASE,
+)
+_FINDING_ID_INJECT_RE = re.compile(
+    r"^([ \t]*[-*•]?[ \t]*)(\[CRITICAL\])",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def assign_finding_ids(review_text: str, prefix: str = "") -> tuple[str, list[dict]]:
+    """Inject stable IDs into every [CRITICAL] line.
+
+    With ``prefix=""`` (default, single-backend mode): IDs are
+    ``F1, F2, ...`` — exactly as before.
+
+    With ``prefix="opencode"`` (multi-backend mode, set by the
+    orchestrator per backend): IDs become ``opencode-F1, opencode-F2, ...``
+    so the arbiter can disambiguate which reviewer flagged what when
+    consolidating.
+
+    Returns ``(tagged_text, findings)`` where findings is a list of
+    ``{"id": "<id>", "line": "<full finding line, stripped>"}``.
+    """
+    counter = [0]
+    id_prefix = f"{prefix}-" if prefix else ""
+
+    def _replace(m: re.Match) -> str:
+        counter[0] += 1
+        return f"{m.group(1)}[{id_prefix}F{counter[0]}] {m.group(2)}"
+
+    tagged = _FINDING_ID_INJECT_RE.sub(_replace, review_text)
+
+    findings: list[dict] = []
+    line_re = re.compile(
+        rf"^[ \t]*[-*•]?[ \t]*\[({_FINDING_ID_PATTERN})\]\s*\[CRITICAL\].*$",
+        re.IGNORECASE,
+    )
+    for line in tagged.splitlines():
+        m = line_re.match(line)
+        if m:
+            findings.append({"id": m.group(1), "line": line.strip()})
+    return tagged, findings
+
+
+def parse_arbiter_verdict(arbiter_raw: str, all_finding_ids: list[str]) -> set[str]:
+    """Extract UPHELD finding IDs from arbiter output.
+
+    Fail-open: if the arbiter output is malformed (no Summary line),
+    every finding is treated as UPHELD. The arbiter exists to *reduce*
+    the blocking set; a parser bug must never expand it by silently
+    dropping valid findings.
+    """
+    if not arbiter_raw or not _ARBITER_SUMMARY_RE.search(arbiter_raw):
+        return set(all_finding_ids)
+
+    seen: dict[str, str] = {}
+    for m in _ARBITER_VERDICT_RE.finditer(arbiter_raw):
+        verdict = m.group(1).upper()
+        fid = m.group(2)
+        seen[fid] = verdict
+
+    upheld: set[str] = set()
+    for fid in all_finding_ids:
+        # Missing verdict line → fail-open (count as UPHELD).
+        if seen.get(fid, "UPHELD") == "UPHELD":
+            upheld.add(fid)
+    return upheld
+
+
+def run_arbiter(
+    diff: str,
+    findings: list[dict],
+) -> dict:
+    """Run the Claude Sonnet arbiter over findings.
+
+    Returns {status, upheld_ids, raw, error}. Fail-open on any error:
+    upheld_ids will equal the full set of input finding IDs.
+    """
+    all_ids = [f["id"] for f in findings]
+    if not findings:
+        return {"status": "skipped", "upheld_ids": set(), "raw": "", "error": "no criticals to arbitrate"}
+
+    system_prompt = read_file(ARBITER_PROMPT_PATH)
+    if not system_prompt:
+        warn(f"Arbiter prompt {ARBITER_PROMPT_PATH} missing — upholding all findings")
+        return {
+            "status": "unavailable",
+            "upheld_ids": set(all_ids),
+            "raw": "",
+            "error": f"{ARBITER_PROMPT_PATH} not found",
+        }
+
+    user_prompt = (
+        "## Full staged diff\n\n"
+        "```diff\n" + diff + "\n```\n\n"
+        "## Findings to arbitrate (in order):\n\n" + "\n".join(f["line"] for f in findings) + "\n\n"
+        "Output one `[UPHELD]` or `[OVERTURN]` line per finding above, "
+        "in the same order, then the `Summary:` line. No other content."
+    )
+
+    info(f"Arbiter: analyzing {len(findings)} finding(s) with {ARBITER.backend} {ARBITER.model} (may take 30-120s)...")
+    try:
+        raw, stderr, rc = run_reviewer(ARBITER, system_prompt, user_prompt)
+    except subprocess.TimeoutExpired:
+        warn(f"Arbiter timed out after {ARBITER.timeout}s — upholding all findings")
+        return {"status": "unavailable", "upheld_ids": set(all_ids), "raw": "", "error": "timeout"}
+    except (FileNotFoundError, OSError) as exc:
+        warn(f"Arbiter unreachable ({exc}) — upholding all findings")
+        return {"status": "unavailable", "upheld_ids": set(all_ids), "raw": "", "error": f"unreachable: {exc}"}
+
+    if rc != 0 or not raw or not raw.strip():
+        warn(f"Arbiter failed (rc={rc}) — upholding all findings")
+        return {"status": "unavailable", "upheld_ids": set(all_ids), "raw": raw, "error": f"rc={rc} stderr={stderr}"}
+
+    upheld = parse_arbiter_verdict(raw, all_ids)
+    overturned = len(all_ids) - len(upheld)
+    info(f"Arbiter: {len(upheld)} UPHELD, {overturned} OVERTURN.")
+    return {"status": "ok", "upheld_ids": upheld, "raw": raw, "error": ""}
+
+
+def _render_with_arbiter(
+    findings: list[dict],
+    upheld_ids: set[str],
+    arbiter: dict,
+    warning_lines: list[str],
+    denominator_label: str,
+    unavailable_label: str = "",
+) -> str:
+    """Developer-facing summary for any review path that produced findings.
+
+    ``denominator_label`` describes the producer side ("7 lenses",
+    "1 reviewer"). ``unavailable_label`` is an optional comma-separated
+    list of failed/skipped producers (used by fan-out only).
+    ``warning_lines`` are the raw `[WARNING]` finding lines from the
+    reviewer output; they are rendered verbatim so the developer can
+    act on every warning without opening the log file.
+    """
+    upheld = [f for f in findings if f["id"] in upheld_ids]
+    overturned = [f for f in findings if f["id"] not in upheld_ids]
+    warning_count = len(warning_lines)
+
+    sections: list[str] = ["## Review summary\n"]
+    if upheld:
+        sections.append("### Upheld findings (blocking)")
+        sections.extend(f"- {f['line']}" for f in upheld)
+    else:
+        sections.append("### Upheld findings (blocking)\n_(none)_")
+
+    if overturned:
+        rationales: dict[str, str] = {}
+        for m in re.finditer(
+            r"^\s*\[(?:UPHELD|OVERTURN)\]\s*(F\d+)\s*[—-]?\s*(.*)$",
+            arbiter.get("raw", ""),
+            re.MULTILINE | re.IGNORECASE,
+        ):
+            rationales[m.group(1)] = m.group(2).strip()
+        sections.append("\n### Overturned findings (advisory — not blocking)")
+        for f in overturned:
+            reason = rationales.get(f["id"], "")
+            sections.append(f"- {f['line']}")
+            if reason:
+                sections.append(f"    arbiter: {reason}")
+
+    if warning_lines:
+        sections.append(f"\n### Warnings: {warning_count} (advisory — fix-in-one-pass per BLOCK directive)")
+        sections.extend(warning_lines)
+    if unavailable_label:
+        sections.append(f"\n### Producers unavailable: {unavailable_label}")
+
+    sections.append(
+        f"\nSummary: {len(upheld)} UPHELD, {len(overturned)} OVERTURN, "
+        f"{warning_count} WARNING across {denominator_label}."
+    )
+    return "\n".join(sections)
+
+
+def _render_fanout_output(
+    per_lens: list[dict],
+    findings: list[dict],
+    upheld_ids: set[str],
+    arbiter: dict,
+) -> str:
+    """Compact summary for fan-out path. Wraps _render_with_arbiter."""
+    warning_lines: list[str] = []
+    for d in per_lens:
+        if d["status"] == "ok":
+            warning_lines.extend(extract_warning_lines(d.get("review", "")))
+    unavailable = [d["name"] for d in per_lens if d["status"] != "ok"]
+    return _render_with_arbiter(
+        findings,
+        upheld_ids,
+        arbiter,
+        warning_lines=warning_lines,
+        denominator_label=f"{len(per_lens)} lenses",
+        unavailable_label=", ".join(unavailable),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+
+def _format_per_lens(per_lens: list[dict]) -> str:
+    parts: list[str] = ["## Per-lens detail\n"]
+    for d in per_lens:
+        reviewer_suffix = f" ({d['reviewer']})" if d.get("reviewer") else ""
+        parts.append(f"### Lens: {d['name']} — {d['status']}{reviewer_suffix}\n")
+        if d.get("error"):
+            parts.append(f"_Error:_ {d['error']}\n")
+        if d.get("review"):
+            parts.append(f"```\n{d['review']}\n```\n")
+    return "\n".join(parts) + "\n"
+
+
+def _format_arbiter(arbiter: dict) -> str:
+    parts: list[str] = [f"## Arbiter ({ARBITER.model}) — status: {arbiter.get('status', 'n/a')}\n"]
+    if arbiter.get("error"):
+        parts.append(f"_Error:_ {arbiter['error']}\n")
+    upheld = arbiter.get("upheld_ids") or set()
+    if upheld:
+        parts.append(f"_Upheld IDs:_ {', '.join(sorted(upheld))}\n")
+    if arbiter.get("raw"):
+        parts.append(f"```\n{arbiter['raw']}\n```\n")
+    return "\n".join(parts) + "\n"
+
+
+def _build_log_sections(
+    project: str,
+    timestamp: str,
+    verdict: str,
+    files: str,
+    diff: str,
+    review: str,
+    error_msg: str | None,
+    diag: str | None,
+    reviewer: str | None,
+    per_lens: list[dict] | None,
+    arbiter: dict | None,
+    per_backend: list | None,
+    consolidation: object | None,
+) -> list[str]:
+    """Compose the markdown sections for save_log without I/O."""
+    sections: list[str] = [
+        f"# Review: {project} @ {timestamp}\n",
+        f"**Verdict:** {verdict}",
+    ]
+    if reviewer:
+        sections.append(f"**Reviewer:** {reviewer}")
+    if files:
+        sections.append(f"**Files:**\n{files}\n")
+    if diff:
+        sections.append(
+            f"## Diff stats\n{len(diff.splitlines())} lines in diff "
+            f"({count_added_production_lines(diff)} added prod line(s))\n"
+        )
+    if error_msg:
+        sections.append(f"## Error\n```\n{error_msg}\n```\n")
+    if diag:
+        sections.append(f"## Diagnostics\n```\n{diag}\n```\n")
+    if review:
+        sections.append(f"## Review output\n```\n{review}\n```\n")
+    if per_backend:
+        sections.append(_format_per_backend(per_backend))
+    if consolidation is not None:
+        sections.append(_format_consolidation_section(consolidation))
+    if per_lens:
+        sections.append(_format_per_lens(per_lens))
+    if arbiter:
+        sections.append(_format_arbiter(arbiter))
+    if diff:
+        sections.append(f"## Full diff\n```diff\n{diff}\n```")
+    return sections
+
+
+def save_log(
+    verdict: str,
+    files: str = "",
+    diff: str = "",
+    review: str = "",
+    error_msg: str | None = None,
+    diag: str | None = None,
+    reviewer: str | None = None,
+    per_lens: list[dict] | None = None,
+    arbiter: dict | None = None,
+    per_backend: list | None = None,
+    consolidation: object | None = None,
+) -> Path | None:
+    """Save review to a log file for debugging.
+
+    Returns the log path on success (so the caller can drop a sidecar
+    ``.stats.json`` next to it), or ``None`` if writing failed. Failure
+    is silent — a busted log directory must not block a commit.
+
+    ``per_backend`` and ``consolidation`` are populated only by the
+    multi-backend orchestrator path (``main()`` after orchestrator
+    integration). At N==1 they remain ``None`` and the markdown layout
+    is identical to single-backend mode.
+    """
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        project = Path.cwd().name
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        log_path = LOG_DIR / f"{timestamp}_{project}_{verdict}.md"
+        sections = _build_log_sections(
+            project,
+            timestamp,
+            verdict,
+            files,
+            diff,
+            review,
+            error_msg,
+            diag,
+            reviewer,
+            per_lens,
+            arbiter,
+            per_backend,
+            consolidation,
+        )
+        log_path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+        return log_path
+    except OSError:
+        return None
+
+
+def _format_per_backend(results: list) -> str:
+    """Render the ``## Per-backend results`` section for multi-backend logs.
+
+    Accepts ``list[orchestrator.BackendReviewResult]`` (typed loosely
+    to keep the import lazy and avoid an import cycle).
+    """
+    parts: list[str] = ["## Per-backend results\n"]
+    for r in results:
+        label = f"{r.cfg.backend}/{r.cfg.model}"
+        if r.fallback_used:
+            label += " (FALLBACK)"
+        duration = max(r.ended_at - r.started_at, 0.0)
+        parts.append(f"### {label} — {r.status} ({duration:.1f}s)\n")
+        if r.error:
+            parts.append(f"_Error:_ {r.error}\n")
+        if r.per_lens:
+            for lens in r.per_lens:
+                lens_dur = max(
+                    (lens.get("ended_at", 0.0) or 0.0) - (lens.get("started_at", 0.0) or 0.0),
+                    0.0,
+                )
+                parts.append(
+                    f"- lens `{lens['name']}`: {lens['status']} ({lens_dur:.1f}s)"
+                    + (f" — {lens['error']}" if lens.get("error") else "")
+                )
+            parts.append("")
+        if r.review_text:
+            parts.append("```\n" + r.review_text + "\n```\n")
+    return "\n".join(parts) + "\n"
+
+
+def _format_consolidation_section(consolidation: object) -> str:
+    """Render the ``## Consolidation`` section showing clusters + verdicts."""
+    cons = consolidation  # narrow alias; types kept loose to avoid the cycle
+    parts: list[str] = [
+        f"## Consolidation — arbiter status: {cons.arbiter_status}\n",  # type: ignore[attr-defined]
+    ]
+    if cons.arbiter_error:  # type: ignore[attr-defined]
+        parts.append(f"_Arbiter error:_ {cons.arbiter_error}\n")  # type: ignore[attr-defined]
+    parts.append(
+        f"_Clusters:_ {len(cons.clusters)} total, "  # type: ignore[attr-defined]
+        f"{len(cons.upheld_clusters)} upheld, "  # type: ignore[attr-defined]
+        f"{len(cons.clusters) - len(cons.upheld_clusters)} overturned\n"  # type: ignore[attr-defined]
+    )
+    for c in cons.clusters:  # type: ignore[attr-defined]
+        members = ", ".join(c.member_ids)
+        verdict = "UPHELD" if c.upheld else "OVERTURN"
+        contribs = ", ".join(b for b in c.contributors if b) or "—"
+        parts.append(f"- **{c.cluster_id}** [{verdict}] contributors: {contribs} | members: {members}")
+        if c.canonical_line:
+            parts.append(f"  > {c.canonical_line}")
+    parts.append("")
+    if cons.arbiter_raw_output:  # type: ignore[attr-defined]
+        parts.append("### Arbiter raw output\n")
+        parts.append("```\n" + cons.arbiter_raw_output + "\n```\n")  # type: ignore[attr-defined]
+    return "\n".join(parts) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+
+def collect_diff() -> tuple[str, str, bool] | None:
+    """Collect staged diff and metadata. Returns (diff, files, is_merge) or None."""
+    diff, git_error = get_staged_diff()
+
+    if git_error:
+        warn(f"git diff failed: {git_error}")
+        save_log("SKIP", error_msg=git_error)
+        return None
+
+    if not diff:
+        status = get_git_status()
+        diag = f"git diff --cached returned empty.\ngit status:\n{status}"
+        warn("No staged changes to review.")
+        save_log("SKIP", diag=diag)
+        return None
+
+    changed = count_changed_lines(diff)
+    if changed < MIN_LINES_TO_REVIEW:
+        save_log("SKIP", diag=f"only {changed} changed lines (min {MIN_LINES_TO_REVIEW})")
+        return None
+
+    too_big = check_diff_size(diff)
+    if too_big:
+        error(too_big)
+        save_log("TOO_BIG", diff=diff, error_msg=too_big)
+        sys.exit(1)
+
+    files = get_staged_files()
+    is_merge = Path(".git/MERGE_HEAD").is_file()
+    return diff, files, is_merge
+
+
+def _run_single_call(
+    diff: str,
+    files: str,
+    is_merge: bool,
+) -> tuple[str | None, str]:
+    """Legacy single-call reviewer path for small diffs."""
+    system_prompt = build_system_prompt()
+    if not system_prompt:
+        warn(f"No {GLOBAL_PROMPT.name} found, skipping review")
+        save_log("SKIP", files=files, diff=diff, error_msg=f"no {GLOBAL_PROMPT}")
+        return None, "SKIP"
+
+    user_prompt = build_user_prompt(diff, files, is_merge)
+
+    try:
+        review, reviewer_stderr, returncode, reviewer = run_with_fallback(
+            PRIMARIES[0], FALLBACK, system_prompt, user_prompt
+        )
+    except subprocess.TimeoutExpired as exc:
+        warn(f"Review timed out after {exc.timeout}s — allowing commit")
+        save_log("TIMEOUT", files=files, diff=diff, error_msg="timed out")
+        return None, "TIMEOUT"
+    except (FileNotFoundError, OSError):
+        warn("Both reviewers unavailable — allowing commit")
+        save_log("SKIP", files=files, diff=diff, error_msg="no reviewer available")
+        return None, "SKIP"
+
+    if returncode != 0:
+        detail = f"{reviewer} exited with code {returncode}\nstderr: {reviewer_stderr}\nstdout: {review}"
+        warn(f"{reviewer} failed (rc={returncode}) — allowing commit")
+        save_log("ERROR", files=files, diff=diff, error_msg=detail)
+        return None, "ERROR"
+
+    if not review or not review.strip():
+        warn(f"{reviewer} returned empty output — allowing commit")
+        save_log(
+            "EMPTY", files=files, diff=diff, reviewer=reviewer, error_msg=f"empty output. stderr: {reviewer_stderr}"
+        )
+        return None, "EMPTY"
+
+    return _arbitrate_single_call_review(review, reviewer, diff, files)
+
+
+def _arbitrate_single_call_review(
+    review: str,
+    reviewer: str,
+    diff: str,
+    files: str,
+) -> tuple[str | None, str]:
+    """Apply well-formed/critical/arbiter logic to a single-call review.
+
+    Mirrors the fan-out arbiter step so small diffs also benefit from
+    Sonnet calibration when the primary reviewer flags CRITICALs.
+    """
+    if not is_well_formed(review):
+        warn("Reviewer output missing `Summary:` terminator — treating as malformed (fail-closed BLOCK)")
+        info(f"Reviewer: {reviewer} — malformed output")
+        save_log("BLOCK", files=files, diff=diff, review=review, reviewer=reviewer)
+        return review, "BLOCK"
+
+    critical_count = count_criticals(review)
+    info(f"Reviewer: {reviewer} — {critical_count} CRITICAL finding(s)")
+
+    if critical_count == 0:
+        save_log("OK", files=files, diff=diff, review=review, reviewer=reviewer)
+        return review, "OK"
+
+    tagged_review, findings = assign_finding_ids(review)
+    arbiter = run_arbiter(diff, findings)
+    upheld_ids = arbiter["upheld_ids"]
+    display = _render_with_arbiter(
+        findings,
+        upheld_ids,
+        arbiter,
+        warning_lines=extract_warning_lines(review),
+        denominator_label=f"1 reviewer ({reviewer})",
+    )
+    verdict = "BLOCK" if upheld_ids else "OK"
+    save_log(
+        verdict,
+        files=files,
+        diff=diff,
+        review=display,
+        reviewer=f"{reviewer}+arbiter",
+        arbiter=arbiter,
+        diag=f"original review (pre-arbiter):\n{tagged_review}",
+    )
+    # On BLOCK the synthesized display already inlines warning lines via
+    # extract_warning_lines(); on OK return the raw review so main()'s
+    # banner gate (also extract_warning_lines-based) prints the full
+    # reviewer text rather than just counts.
+    return (display if verdict == "BLOCK" else review), verdict
+
+
+def _run_fanout_with_arbiter(
+    diff: str,
+    files: str,
+    is_merge: bool,
+) -> tuple[str | None, str]:
+    """Fan-out reviewer → aggregator → arbiter pipeline for large diffs."""
+    aggregated, per_lens = run_fanout(diff, files, is_merge)
+
+    ok_lenses = [d for d in per_lens if d["status"] == "ok"]
+    if not ok_lenses:
+        warn("All fan-out lenses failed — allowing commit")
+        save_log(
+            "EMPTY", files=files, diff=diff, reviewer="fan-out", per_lens=per_lens, error_msg="all lenses unavailable"
+        )
+        return None, "EMPTY"
+
+    tagged_aggregated, findings = assign_finding_ids(aggregated)
+
+    if not findings:
+        display = tagged_aggregated
+        save_log("OK", files=files, diff=diff, review=display, reviewer="fan-out", per_lens=per_lens)
+        return display, "OK"
+
+    arbiter = run_arbiter(diff, findings)
+    upheld_ids = arbiter["upheld_ids"]
+    display = _render_fanout_output(per_lens, findings, upheld_ids, arbiter)
+    verdict = "BLOCK" if upheld_ids else "OK"
+
+    save_log(
+        verdict, files=files, diff=diff, review=display, reviewer="fan-out+arbiter", per_lens=per_lens, arbiter=arbiter
+    )
+    return display, verdict
+
+
+def run_review(diff: str, files: str, is_merge: bool) -> tuple[str | None, str]:
+    """Execute the review. Routes between single-call and fan-out+arbiter.
+
+    Short-circuits to SKIP when no lens is applicable (docs-only diff).
+
+    Legacy single-backend orchestration kept for the test surface and
+    any external callers that import it. The production hook entry
+    point (``main()``) now goes through ``orchestrator.run_multi_backend``
+    so multi-backend review and per-run stats happen automatically
+    even when ``len(PRIMARIES) == 1``.
+    """
+    if not applicable_lenses(files):
+        info("No reviewable content (docs / pure data only) — skipping review.")
+        save_log(
+            "SKIP",
+            files=files,
+            diff=diff,
+            error_msg="no applicable lens for this file set",
+        )
+        return None, "SKIP"
+
+    added = count_added_production_lines(diff)
+    use_fanout = added >= FANOUT_THRESHOLD
+    info(
+        f"Reviewing {len(files.splitlines())} file(s), +{added} added prod line(s), "
+        f"mode={'fan-out+arbiter' if use_fanout else 'single-call'}"
+    )
+
+    if use_fanout:
+        display, verdict = _run_fanout_with_arbiter(diff, files, is_merge)
+    else:
+        display, verdict = _run_single_call(diff, files, is_merge)
+    # These legacy paths call run_with_fallback (which records the fallback) but
+    # write their own logs; surface any fallback on the returned display + stderr
+    # for parity with the production _run_multi_backend_pipeline. Saved-log
+    # inlining stays on the production path — these are test-surface routes.
+    if display is not None:
+        banner = fallback_banner()
+        if banner:
+            display = f"{banner}\n\n{display}"
+    emit_fallback_stderr()
+    return display, verdict
+
+
+def _summarize_results_label(results: list) -> str:
+    """One-line `Reviewer:` label for save_log: `opencode+claude+arbiter`."""
+    if not results:
+        return "no-reviewers"
+    parts: list[str] = []
+    for r in results:
+        tag = r.cfg.backend
+        if r.fallback_used:
+            tag += "(fallback)"
+        if r.status != "ok":
+            tag += f"({r.status})"
+        parts.append(tag)
+    return "+".join(parts) + "+arbiter"
+
+
+def _render_consolidation_display(
+    results: list,
+    consolidation: object,
+) -> str:
+    """Developer-facing summary used both for stdout and the markdown log.
+
+    Lists upheld clusters first (with backend contributors and the
+    canonical line), then overturned, then warning lines emitted by
+    any backend. Mirrors the shape of the legacy ``_render_with_arbiter``
+    output so eyeballing two adjacent log files (one N==1, one N>1)
+    feels consistent.
+    """
+    cons = consolidation
+    upheld = cons.upheld_clusters  # type: ignore[attr-defined]
+    overturned = [c for c in cons.clusters if not c.upheld]  # type: ignore[attr-defined]
+
+    warning_lines: list[str] = []
+    for r in results:
+        if r.status == "ok" and r.review_text:
+            warning_lines.extend(extract_warning_lines(r.review_text))
+
+    sections: list[str] = ["## Review summary\n"]
+    if upheld:
+        sections.append(f"### Upheld findings ({len(upheld)})\n")
+        for c in upheld:
+            contribs = ", ".join(b for b in c.contributors if b) or "—"
+            sections.append(f"- **{c.cluster_id}** [{contribs}] {c.canonical_line}")
+    if overturned:
+        sections.append(f"\n### Overturned by arbiter ({len(overturned)})\n")
+        for c in overturned:
+            contribs = ", ".join(b for b in c.contributors if b) or "—"
+            sections.append(f"- {c.cluster_id} [{contribs}] {c.canonical_line}")
+    if warning_lines:
+        sections.append(f"\n### Warnings ({len(warning_lines)})\n")
+        # Verbatim, like the fan-out renderer above: these lines already carry
+        # their own bullet, and a second one ("- - [WARNING] …") stops
+        # `extract_warning_lines` from recognising them — including in main()'s
+        # own banner gate, which re-parses this display and would then print
+        # nothing at all.
+        sections.extend(warning_lines)
+
+    backends_label = ", ".join(
+        f"{r.cfg.backend}/{r.cfg.model}{' (fallback)' if r.fallback_used else ''}" for r in results
+    )
+    sections.append(
+        f"\nSummary: {len(upheld)} UPHELD, {len(overturned)} OVERTURN, "
+        f"{len(warning_lines)} WARNING across {backends_label}."
+    )
+    return "\n".join(sections)
+
+
+def _diff_stats_for(diff: str, files: str) -> object:
+    """Build a stats.DiffStats from the staged diff + files string."""
+    from stats import DiffStats
+
+    return DiffStats(
+        total_lines=len(diff.splitlines()),
+        added_prod_lines=count_added_production_lines(diff),
+        files_count=len([f for f in files.splitlines() if f.strip()]),
+    )
+
+
+_BLOCK_FIX_DIRECTIVE = (
+    "Fix-in-one-pass directive: address EVERY [CRITICAL] and "
+    "EVERY [WARNING] above in the next commit, plus obvious "
+    "adjacent cases (same edge-case class, the same rule's "
+    "remaining cases, sibling assertions, prod+tests pairing). Do "
+    "NOT minimize to just-barely-pass — each hook iteration "
+    'costs ~20 min and reviewer tokens, and "sneaking '
+    "through\" wastes the user's budget. If the combined "
+    f"fix would exceed the {MAX_PROD_LINES}-prod-line limit, split into "
+    "sequential commits — but each commit still lands its "
+    "slice completely, no halfway work."
+)
+_BLOCK_TRADEOFF_DIRECTIVE = (
+    "Trade-off channel: if a finding above is a deliberate "
+    "trade-off, document it inline via "
+    "`# review-note: <specific reason>` on the relevant line "
+    "(commit messages are not visible to the reviewer in "
+    "this hook stage) — then re-commit. The reviewer honors "
+    "specific, named-invariant explanations.\n"
+    'Use sparingly: vague notes ("intentional", "by design") '
+    "or 3+ in one commit are themselves flagged as CRITICAL. "
+    "This is not a hook-skip substitute."
+)
+
+
+def _persist_run(
+    verdict: str,
+    files: str,
+    diff: str,
+    display: str,
+    results: list,
+    cons: object,
+    error_msg: str | None = None,
+) -> None:
+    """Save the markdown log + sidecar stats for one orchestrator run."""
+    from stats import build_run_stats, default_aggregate_path
+    from stats import save as save_stats
+
+    stats_obj = build_run_stats(
+        results,
+        cons,  # type: ignore[arg-type]
+        _diff_stats_for(diff, files),  # type: ignore[arg-type]
+        verdict,
+        Path.cwd().name,
+        datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+    # At N==1 the markdown layout must stay byte-for-byte identical to
+    # the legacy single-backend log (existing snapshot test pins this).
+    # The new per-backend / consolidation sections only appear when there
+    # is genuinely more than one reviewer to compare. Stats sidecars are
+    # written either way — they are additive, not visible in markdown.
+    multi = len(results) > 1
+    log_path = save_log(
+        verdict,
+        files=files,
+        diff=diff,
+        review=display,
+        reviewer=_summarize_results_label(results),
+        per_backend=results if multi else None,
+        consolidation=cons if multi else None,
+        error_msg=error_msg,
+    )
+    if log_path is not None:
+        save_stats(stats_obj, log_path, default_aggregate_path())
+
+
+_REVIEW_ARTIFACT_PREFIXES: tuple[str, ...] = ("state/", "raw/")
+_REVIEW_ARTIFACT_NAMES: frozenset[str] = frozenset(
+    {"arbiter_raw.txt", "findings.json", "blocking.txt", "metrics.json", "crash.log"}
+)
+
+
+def _is_accidental_review_artifact(path: str) -> bool:
+    """True for working artifacts under ``.review/`` that must never be committed."""
+    if not path.startswith(".review/"):
+        return False
+    inner = path[len(".review/") :]
+    if inner.startswith(_REVIEW_ARTIFACT_PREFIXES):
+        return True
+    return inner in _REVIEW_ARTIFACT_NAMES
+
+
+def _check_staged_review_guard() -> None:
+    """Exit 1 if any staged path is under ``.review/``.
+
+    Manifest is intentionally NOT committed (the chicken-and-egg with
+    ``diff_hash``). ``.review/`` should live in global gitignore
+    (``~/.config/git/ignore`` via ``core.excludesFile``); this guard
+    catches the misconfigured case where it isn't, before a stray
+    ``.review/manifest.yaml`` ends up in a commit.
+    """
+    try:
+        out = subprocess.check_output(["git", "diff", "--cached", "--name-only"], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return
+    bad = [p.strip() for p in out.splitlines() if _is_accidental_review_artifact(p.strip())]
+    if bad:
+        error(
+            "ERROR: .review/ paths are staged — these are working artifacts, "
+            "not commit content:\n  " + "\n  ".join(bad) + "\n"
+            "Run: git restore --staged .review/\n"
+            "Then add `.review/` to your global gitignore: "
+            "`echo .review/ >> ~/.config/git/ignore && "
+            "git config --global core.excludesFile ~/.config/git/ignore`"
+        )
+        save_log("BLOCK", error_msg=f"refused: staged .review/ paths: {bad}")
+        sys.exit(1)
+
+
+def _format_chunked_display(result: object) -> str:
+    """Render chunked-review result as text for stdout + log.
+
+    Annotated as ``object`` to avoid an import cycle with ``chunked.py``;
+    callers always pass a ``ChunkedResult`` and we only access named
+    attributes the dataclass defines."""
+    lines = []
+    if result.upheld_clusters:
+        lines.append(result.blocking_text)
+    else:
+        lines.append(f"chunked review: 0 BLOCKING (out of {len(result.clusters)} cluster(s)).")
+    lines.append("")
+    lines.append(
+        f"Reviewers: {len(result.job_results)} job(s) "
+        f"(chunk + wholediff layers); arbiter status: {result.arbiter_status}; "
+        f"wall-clock: {result.metrics.get('wall_clock_seconds', '?')}s."
+    )
+    return "\n".join(lines)
+
+
+def _run_chunked_path(diff: str, files: str, is_merge: bool) -> str:
+    """Drive the chunked-review pipeline + persist artifacts. Returns verdict."""
+    from chunked import run_chunked_review, write_artifacts
+
+    repo_root = Path.cwd()
+    info(f"chunked-review path: dispatching with manifest at {repo_root / '.review/manifest.yaml'}")
+    result = run_chunked_review(diff, files, repo_root, is_merge=is_merge)
+
+    if result.status == "manifest_invalid":
+        msg = result.blocking_text
+        error("Manifest validation failed — refusing chunked review:\n\n" + msg)
+        save_log("BLOCK", files=files, diff=diff, error_msg="manifest_invalid", review=msg)
+        # Still write the validation output to .review/ for forensics; archive.py
+        # will move it to .git/review-archive/ if a commit later lands. Here we
+        # block so no commit happens — leave .review/ in place for the writer.
+        return "BLOCK"
+
+    try:
+        write_artifacts(result, repo_root)
+    except OSError as exc:
+        warn(f"Failed to write review artifacts: {exc} — continuing with verdict")
+    display = _format_chunked_display(result)
+    banner = fallback_banner()
+    if banner:
+        display = f"{banner}\n\n{display}"
+
+    if result.upheld_clusters:
+        verdict = "BLOCK"
+        error(f"Chunked review BLOCKED this commit:\n\n{display}")
+        info(_BLOCK_FIX_DIRECTIVE)
+        info(_BLOCK_TRADEOFF_DIRECTIVE)
+    else:
+        verdict = "OK"
+        info(display)
+
+    save_log(verdict, files=files, diff=diff, review=display)
+    emit_fallback_stderr()
+    return verdict
+
+
+def _run_multi_backend_pipeline(diff: str, files: str, is_merge: bool) -> str:
+    """Run orchestrator → consolidation → log + stats. Returns verdict."""
+    from consolidation import consolidate
+    from orchestrator import run_multi_backend, total_failure_reason
+
+    results = run_multi_backend(diff, files, is_merge)
+    # The orchestrator (this — the production — path) falls back by appending a
+    # FALLBACK result when all primaries fail; it dispatches via run_reviewer,
+    # NOT run_with_fallback, so it never touches record_fallback. Bridge that
+    # result-based signal into the shared accumulator here, or fallback_banner()
+    # below would stay empty and the fallback would go unsurfaced.
+    fb_reason = total_failure_reason(results)
+    if fb_reason is not None and FALLBACK is not None:
+        record_fallback(", ".join(c.backend for c in PRIMARIES), FALLBACK.backend, fb_reason)
+    any_ok = any(r.status == "ok" and r.review_text and r.review_text.strip() for r in results)
+    if not any_ok:
+        error(
+            "All reviewers (and fallback if configured) FAILED — allowing commit (fail-open); this diff was NOT reviewed."
+        )
+        emit_fallback_stderr()
+        cons = consolidate(results, diff)
+        _persist_run(
+            "EMPTY", files, diff, fallback_banner() or "", results, cons, error_msg="no reviewer produced output"
+        )
+        return "EMPTY"
+
+    cons = consolidate(results, diff)
+    verdict = "BLOCK" if cons.upheld_clusters else "OK"
+    display = _render_consolidation_display(results, cons)
+    banner = fallback_banner()
+    if banner:
+        display = f"{banner}\n\n{display}"
+    _persist_run(verdict, files, diff, display, results, cons)
+
+    if verdict == "BLOCK":
+        error(f"Review BLOCKED this commit:\n\n{display}")
+        info(_BLOCK_FIX_DIRECTIVE)
+        info(_BLOCK_TRADEOFF_DIRECTIVE)
+    elif extract_warning_lines(display):
+        warn(f"Review notes (non-blocking warnings):\n{display}")
+    emit_fallback_stderr()
+    return verdict
+
+
+def _auto_scaffold_manifest(repo_root: Path, n_prod: int) -> None:
+    """Auto-create ``.review/manifest.yaml`` scaffold when the diff is large
+    and no manifest exists. Exits 1 with a message asking the writer to fill
+    in chunks and retry.
+
+    The scaffolder doesn't auto-classify — it just lays out empty templates
+    plus a comment listing every staged file. The writer fills them in.
+    """
+    from scripts.scaffold_manifest import build_scaffold, write_scaffold
+
+    text = build_scaffold(num_chunks=3, max_chunks=MAX_CHUNKS, max_prod=MAX_PROD_LINES)
+    path = write_scaffold(text, repo_root)
+    error(
+        f"Diff has {n_prod} added prod lines (limit {MAX_PROD_LINES}).\n"
+        f"Scaffolded {path} — please:\n"
+        "  1. Open the file and fill in `chunks:` (group files by meaning,\n"
+        "     keep each chunk ≤300 prod lines; split big files via line_ranges).\n"
+        "  2. Re-run `git commit` — the chunked pipeline will run reviewers\n"
+        "     in parallel.\n"
+        "Tests, docs, .yaml/.json, and .sh do not count toward the prod limit."
+    )
+    save_log(
+        "BLOCK",
+        diff="<auto-scaffold>",
+        error_msg=f"manifest auto-scaffolded; writer must fill in chunks ({n_prod} prod lines)",
+    )
+    sys.exit(1)
+
+
+def _maybe_dispatch_chunked() -> None:
+    """Branch on diff-size + manifest presence:
+
+    * ``N < MAX_PROD_LINES`` → return; ``main()`` falls through to the
+      legacy single-call path.
+    * ``N >= MAX_PROD_LINES`` and no manifest → auto-scaffold one and
+      exit 1, asking the writer to fill it in.
+    * ``N >= MAX_PROD_LINES`` and manifest present → run chunked path
+      and exit with its verdict.
+
+    Calling ``get_staged_diff`` here costs one extra subprocess but lets
+    the rest of ``main()`` keep its existing contract.
+    """
+    from chunked import manifest_present
+
+    diff, _git_err = get_staged_diff()
+    if not diff:
+        return  # let collect_diff produce the existing SKIP log
+    n_prod = count_added_production_lines(diff)
+    if n_prod < MAX_PROD_LINES:
+        return
+
+    repo_root = Path.cwd()
+    if not manifest_present(repo_root):
+        _auto_scaffold_manifest(repo_root, n_prod)  # exits 1
+        return  # unreachable; keeps the function shape obvious
+
+    files = get_staged_files()
+    is_merge = Path(".git/MERGE_HEAD").is_file()
+    info(f"Reviewing {len(files.splitlines())} file(s), +{n_prod} added prod line(s), mode=chunked (manifest detected)")
+    verdict = _run_chunked_path(diff, files, is_merge)
+    sys.exit(1 if verdict == "BLOCK" else 0)
+
+
+def _maybe_fastpath() -> bool:
+    """Pre-review fast-path: skip the LLM review for an already-approved diff.
+
+    Returns ``True`` (caller should ``exit 0``) only when ALL hold:
+      * ``SDD_REVIEW_FASTPATH`` is set — the workflow Land phase enables the
+        mode; a normal manual commit never has it, so the cache is ignored.
+      * the staged diff is non-empty, and
+      * a marker ``.review/approvals/<content_key>`` exists — written by
+        ``pre_review.py`` only after the *same content* passed review.
+
+    The key is the staged change set's CONTENT key (``get_staged_content_key``),
+    not the textual diff hash: it depends only on each changed path's final blob
+    sha, so it matches the pre-review marker even when the diff text differs
+    (base drift, stash reconstruction, rename detection). That base-dependence
+    was why the old textual hash silently missed.
+
+    Any miss returns ``False`` → the full review runs (fail-safe: the bypass
+    can only ever *skip* an already-reviewed change, never pass an unreviewed
+    one). Deterministic gates are NOT skipped: ``run_gate`` already ran before
+    this, and gitleaks/semgrep run earlier in the pre-commit wrapper. The
+    integrity backstop lives in the workflow (an independent post-Land audit
+    re-derives every landed commit's content key from git and demands it was
+    approved).
+    """
+    if not os.environ.get("SDD_REVIEW_FASTPATH"):
+        return False
+    diff, _git_err = get_staged_diff()
+    if not diff:
+        return False
+    key = get_staged_content_key()
+    if not key or not approvals.approval_exists(Path.cwd(), key):
+        return False
+    info(f"Fast-path: staged content pre-reviewed CLEAN ({key[:12]}…) — skipping LLM review.")
+    save_log("FASTPATH", diff=diff, error_msg=f"pre-approved {key}")
+    return True
+
+
+def _run_preflight_gate_or_exit() -> None:
+    """Run the deterministic coverage/assert preflight; exit on failure.
+
+    No-op when the gate is disabled. Crash → exit 3; gate failure → exit with
+    the gate's own rc (e.g. 2). Always runs before the fast-path so a
+    pre-approved diff is still held to coverage/assert.
+    """
+    if not COVERAGE_GATE.enabled:
+        return
+    try:
+        rc = run_gate()
+    except Exception as exc:
+        error(f"Pre-flight gate crashed: {type(exc).__name__}: {exc}")
+        sys.exit(3)
+    if rc != 0:
+        sys.exit(rc)
+
+
+def main() -> None:
+    try:
+        _verify_runner_configs()
+        _warn_on_unhealthy_backends()
+        _check_staged_review_guard()
+        _run_preflight_gate_or_exit()
+
+        # Pre-review fast-path: after the deterministic gate, before any LLM
+        # work (single-call OR chunked manifest routing).
+        if _maybe_fastpath():
+            sys.exit(0)
+
+        _maybe_dispatch_chunked()
+
+        context = collect_diff()
+        if not context:
+            sys.exit(0)
+
+        diff, files, is_merge = context
+
+        if not applicable_lenses(files):
+            info("No reviewable content (docs / pure data only) — skipping review.")
+            save_log("SKIP", files=files, diff=diff, error_msg="no applicable lens for this file set")
+            sys.exit(0)
+
+        added = count_added_production_lines(diff)
+        backend_labels = ", ".join(c.backend for c in PRIMARIES)
+        info(
+            f"Reviewing {len(files.splitlines())} file(s), +{added} added prod line(s), "
+            f"backends=[{backend_labels}] (mode auto: per-backend single-call vs fan-out)"
+        )
+
+        verdict = _run_multi_backend_pipeline(diff, files, is_merge)
+        sys.exit(1 if verdict == "BLOCK" else 0)
+
+    except Exception as exc:
+        # Never let a bug in this script block a commit
+        warn(f"Review script crashed: {exc} — allowing commit")
+        save_log("CRASH", error_msg=f"{type(exc).__name__}: {exc}")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

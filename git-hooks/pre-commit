@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Global pre-commit hook: runs repo-local linters first, then code review.
+# Skip with: git commit --no-verify
+
+set -euo pipefail
+
+# Guard: prevent infinite recursion if .git/hooks/pre-commit forwards here
+[ "${_CLAUDE_HOOK_RUNNING:-}" = "1" ] && exit 0
+export _CLAUDE_HOOK_RUNNING=1
+
+# --- Index snapshot ---
+# The AI review backend (opencode) is an agent with bash access; during its
+# investigation it can run `git add`, stash, or other index-mutating commands
+# that silently leak untracked files into the commit (or, via stash/apply
+# --index, leave missing-blob refs in the index — the same symptom blamed on
+# the pre-commit framework historically). Snapshot the index at hook entry
+# and restore it on exit, regardless of whether sub-tools mutate it. Verify-
+# only sub-tools (gitleaks --staged, semgrep on file paths, our local
+# verify-only hook) make this restore a no-op; index-mutating sub-tools get
+# their changes rolled back.
+_CLAUDE_INDEX_SNAPSHOT=""
+if _CLAUDE_INDEX_SNAPSHOT="$(git write-tree 2>/dev/null)"; then
+    trap '
+        if [ -n "${_CLAUDE_INDEX_SNAPSHOT:-}" ]; then
+            _current="$(git write-tree 2>/dev/null)" || _current=CORRUPT
+            if [ "$_current" != "$_CLAUDE_INDEX_SNAPSHOT" ]; then
+                echo "[claude-hook] index mutated by sub-tool ($_current vs $_CLAUDE_INDEX_SNAPSHOT) — restoring snapshot" >&2
+                git read-tree "$_CLAUDE_INDEX_SNAPSHOT" 2>/dev/null || \
+                    echo "[claude-hook] restore failed — run: git read-tree $_CLAUDE_INDEX_SNAPSHOT" >&2
+            fi
+        fi
+    ' EXIT INT TERM HUP
+fi
+
+# --- Step 1: Run repo-local pre-commit hook (linters: ruff, pylint, xmllint) ---
+# core.hooksPath overrides .git/hooks/, so we call the local one explicitly.
+# In worktrees, git-dir points to .git/worktrees/<name> which has no hooks/.
+# Use git-common-dir to find the shared hooks directory.
+COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null)"
+LOCAL_HOOK="$COMMON_DIR/hooks/pre-commit"
+if [ -f "$LOCAL_HOOK" ] && [ -x "$LOCAL_HOOK" ]; then
+    "$LOCAL_HOOK"
+fi
+
+# --- Step 2: Export commit message draft for the reviewer ---
+# git writes COMMIT_EDITMSG into the WORKTREE-specific git-dir (not
+# git-common-dir) before pre-commit for both `-m` and editor flows.
+# The mtime check (≤10s) avoids leaking a stale message from the
+# previous commit.
+GIT_DIR="$(git rev-parse --git-dir 2>/dev/null)"
+COMMIT_MSG_FILE="$GIT_DIR/COMMIT_EDITMSG"
+if [ -f "$COMMIT_MSG_FILE" ]; then
+    # review-note: mtime freshness gate — the message file persists on disk
+    # after the previous commit, so without this guard we would leak stale
+    # content into CLAUDE_COMMIT_MSG. 0.17 min ≈ 10s covers the git write
+    # that happens immediately before pre-commit runs.
+    if [ "$(find "$COMMIT_MSG_FILE" -mmin -0.17 2>/dev/null)" ]; then
+        # review-note: shell plumbing below the Python-tested CLAUDE_COMMIT_MSG
+        # contract (see review/test_hook.py::test_build_user_prompt_includes_commit_message_*).
+        # Strip git's helper comments (#) and blank lines before export.
+        CLAUDE_COMMIT_MSG="$(grep -v '^#' "$COMMIT_MSG_FILE" | sed '/^$/d' || true)"
+        export CLAUDE_COMMIT_MSG
+    fi
+fi
+
+# --- Step 3: Collect staged files (A/C/M only) for semgrep ---
+# NUL-delimited so paths with spaces/newlines survive intact. gitleaks
+# reads the index directly and does not need this list.
+STAGED_FILES=()
+while IFS= read -r -d '' staged_path; do
+    STAGED_FILES+=("$staged_path")
+done < <(git diff --cached --name-only --diff-filter=ACM -z)
+
+# --- Step 4: gitleaks — scan the staged index for secrets ---
+run_gitleaks() {
+    if ! command -v gitleaks >/dev/null 2>&1; then
+        echo "[gitleaks] not installed — skipping. Install: https://github.com/gitleaks/gitleaks#installing" >&2
+        return 0
+    fi
+    echo "[gitleaks] scanning staged content..." >&2
+    if ! gitleaks protect --staged --redact >&2; then
+        echo "[gitleaks] secrets detected — commit blocked" >&2
+        return 1
+    fi
+}
+
+# --- Step 5: semgrep — static analysis on staged files ---
+run_semgrep() {
+    if ! command -v semgrep >/dev/null 2>&1; then
+        echo "[semgrep] not installed — skipping. Install: pip install semgrep" >&2
+        return 0
+    fi
+    if [ "${#STAGED_FILES[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    local exclude_args=()
+    if [ -f ".semgrep-exclude-rules" ]; then
+        while IFS= read -r rule || [ -n "$rule" ]; do
+            [ -z "$rule" ] && continue
+            [ "${rule:0:1}" = "#" ] && continue
+            exclude_args+=("--exclude-rule=$rule")
+        done < .semgrep-exclude-rules
+    fi
+
+    echo "[semgrep] scanning staged files..." >&2
+    if ! semgrep --config=auto --error --quiet "${exclude_args[@]}" "${STAGED_FILES[@]}" >&2; then
+        echo "[semgrep] findings — commit blocked" >&2
+        return 1
+    fi
+}
+
+run_gitleaks || exit 1
+run_semgrep || exit 1
+
+# --- Step 6: Run code review (on already-linted + scanned code) ---
+REVIEW_SCRIPT="$HOME/.claude/review/hook.py"
+if [ -f "$REVIEW_SCRIPT" ]; then
+    python3 -B "$REVIEW_SCRIPT"
+fi
